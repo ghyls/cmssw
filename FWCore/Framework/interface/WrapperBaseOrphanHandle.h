@@ -45,6 +45,12 @@ namespace edm {
   // specialise Event::putImpl for WrapperBase
   template <>
   inline OrphanHandle<WrapperBase> Event::putImpl(EDPutToken::value_type index, std::unique_ptr<WrapperBase> product) {
+    // Event::putImpl<PROD> calls detail::do_post_insert_if_available(prod),
+    // but that requires access to the concrete type of PROD, which is not
+    // available here. Eventually the call to post_insert() should be moved to
+    // be part of the Wrapper constructor.
+    // For now the call to post_insert() is the responsibility of the caller.
+
     assert(index < putProducts().size());
 
     // move the wrapped product into the event

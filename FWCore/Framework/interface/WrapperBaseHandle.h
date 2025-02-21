@@ -4,7 +4,7 @@
  Description: Allows interaction with data in the Event without actually using the C++ class
 
  Usage:
-    The Handle<WrapperBase> allows one to get data back from the edm::Event as an edm::Wrappter<T>
+    The Handle<WrapperBase> allows one to get data back from the edm::Event as an edm::Wrapper<T>
   via a polymorphic pointer of type edm::WrapperBase, instead of as the actual C++ class type.
 
   // make a handle to hold an instance of MyClass
