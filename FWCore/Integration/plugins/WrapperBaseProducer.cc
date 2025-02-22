@@ -83,7 +83,8 @@ namespace edmtest {
       // Check that an int can be put into the event via a WrapperBase.
       int value = 42;
       // Copy the value into the wrapper
-      std::unique_ptr<edm::WrapperBase> product(new edm::Wrapper<int>(edm::WrapperBase::Emplace{}, value));
+      std::unique_ptr<edm::WrapperBase> product(
+          std::make_unique<edm::Wrapper<int>>(edm::WrapperBase::Emplace{}, value));
       // FIXME Wrapper should call post_insert (if available), but that is not implemented yet
       edm::detail::do_post_insert_if_available(unwrap_as<int>(*product));
       assert(unwrap_as<int>(*product) == value);
