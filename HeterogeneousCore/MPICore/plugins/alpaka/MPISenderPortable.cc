@@ -30,9 +30,12 @@
 #include "DataFormats/Portable/interface/alpaka/PortableCollection.h"
 #include "DataFormats/ParticleFlowReco/interface/PFClusterSoA.h"
 #include "DataFormats/EcalRecHit/interface/EcalUncalibratedRecHitSoA.h"
+#include "DataFormats/ParticleFlowReco/interface/PFRecHitFractionSoA.h"
 
 #include "HeterogeneousCore/MPICore/interface/api.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
+
+
 
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
@@ -79,6 +82,7 @@ public:
               // TODO move this to EDConsumerBase::consumes() ?
               entry.token = consumes(
                   edm::InputTag(product.moduleLabel(), product.productInstanceName(), product.processName()));
+              
               edm::LogVerbatim("MPISender")
                   << "send product \"" << product.friendlyClassName() << '_' << product.moduleLabel() << '_'
                   << product.productInstanceName() << '_' << product.processName() << "\" of type \""
@@ -116,7 +120,6 @@ public:
     printf("++++++  MPISenderPortable::produce: got token\n");
 
     for (auto const& entry : products_) {
-      //edm::Handle<edm::WrapperBase> handle(entry.typeID);
       printf("++++++  MPISenderPortable::produce: entered loop\n");
       auto const& handle = event.get(entry.token);
       printf("++++++  MPISenderPortable::produce: extracting product from wrapper of type %s\n",
