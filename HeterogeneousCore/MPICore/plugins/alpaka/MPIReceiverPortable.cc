@@ -28,24 +28,43 @@
 #include "DataFormats/HcalRecHit/interface/HcalRecHitSoA.h"
 #include "DataFormats/ParticleFlowReco/interface/PFClusterSoA.h"
 #include "DataFormats/EcalRecHit/interface/EcalUncalibratedRecHitSoA.h"
+#include "DataFormats/ParticleFlowReco/interface/PFRecHitFractionSoA.h"
 
 
 
 #include "HeterogeneousCore/MPICore/interface/api.h"
-
-#include "DataFormats/EcalDigi/interface/alpaka/EcalDigiDeviceCollection.h"
+#include "DataFormats/Portable/interface/alpaka/PortableCollection.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
-//  template <template <typename...> class Template, typename T>
-//  struct is_instance_of : std::false_type {};
-//
-//  template <template <typename...> class Template, typename... Args>
-//  struct is_instance_of<Template, Template<Args...>> : std::true_type {};
-//
-//  template <template <typename...> class Template, typename T>
-//  concept IsInstanceOf = is_instance_of<Template, T>::value;
+template<typename... Types, typename T, std::size_t N, typename Func>
+void initTupleElementsFromArray(std::tuple<Types...>& tup,
+                        const std::array<T, N>& arr, Func&& func) {
+  std::size_t i = 0;
+  std::apply([&arr, &func, &i](auto&... elements) {
+    ((elements = func(arr[i++])), ...);
+  }, tup);
+}
+
+template<typename ProductType>
+void receiveSingleProduct(device::Event& event, MPIToken& mpiToken,
+                         device::EDPutToken<ProductType>& token, uint32_t instance) {
+  
+  auto product = std::make_unique<ProductType>(edm::Uninitialized{});
+  mpiToken.channel()->receiveSurelyTrivialCopyProduct(event.queue(), instance, *product);
+  
+  event.put(token, std::move(product));
+}
+
+template<typename... TokenTypes>
+void receiveProducts(device::Event& event, MPIToken& mpiToken,
+                     std::tuple<TokenTypes...>& tokens, uint32_t instance) {
+    std::apply([&event, &mpiToken, instance](auto&... tokens) {
+        ((receiveSingleProduct(event, mpiToken, tokens, instance)), ...);
+    }, tokens);
+}
+
 
 
 template <template <typename...> class Template, typename T>
@@ -55,7 +74,14 @@ template <template <typename...> class Template, typename... Args>
 inline constexpr bool is_instance_of_v<Template, Template<Args...>> = true;
 
 template <typename T>
-  requires(is_instance_of_v<PortableHostCollection, T> or is_instance_of_v<PortableDeviceCollection, T>)
+inline constexpr bool is_portable_collection_v =
+  is_instance_of_v<PortableHostCollection, T> or is_instance_of_v<PortableDeviceCollection, T>;
+
+template <typename... Ts>
+inline constexpr bool all_are_portable_collections_v = (is_portable_collection_v<Ts> && ...);
+
+template <typename... Ts>
+  requires(all_are_portable_collections_v<Ts...>)
 class MPIReceiverPortable : public stream::EDProducer<> {
 public:
   MPIReceiverPortable(edm::ParameterSet const& config)
@@ -73,35 +99,22 @@ public:
     token_ = produces();
 
     auto const& products = config.getParameter<std::vector<edm::ParameterSet>>("products");
-    products_.reserve(products.size());
-    for (auto const& product : products) {
-      auto const& label = product.getParameter<std::string>("label");
-      Entry entry;
-      entry.token = produces(label);
+    assert(products.size() == sizeof...(Ts) && "No template class MPIReceiverPortable<Ts...> found matching the number of products provided in the configuration");
 
-      // edm::LogVerbatim("MPIReceiver") << "receive type \"" << entry.type.name() << "\" for label \"" << label
-      //                                 << "\" over MPI channel instance " << this->instance_;
-
-      products_.emplace_back(std::move(entry));
+    for (size_t i = 0; i < products.size(); ++i) {
+      instanceNames_[i] = products[i].getParameter<std::string>("instance");
     }
+
+    initTupleElementsFromArray(tokens_, instanceNames_, [this](const auto& instanceName) {
+      return this->produces(instanceName);
+    });
   }
 
   void produce(device::Event& event, device::EventSetup const&) override {
     // read the MPIToken used to establish the communication channel
     MPIToken token = event.get(upstream_);
-    auto& queue = event.queue();
 
-    for (auto const& entry : products_) {
-      
-      auto product = std::make_unique<T>(edm::Uninitialized{});
-      
-      printf("++++++  MPIReceiverPortable::produce: receiving product into collection of type %s\n",
-              typeid(T).name());
-      token.channel()->receiveSurelyTrivialCopyProduct(queue, instance_, *product);
-
-      // Put the data into the Event
-      event.put(entry.token, std::move(product));
-    }
+    receiveProducts(event, token, tokens_, instance_);
 
     // write a shallow copy of the channel to the output, so other modules can consume it
     // to indicate that they should run after this
@@ -109,21 +122,21 @@ public:
   }
 
 private:
-  struct Entry {
-    device::EDPutToken<T> token;  // token for the product
-  };
 
   // TODO consider if upstream_ should be a vector instead of a single token ?
   edm::EDGetTokenT<MPIToken> upstream_;     // MPIToken used to establish the communication channel
   edm::EDPutTokenT<MPIToken> token_;        // copy of the MPIToken that may be used to implement an ordering relation
-  std::vector<Entry> products_;             // data to be read over the channel and put into the Event
+  std::tuple<device::EDPutToken<Ts>...> tokens_;  // tokens for the products
+  std::array<std::string, std::tuple_size_v<decltype(tokens_)>> instanceNames_;  // names for the products
   int32_t const instance_;                  // instance used to identify the source-destination pair
 };
 
-template class MPIReceiverPortable<PortableCollection<EcalDigiSoALayout<128, false>>>;
+template class MPIReceiverPortable<PortableCollection<EcalDigiSoALayout<128, false>>, 
+                                   PortableCollection<EcalDigiSoALayout<128, false>>>;
 template class MPIReceiverPortable<PortableCollection<hcal::HcalRecHitSoALayout<128, false>>>;
 template class MPIReceiverPortable<PortableCollection<reco::PFRecHitSoALayout<128, false>>>;
-template class MPIReceiverPortable<PortableCollection<reco::PFClusterSoALayout<128, false>>>;
+template class MPIReceiverPortable<PortableCollection<reco::PFClusterSoALayout<128, false>>, 
+                                   PortableCollection<reco::PFRecHitFractionSoALayout<128, false>>>;
 template class MPIReceiverPortable<PortableCollection<EcalUncalibratedRecHitSoALayout<128, false>>>;
 
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE
@@ -133,9 +146,12 @@ template class MPIReceiverPortable<PortableCollection<EcalUncalibratedRecHitSoAL
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
   using MPIReceiverPortableHbheRecoSoA = MPIReceiverPortable<PortableCollection<hcal::HcalRecHitSoALayout<128, false>>>;
   using MPIReceiverPortablePFRecHitSoA = MPIReceiverPortable<PortableCollection<reco::PFRecHitSoALayout<128, false>>>;
-  using MPIReceiverPortablePFClusterSoA = MPIReceiverPortable<PortableCollection<reco::PFClusterSoALayout<128, false>>>;
-  using MPIReceiverPortableEcalDigiSoA = MPIReceiverPortable<PortableCollection<EcalDigiSoALayout<128, false>>>;
-  using MPIReceiverPortableEcalUncalibratedRecHitSoA = MPIReceiverPortable<PortableCollection<EcalUncalibratedRecHitSoALayout<128, false>>>;
+  using MPIReceiverPortablePFClusterSoA = MPIReceiverPortable<PortableCollection<reco::PFClusterSoALayout<128, false>>,
+                                                              PortableCollection<reco::PFRecHitSoALayout<128, false>>>;
+  using MPIReceiverPortableEcalDigiSoA = MPIReceiverPortable<PortableCollection<EcalDigiSoALayout<128, false>>,
+                                                             PortableCollection<EcalDigiSoALayout<128, false>>>;
+  using MPIReceiverPortableEcalUncalibratedRecHitSoA = MPIReceiverPortable<PortableCollection<EcalUncalibratedRecHitSoALayout<128, false>>,
+                                                                           PortableCollection<EcalUncalibratedRecHitSoALayout<128, false>>>;
 
   //using MPIReceiverPortableUShort = MPIReceiverPortable<unsigned short>;
 }
