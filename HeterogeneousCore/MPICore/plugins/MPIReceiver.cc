@@ -12,7 +12,7 @@
 #include "HeterogeneousCore/MPICore/interface/MPIToken.h"
 
 // local include files
-#include "api.h"
+#include "HeterogeneousCore/MPICore/interface/api.h"
 
 class MPIReceiver : public edm::global::EDProducer<> {
 public:
@@ -51,6 +51,7 @@ public:
 
     // Receive the number of products
     int numProducts;
+    printf("++++++  MPIReceiver::produce: receiving number of products\n");
     token.channel()->receiveProduct(instance_, numProducts);
     edm::LogVerbatim("MPIReceiver") << "Received number of products: " << numProducts;
 
@@ -60,6 +61,7 @@ public:
 
       // receive the data sent over the MPI channel
       // note: currently this uses a blocking probe/recv
+      printf("++++++  MPIReceiver::produce: receiving product of type %s\n", entry.type.name().c_str());
       token.channel()->receiveProduct(instance_, entry.wrappedType, *wrapper);
 
       // put the data into the Event
