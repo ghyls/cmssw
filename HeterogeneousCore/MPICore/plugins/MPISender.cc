@@ -16,31 +16,11 @@
 #include "FWCore/Utilities/interface/Exception.h"
 #include "HeterogeneousCore/MPICore/interface/MPIToken.h"
 
-
-//#include "HeterogeneousCore/AlpakaCore/interface/alpaka/EDGetToken.h"
-//#include "HeterogeneousCore/AlpakaCore/interface/alpaka/EDPutToken.h"
-//#include "HeterogeneousCore/AlpakaCore/interface/alpaka/Event.h"
-//#include "HeterogeneousCore/AlpakaCore/interface/alpaka/EventSetup.h"
-//#include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/EDProducer.h"
-//
-//#include <alpaka/alpaka.hpp>
-
-
-
 // local include files
 #include "HeterogeneousCore/MPICore/interface/api.h"
 
-
-//namespace ALPAKA_ACCELERATOR_NAMESPACE {
-
 class MPISender : public edm::global::EDProducer<> {
 public:
-  //MPISender(edm::ParameterSet const& config)
-  //    : stream::EDProducer<>(config),
-  //      upstream_(consumes<MPIToken>(config.getParameter<edm::InputTag>("upstream"))),
-  //      token_(produces<>(config.getParameter<std::string>("tokenLabel"))),
-  //      patterns_(edm::productPatterns(config.getParameter<std::vector<std::string>>("products"))),
-  //      instance_(config.getParameter<int32_t>("instance"))  //
   MPISender(edm::ParameterSet const& config)
       : upstream_(consumes<MPIToken>(config.getParameter<edm::InputTag>("upstream"))),
         token_(produces<MPIToken>()),
@@ -100,7 +80,6 @@ public:
   }
 
   void produce(edm::StreamID, edm::Event& event, edm::EventSetup const&) const override {
-  //void produce(device::Event& event, device::EventSetup const&) override {
     // read the MPIToken used to establish the communication channel
     MPIToken token = event.get(upstream_);
 
@@ -115,7 +94,6 @@ public:
       // send the products over MPI
       // note: currently this uses a blocking send
       token.channel()->sendProduct(instance_, entry.wrappedType, *wrapper);
-      printf("MPISender::produce: sending product of type %s\n", entry.wrappedType.name().c_str());
     }
 
     // write a shallow copy of the channel to the output, so other modules can consume it
@@ -128,7 +106,6 @@ private:
     edm::TypeWithDict type;
     edm::TypeWithDict wrappedType;
     edm::EDGetToken token;
-    //edm::EDGetTokenT<edm::WrapperBase> token;  // token to read the product from the Event
   };
 
   // TODO consider if upstream_ should be a vector instead of a single token ?
@@ -138,8 +115,6 @@ private:
   std::vector<Entry> products_;                    // types and tokens corresponding to the branches
   int32_t const instance_;                         // instance used to identify the source-destination pair
 };
-
-//}  // namespace ALPAKA_ACCELERATOR_NAMESPACE
 
 #include "FWCore/Framework/interface/MakerMacros.h"
 DEFINE_FWK_MODULE(MPISender);

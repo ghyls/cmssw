@@ -39,9 +39,9 @@
 #include "HeterogeneousCore/MPIServices/interface/MPIService.h"
 
 // local headers
-#include "api.h"
-#include "conversion.h"
-#include "messages.h"
+#include "HeterogeneousCore/MPICore/interface/api.h"
+#include "HeterogeneousCore/MPICore/interface/conversion.h"
+#include "HeterogeneousCore/MPICore/interface/messages.h"
 
 class MPISource : public edm::ProducerSourceBase {
 public:

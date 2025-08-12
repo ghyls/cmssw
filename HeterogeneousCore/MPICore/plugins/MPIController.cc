@@ -27,8 +27,8 @@
 #include "HeterogeneousCore/MPICore/interface/MPIToken.h"
 #include "HeterogeneousCore/MPIServices/interface/MPIService.h"
 
-#include "api.h"
-#include "messages.h"
+#include "HeterogeneousCore/MPICore/interface/api.h"
+#include "HeterogeneousCore/MPICore/interface/messages.h"
 
 /* MPIController class
  *
