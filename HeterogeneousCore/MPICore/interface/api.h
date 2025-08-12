@@ -181,7 +181,12 @@ public:
   template <typename T>
   void sendSurelyTrivialCopyProduct(int instance, T const& product, unsigned long bufferSize) {
     int tag = EDM_MPI_SendTrivialCopyProduct | instance * EDM_MPI_MessageTagWidth_;
-    printf("++++++  MPIChannel::sendSurelyTrivialCopyProduct: Calling MPI_Send with tag %d, size %lu\n", tag, bufferSize);
+    int nRows = product->metadata().size();
+
+    // send first the nRows so the collection can be initialized
+    MPI_Send(&nRows, 1, MPI_INT, dest_, tag-1, comm_);
+
+    // then send the actual collection
     MPI_Send(product.buffer().data(), bufferSize, MPI_BYTE, dest_, tag, comm_);
   }
 
@@ -189,28 +194,21 @@ public:
   template <typename Q, typename T>
   void receiveSurelyTrivialCopyProduct(Q& queue, int instance, T& product) {
     int tag = EDM_MPI_SendTrivialCopyProduct | instance * EDM_MPI_MessageTagWidth_;
+    // TODO: Ensure that each product gets a unique tag?
 
+    int nRows;
+    MPI_Recv(&nRows, 1, MPI_INT, dest_, tag-1, comm_, MPI_STATUS_IGNORE);
+    product = T(nRows, queue);
+
+    // Get the size of the buffer
     MPI_Message message;
     MPI_Status status;
-    int size;
-
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: Calling MPI_Mprobe with:: tag %d\n", tag);
+    int bufferSize;
     MPI_Mprobe(dest_, tag, comm_, &message, &status);
-    // check that the message size matches the expected buffer size
-    MPI_Get_count(&status, MPI_BYTE, &size);
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: Received size %d\n", size);
+    MPI_Get_count(&status, MPI_BYTE, &bufferSize);
 
-    // initialize the portablecollection with the size and device
-    printf("Initializing product with size %d\n", size);
-    product = T(size, queue);
-
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: MPI_Mprobe completed\n");
-    MPI_Get_count(&status, MPI_BYTE, &size);
-    // receive the properties
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: Calling MPI_Mrecv, size %d\n", size);
-    MPI_Mrecv(product.buffer().data(), size, MPI_BYTE, &message, &status);
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: MPI_Mrecv completed\n");
-    //collection->trivialCopyInitialize(collection->trivialCopyParameters());
+    // Receive the buffer
+    MPI_Mrecv(product.buffer().data(), bufferSize, MPI_BYTE, &message, &status);
   }
 
 private:
@@ -219,7 +217,7 @@ private:
   void edmToBuffer_(EDM_MPI_LuminosityBlockAuxiliary_t& buffer, edm::LuminosityBlockAuxiliary const& aux);
   void edmToBuffer_(EDM_MPI_EventAuxiliary_t& buffer, edm::EventAuxiliary const& aux);
 
-  // dwserialize an EDM object from a simplified representation transmitted as an MPI message
+  // deserialize an EDM object from a simplified representation transmitted as an MPI message
   void edmFromBuffer_(EDM_MPI_RunAuxiliary_t const& buffer, edm::RunAuxiliary& aux);
   void edmFromBuffer_(EDM_MPI_LuminosityBlockAuxiliary_t const& buffer, edm::LuminosityBlockAuxiliary& aux);
   void edmFromBuffer_(EDM_MPI_EventAuxiliary_t const& buffer, edm::EventAuxiliary& aux);
@@ -292,17 +290,12 @@ void receiveTrivialCopyProduct_(Q& queue, int instance, edm::WrapperBase* wrappe
   // if the wrapped type requires it, send the properties required toinitialise the remote copy
   if (wrapper->hasTrivialCopyProperties()) {
     edm::AnyBuffer buffer = wrapper->trivialCopyParameters();
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: Calling MPI_Mprobe with:: tag %d\n", tag);
     MPI_Mprobe(dest_, tag, comm_, &message, &status);
     // check that the message size matches the expected buffer size
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: MPI_Mprobe completed\n");
     MPI_Get_count(&status, MPI_BYTE, &size);
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: Expected size %d, got %d\n", static_cast<int>(buffer.size_bytes()), size);
     assert(static_cast<int>(buffer.size_bytes()) == size);
     // receive the properties
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: Calling MPI_Mrecv\n");
     MPI_Mrecv(buffer.data(), buffer.size_bytes(), MPI_BYTE, &message, &status);
-    printf("++++++  MPIChannel::receiveTrivialCopyProduct: MPI_Mrecv completed\n");
     wrapper->trivialCopyInitialize(buffer);
   }
 

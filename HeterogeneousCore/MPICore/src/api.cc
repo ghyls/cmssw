@@ -187,7 +187,6 @@ void MPIChannel::receiveSerializedProduct_(int instance, TClass const* type, voi
   TBufferFile buffer{TBuffer::kRead, size};
   printf("++++++  MPIChannel::receiveSerializedProduct: Calling MPI_Mrecv with tag %d and size %d\n", tag, size);
   MPI_Mrecv(buffer.Buffer(), size, MPI_BYTE, &message, &status);
-  printf("++++++  MPIChannel::receiveSerializedProduct: Expected size %d, got %d\n", size, buffer.Length());
   type->Streamer(product, buffer);
 }
 
