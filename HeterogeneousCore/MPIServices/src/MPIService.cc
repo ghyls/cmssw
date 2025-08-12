@@ -86,7 +86,9 @@ MPIService::MPIService(edm::ParameterSet const& config) {
 
 MPIService::~MPIService() {
   // terminate the MPI execution environment
-  MPI_Finalize();
+  
+  // TODO: Wait for all GPU jobs to finish before finalizing MPI (for which this needs to become an alpaka module?)
+  // MPI_Finalize();
 }
 
 void MPIService::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {
