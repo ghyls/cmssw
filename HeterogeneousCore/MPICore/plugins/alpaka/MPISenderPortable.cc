@@ -57,6 +57,7 @@ template<typename TokenType>
 void sendSingleProduct(device::Event& event, MPIToken& mpiToken, 
                        TokenType& token, uint32_t instance) {
     auto const& handle = event.get(token);
+    alpaka::wait(event.queue());
     auto const bufferSize = alpaka::getExtentProduct(handle.buffer());
     mpiToken.channel()->sendSurelyTrivialCopyProduct(instance, handle, bufferSize);
 }

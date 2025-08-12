@@ -147,7 +147,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   using MPIReceiverPortableHbheRecoSoA = MPIReceiverPortable<PortableCollection<hcal::HcalRecHitSoALayout<128, false>>>;
   using MPIReceiverPortablePFRecHitSoA = MPIReceiverPortable<PortableCollection<reco::PFRecHitSoALayout<128, false>>>;
   using MPIReceiverPortablePFClusterSoA = MPIReceiverPortable<PortableCollection<reco::PFClusterSoALayout<128, false>>,
-                                                              PortableCollection<reco::PFRecHitSoALayout<128, false>>>;
+                                                              PortableCollection<reco::PFRecHitFractionSoALayout<128, false>>>;
   using MPIReceiverPortableEcalDigiSoA = MPIReceiverPortable<PortableCollection<EcalDigiSoALayout<128, false>>,
                                                              PortableCollection<EcalDigiSoALayout<128, false>>>;
   using MPIReceiverPortableEcalUncalibratedRecHitSoA = MPIReceiverPortable<PortableCollection<EcalUncalibratedRecHitSoALayout<128, false>>,
