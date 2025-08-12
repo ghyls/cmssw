@@ -4,7 +4,7 @@
 // #include <Eigen/Core>
 // #include <Eigen/Dense>
 
-// include CSMSW's eigen
+// TODO: include CSMSW's eigen for the moment. Go back to the system's one eventually
 #include "/data/cmssw/el8_amd64_gcc12/external/eigen/3bb6a48d8c171cf20b5f8e48bfb4e424fbd4f79e-5d91c922e771c0dc4f6bc00f61f3e2c5/include/eigen3/Eigen/Core"
 #include "/data/cmssw/el8_amd64_gcc12/external/eigen/3bb6a48d8c171cf20b5f8e48bfb4e424fbd4f79e-5d91c922e771c0dc4f6bc00f61f3e2c5/include/eigen3/Eigen/Dense"
 

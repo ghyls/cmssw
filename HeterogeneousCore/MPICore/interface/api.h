@@ -96,12 +96,8 @@ public:
   // transfer a wrapped object using the TrivialCopyTraits or its ROOT dictionary
   void sendProduct(int instance, edm::TypeWithDict const& type, edm::WrapperBase const& wrapper) {
     if (wrapper.hasTrivialCopyTraits()) {
-      printf("------  MPIChannel::sendProduct: sending trivial copy product of type %s\n",
-             type.name().c_str());
       sendTrivialCopyProduct_(instance, &wrapper);
     } else {
-      printf("------  MPIChannel::sendProduct: sending serialized product of type %s\n",
-             type.name().c_str());
       sendSerializedProduct_(instance, type.getClass(), &wrapper);
     }
   }
@@ -160,10 +156,8 @@ public:
   void receiveProduct(Q& queue, int instance, edm::TypeWithDict const& type, T& wrapper) {
     // handle the case where wrapper is just an integer or a fundamental type
     if (wrapper.hasTrivialCopyTraits()) {
-      printf("++++++  MPIChannel::receiveProduct: receiving trivial copy product\n");
       receiveTrivialCopyProduct_(queue, instance, &wrapper);
     } else {
-      printf("++++++  MPIChannel::receiveProduct: receiving serialized product\n");
       receiveSerializedProduct_(instance, type.getClass(), &wrapper);
     }
   }
@@ -250,7 +244,6 @@ private:
 
   // this is what is used when product is of raw fundamental type
   template <typename T>
-  //void receiveTrivialProduct_(auto& queue, int instance, T& product) {
   void receiveTrivialProduct_(int instance, T& product) {
 
     int tag = EDM_MPI_SendTrivialProduct | instance * EDM_MPI_MessageTagWidth_;

@@ -162,15 +162,12 @@ void MPIChannel::sendSerializedProduct_(int instance, TClass const* type, void c
   TBufferFile buffer{TBuffer::kWrite};
   type->Streamer(const_cast<void*>(product), buffer);
   int tag = EDM_MPI_SendSerializedProduct | instance * EDM_MPI_MessageTagWidth_;
-  printf("++++++  Calling MPI_Send for serialized product with tag %d and size %d\n", tag, buffer.Length());
   MPI_Send(buffer.Buffer(), buffer.Length(), MPI_BYTE, dest_, tag, comm_);
 }
 
 // send simple datatypes directly
 void MPIChannel::sendTrivialProduct_(int instance, edm::ObjectWithDict const& product) {
   int tag = EDM_MPI_SendTrivialProduct | instance * EDM_MPI_MessageTagWidth_;
-  printf("++++++  MPIChannel::sendTrivialProduct: Calling MPI_Send for trivial product with tag %d and size %ld\n",
-         tag, product.typeOf().size());
   MPI_Send(product.address(), product.typeOf().size(), MPI_BYTE, dest_, tag, comm_);
 }
 
@@ -179,13 +176,10 @@ void MPIChannel::receiveSerializedProduct_(int instance, TClass const* type, voi
   int tag = EDM_MPI_SendSerializedProduct | instance * EDM_MPI_MessageTagWidth_;
   MPI_Message message;
   MPI_Status status;
-  printf("++++++  MPIChannel::receiveSerializedProduct: Calling MPI_Mprobe with tag %d\n", tag);
   MPI_Mprobe(dest_, tag, comm_, &message, &status);
   int size;
-  printf("++++++  MPIChannel::receiveSerializedProduct: MPI_Mprobe completed\n");
   MPI_Get_count(&status, MPI_BYTE, &size);
   TBufferFile buffer{TBuffer::kRead, size};
-  printf("++++++  MPIChannel::receiveSerializedProduct: Calling MPI_Mrecv with tag %d and size %d\n", tag, size);
   MPI_Mrecv(buffer.Buffer(), size, MPI_BYTE, &message, &status);
   type->Streamer(product, buffer);
 }
@@ -197,7 +191,6 @@ void MPIChannel::sendTrivialCopyProduct_(int instance, edm::WrapperBase const* w
   // if the wrapped type requires it, send the properties required toinitialise the remote copy
   if (wrapper->hasTrivialCopyProperties()) {
     edm::AnyBuffer buffer = wrapper->trivialCopyParameters();
-    printf("++++++  MPIChannel::sendTrivialCopyProduct: Calling MPI_Send for trivial copy parameters\n");
     MPI_Send(buffer.data(), buffer.size_bytes(), MPI_BYTE, dest_, tag, comm_);
   }
 
@@ -206,8 +199,6 @@ void MPIChannel::sendTrivialCopyProduct_(int instance, edm::WrapperBase const* w
   // TODO send the number of regions ?
   for (size_t i = 0; i < regions.size(); ++i) {
     assert(regions[i].data() != nullptr);
-    printf("++++++  MPIChannel::sendTrivialCopyProduct: Calling MPI_Send for region %zu with size %zu and tag %d\n",
-           i, regions[i].size_bytes(), tag);
     MPI_Send(regions[i].data(), regions[i].size_bytes(), MPI_BYTE, dest_, tag, comm_);
   }
 }
