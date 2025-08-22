@@ -64,7 +64,6 @@ if [ -z "$RELEASE_BASE" ]; then
   exit 1
 fi
 
-# MPI_CMD="mpirun $SSH_WRAPPER_OPTION $RELEASE_BASE/bin/$SCRAM_ARCH/cmsenv_ssh $MPIRUN_PREDICATE"
 MPI_CMD="mpirun $SSH_WRAPPER_OPTION $RELEASE_BASE/bin/$SCRAM_ARCH/cmsenv_ssh $MPIRUN_PREDICATE"
 
 if [[ "$VERBOSE" == true ]]; then
