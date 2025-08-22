@@ -3,7 +3,6 @@
 
 function usage() {
     echo "Usage: $0 [-v, --verbose] [-h, --help] <mpirun options>"
-    echo "This script wraps mpirun and sets the cmssw environment in the remote node before mpi is launched"
     echo
     echo "Options:"
     echo "  -v, --verbose   Make this script verbose"
