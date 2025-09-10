@@ -2,12 +2,10 @@
 #define TrivialSerialisation_Common_interface_TrivialSerialiserBase_h
 
 #include "DataFormats/Common/interface/AnyBuffer.h"
-#include "DataFormats/Common/interface/Wrapper.h"
 #include "DataFormats/Common/interface/WrapperBase.h"
 // #include "TrivialSerialisation/Common/interface/TrivialSerialiser.h"
 // #include "TrivialSerialisation/Common/interface/TrivialSerialiserSourceFactory.h"
 
-#include <memory>
 #include <span>
 #include <vector>
 
@@ -25,7 +23,7 @@ namespace ngt {
     virtual void trivialCopyFinalize() = 0;
 
     // TODO: should this be private?
-    const edm::WrapperBase* Ptr() const { return ptr_; }
+    const edm::WrapperBase* getWrapperBasePtr() const { return ptr_; }
 
     virtual ~TrivialSerialiserBase() = default;
 

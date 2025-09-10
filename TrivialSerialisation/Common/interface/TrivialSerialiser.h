@@ -74,7 +74,7 @@ namespace ngt {
       // if edm::TrivialCopyTraits<T>::Properties is not defined, do not call initialize()
       return;
     } else {
-      auto& w = static_cast<WrapperType const&>(*Ptr());
+      auto& w = static_cast<WrapperType const&>(*getWrapperBasePtr());
       if constexpr (std::is_same_v<typename edm::TrivialCopyTraits<T>::Properties, void>) {
         // if edm::TrivialCopyTraits<T>::Properties is void, call initialize() without any additional arguments
         edm::TrivialCopyTraits<T>::initialize(const_cast<WrapperType&>(w).bareProduct());
@@ -88,7 +88,7 @@ namespace ngt {
 
   template <typename T>
   inline edm::AnyBuffer TrivialSerialiser<T>::trivialCopyParameters() const {
-    auto& w = static_cast<WrapperType const&>(*Ptr());
+    auto& w = static_cast<WrapperType const&>(*getWrapperBasePtr());
     const T& obj = getWrappedObj_(w);
     if constexpr (not requires { typename edm::TrivialCopyTraits<T>::Properties; }) {
       // if edm::TrivialCopyTraits<T>::Properties is not defined, do not call properties()
@@ -106,7 +106,7 @@ namespace ngt {
   template <typename T>
   inline std::vector<std::span<const std::byte>> TrivialSerialiser<T>::trivialCopyRegions() const {
     if constexpr (requires(T const& t) { edm::TrivialCopyTraits<T>::regions(t); }) {
-      auto& w = static_cast<WrapperType const&>(*Ptr());
+      auto& w = static_cast<WrapperType const&>(*getWrapperBasePtr());
       const T& obj = getWrappedObj_(w);
       return edm::TrivialCopyTraits<T>::regions(obj);
     } else {
@@ -120,7 +120,7 @@ namespace ngt {
   template <typename T>
   inline std::vector<std::span<std::byte>> TrivialSerialiser<T>::trivialCopyRegions() {
     if constexpr (requires(T& t) { edm::TrivialCopyTraits<T>::regions(t); }) {
-      auto& w = const_cast<edm::Wrapper<T>&>(static_cast<edm::Wrapper<T> const&>(*Ptr()));
+      auto& w = const_cast<edm::Wrapper<T>&>(static_cast<edm::Wrapper<T> const&>(*getWrapperBasePtr()));
       T& obj = getWrappedObj_(w);
       return edm::TrivialCopyTraits<T>::regions(obj);
     } else {
@@ -134,7 +134,7 @@ namespace ngt {
   template <typename T>
   inline void TrivialSerialiser<T>::trivialCopyFinalize() {
     if constexpr (requires(T& t) { edm::TrivialCopyTraits<T>::finalize(t); }) {
-      auto& w = static_cast<WrapperType const&>(*Ptr());
+      auto& w = static_cast<WrapperType const&>(*getWrapperBasePtr());
       const T& obj = getWrappedObj_(w);
       edm::TrivialCopyTraits<T>::finalize(obj);
     }
