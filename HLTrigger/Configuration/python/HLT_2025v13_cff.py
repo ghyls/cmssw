@@ -1,6 +1,6 @@
 # hltGetConfiguration /frozen/2025/2e34/v1.3/HLT --cff --data --type 2025v13
 
-# /frozen/2025/2e34/v1.3/HLT/V1 (CMSSW_15_0_11)
+# /frozen/2025/2e34/v1.3/HLT/V2 (CMSSW_15_0_15)
 
 import FWCore.ParameterSet.Config as cms
 
@@ -9,7 +9,7 @@ fragment = cms.ProcessFragment( "HLT" )
 fragment.load("Configuration.StandardSequences.Accelerators_cff")
 
 fragment.HLTConfigVersion = cms.PSet(
-  tableName = cms.string("/frozen/2025/2e34/v1.3/HLT/V1")
+  tableName = cms.string("/frozen/2025/2e34/v1.3/HLT/V2")
 )
 
 fragment.HLTGroupedCkfTrajectoryBuilderP5 = cms.PSet( 
@@ -19820,7 +19820,7 @@ fragment.hltL1EventNumberNZS = cms.EDFilter( "HLTL1NumberFilter",
     rawInput = cms.InputTag( "rawDataCollector" ),
     period = cms.uint32( 4096 ),
     invert = cms.bool( False ),
-    fedId = cms.int32( 1024 ),
+    fedIds = cms.vint32( 1024 ),
     useTCDSEventNumber = cms.bool( False )
 )
 fragment.hltL1sHcalNZS = cms.EDFilter( "HLTL1TSeed",
@@ -19865,7 +19865,7 @@ fragment.hltL1EventNumberL1Fat = cms.EDFilter( "HLTL1NumberFilter",
     rawInput = cms.InputTag( "rawDataCollector" ),
     period = cms.uint32( 107 ),
     invert = cms.bool( False ),
-    fedId = cms.int32( 1024 ),
+    fedIds = cms.vint32( 1024 ),
     useTCDSEventNumber = cms.bool( True )
 )
 fragment.hltPrePhysics = cms.EDFilter( "HLTPrescaler",

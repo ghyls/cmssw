@@ -1,6 +1,6 @@
 # hltGetConfiguration /frozen/2025/2e34/v1.3/HLT --full --data --type 2025v13 --unprescale --process HLT2025v13 --globaltag auto:run3_hlt_2025v13 --input file:RelVal_Raw_2025v13_DATA.root
 
-# /frozen/2025/2e34/v1.3/HLT/V1 (CMSSW_15_0_11)
+# /frozen/2025/2e34/v1.3/HLT/V2 (CMSSW_15_0_15)
 
 import FWCore.ParameterSet.Config as cms
 
@@ -9,7 +9,7 @@ process = cms.Process( "HLT2025v13" )
 process.load("Configuration.StandardSequences.Accelerators_cff")
 
 process.HLTConfigVersion = cms.PSet(
-  tableName = cms.string("/frozen/2025/2e34/v1.3/HLT/V1")
+  tableName = cms.string("/frozen/2025/2e34/v1.3/HLT/V2")
 )
 
 process.HLTGroupedCkfTrajectoryBuilderP5 = cms.PSet( 
@@ -20103,7 +20103,7 @@ process.hltL1EventNumberNZS = cms.EDFilter( "HLTL1NumberFilter",
     rawInput = cms.InputTag( "rawDataCollector" ),
     period = cms.uint32( 4096 ),
     invert = cms.bool( False ),
-    fedId = cms.int32( 1024 ),
+    fedIds = cms.vint32( 1024 ),
     useTCDSEventNumber = cms.bool( False )
 )
 process.hltL1sHcalNZS = cms.EDFilter( "HLTL1TSeed",
@@ -20148,7 +20148,7 @@ process.hltL1EventNumberL1Fat = cms.EDFilter( "HLTL1NumberFilter",
     rawInput = cms.InputTag( "rawDataCollector" ),
     period = cms.uint32( 107 ),
     invert = cms.bool( False ),
-    fedId = cms.int32( 1024 ),
+    fedIds = cms.vint32( 1024 ),
     useTCDSEventNumber = cms.bool( True )
 )
 process.hltPrePhysics = cms.EDFilter( "HLTPrescaler",
