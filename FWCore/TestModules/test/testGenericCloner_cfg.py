@@ -115,3 +115,4 @@ process.validatePortableObject = cms.EDAnalyzer('TestAlpakaObjectAnalyzer',
 process.taskSoA = cms.Task(process.producePortableObjects, process.clonePortableObjects)
 
 process.pathSoA = cms.Path(process.validatePortableCollections + process.validatePortableObject, process.taskSoA)
+
