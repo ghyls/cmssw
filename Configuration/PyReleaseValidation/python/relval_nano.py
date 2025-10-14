@@ -87,6 +87,10 @@ _MINI_from_MINI = {'-s': 'PAT:Configuration/StandardSequences/REMINI_cff.patAlgo
                    '--eventcontent' : 'MINIAODSIM',
                    '--datatier' : 'MINIAODSIM',
                    '--process': 'M2M'}
+_MINI_from_MINI_data = merge([{'--data': '',
+                               '--eventcontent' : 'MINIAOD',
+                               '--datatier' : 'MINIAOD'},
+                              _MINI_from_MINI])
 steps['HRV_NANO_mc'] = _HARVEST_mc
 steps['HRV3_NANO_mc'] = merge([{'--filein':'file:step3_inDQM.root'},
                                  _HARVEST_mc])
@@ -138,14 +142,14 @@ steps['NANO_mc10.6ul18v2'] = merge([{'--era': 'Run2_2018,run2_nanoAOD_106Xv2',
 # HIPM_UL2016_MiniAODv2 campaign is CMSSW_10_6_25
 steps['MuonEG2016MINIAOD10.6v2'] = {'INPUT': InputInfo(location='STD', ls=run2_lumis,
                                                        dataSet='/MuonEG/Run2016E-HIPM_UL2016_MiniAODv2-v2/MINIAOD')}
-steps['M2M_data10.6ul16'] = merge([_MINI_from_MINI, {'--procModifiers':'run2_miniAOD_miniAODUL'}, steps['REMINIAOD_data2016UL']])
+steps['M2M_data10.6ul16'] = merge([_MINI_from_MINI_data, {'--procModifiers':'run2_miniAOD_miniAODUL'}, steps['REMINIAOD_data2016UL']])
 steps['NANO_data10.6ul16v2'] = merge([{'--era': 'Run2_2016_HIPM,run2_nanoAOD_106Xv2',
                                      '--conditions': 'auto:run2_data'},
                                       _NANO_data])
 # UL2017_MiniAODv2 campaign is CMSSW_10_6_20
 steps['MuonEG2017MINIAOD10.6v2'] = {'INPUT': InputInfo(location='STD', ls=run2_lumis,
                                                        dataSet='/MuonEG/Run2017F-UL2017_MiniAODv2-v1/MINIAOD')}
-steps['M2M_data10.6ul17'] = merge([_MINI_from_MINI, {'--procModifiers':'run2_miniAOD_miniAODUL'}, steps['REMINIAOD_data2017UL']])
+steps['M2M_data10.6ul17'] = merge([_MINI_from_MINI_data, {'--procModifiers':'run2_miniAOD_miniAODUL'}, steps['REMINIAOD_data2017UL']])
 steps['NANO_data10.6ul17v2'] = merge([{'--era': 'Run2_2017,run2_nanoAOD_106Xv2',
                                      '--conditions': 'auto:run2_data'},
                                       _NANO_data])
@@ -153,7 +157,7 @@ steps['NANO_data10.6ul17v2'] = merge([{'--era': 'Run2_2017,run2_nanoAOD_106Xv2',
 # UL2018_MiniAODv2 campaign is CMSSW_10_6_20
 steps['MuonEG2018MINIAOD10.6v2'] = {'INPUT': InputInfo(location='STD', ls=run2_lumis,
                                                        dataSet='/MuonEG/Run2018D-UL2018_MiniAODv2-v1/MINIAOD')}
-steps['M2M_data10.6ul18'] = merge([_MINI_from_MINI, {'--procModifiers':'run2_miniAOD_miniAODUL'}, steps['REMINIAOD_data2018UL']])
+steps['M2M_data10.6ul18'] = merge([_MINI_from_MINI_data, {'--procModifiers':'run2_miniAOD_miniAODUL'}, steps['REMINIAOD_data2018UL']])
 steps['NANO_data10.6ul18v2'] = merge([{'--era': 'Run2_2018,run2_nanoAOD_106Xv2',
                                      '--conditions': 'auto:run2_data'},
                                       _NANO_data])
@@ -188,6 +192,23 @@ steps['NANO_data_UL18reMINI'] = merge([{'--era': 'Run2_2018',
                                        _NANO_data])
 
 ################################################################
+# 12.4 workflows -- data
+steps['ScoutingPFRun3_Run2022D_RAW_124X'] = {'INPUT': InputInfo(
+    dataSet='/ScoutingPFRun3/Run2022D-v1/RAW', label='2022D', events=100000, location='STD', ls=Run2022D)}
+
+steps['ScoutingPFMonitor_Run2022D_RAW_124X'] = {'INPUT': InputInfo(
+    dataSet='/ScoutingPFMonitor/Run2022D-v1/RAW', label='2022D', events=100000, location='STD', ls=Run2022D)}
+
+steps['NANO_data12.4'] = merge([{'--era': 'Run3,run3_nanoAOD_pre142X', '--conditions': 'auto:run3_data'},
+                                _NANO_data])
+
+steps['scoutingNANO_data12.4'] = merge([{'-s': 'NANO:@Scout'},
+                                        steps['NANO_data12.4']])
+
+steps['scoutingNANO_monitor_data12.4'] = merge([{'-s': 'NANO:@ScoutMonitor'},
+                                                steps['NANO_data12.4']])
+
+################################################################
 # 13.0 workflows
 steps['TTbarMINIAOD13.0'] = {'INPUT': InputInfo(
     location='STD', dataSet='/TTtoLNu2Q_TuneCP5_13p6TeV_powheg-pythia8/Run3Summer23MiniAODv4-130X_mcRun3_2023_realistic_v14-v2/MINIAODSIM')}
@@ -211,11 +232,14 @@ steps['NANO_mc_S23reMINI'] = merge([{'--era': 'Run3', '--conditions': 'auto:phas
 steps['MuonEG2023MINIAOD13.0'] = {'INPUT': InputInfo(location='STD', ls={368489: [[46, 546]]},
                                                      dataSet='/MuonEG/Run2023C-22Sep2023_v4-v1/MINIAOD')}
 
-steps['ScoutingPFRun32022RAW13.0'] = {'INPUT': InputInfo(
-    dataSet='/ScoutingPFRun3/Run2022D-v1/RAW', label='2022D', events=100000, location='STD', ls=Run2022D)}
+steps['ScoutingPFRun3_Run2023D_RAW_130X'] = {'INPUT': InputInfo(
+    dataSet='/ScoutingPFRun3/Run2023D-v1/RAW', label='2023D', events=100000, location='STD', ls=Run2023D)}
 
-steps['M2M_data13.0'] = merge([_MINI_from_MINI, {'--era': 'Run3', '--conditions': 'auto:run3_data', '--procModifier': 'run3_miniAOD_miniAODpre142X'}])
-steps['NANO_data13.0'] = merge([{'--era': 'Run3,run3_nanoAOD_pre142X', '--conditions': 'auto:run3_data'},
+steps['ScoutingPFMonitor_Run2023D_RAW_130X'] = {'INPUT': InputInfo(
+    dataSet='/ScoutingPFMonitor/Run2023D-v1/RAW', label='2023D', events=100000, location='STD', ls=Run2023D)}
+
+steps['M2M_data13.0'] = merge([_MINI_from_MINI_data, {'--era': 'Run3', '--conditions': 'auto:run3_data', '--procModifier': 'run3_miniAOD_miniAODpre142X'}])
+steps['NANO_data13.0'] = merge([{'--era': 'Run3_2023,run3_nanoAOD_pre142X', '--conditions': 'auto:run3_data'},
                                 _NANO_data])
 steps['NANO_data_23reMINI'] = merge([{'--era': 'Run3_2023', '--conditions': 'auto:run3_data'},
                                   _NANO_data])
@@ -225,6 +249,9 @@ steps['NANO_data13.0_prompt'] = merge([{'-s': 'NANO:@Prompt,DQM:@nanoAODDQM', '-
 
 steps['scoutingNANO_data13.0'] = merge([{'-s': 'NANO:@Scout'},
                                         steps['NANO_data13.0']])
+
+steps['scoutingNANO_monitor_data13.0'] = merge([{'-s': 'NANO:@ScoutMonitor'},
+                                                steps['NANO_data13.0']])
 
 
 ################################################################
@@ -313,8 +340,11 @@ steps['jmeNANO_data14.0'] = merge([{'-s': 'NANO:@JME,DQM:@nanojmeDQM', '-n': '10
 steps['scoutingNANO_data14.0'] = merge([{'-s': 'NANO:@Scout'},
                                         steps['NANO_data14.0']])
 
-steps['scoutingNANO_withPrompt_data14.0'] = merge([{'-s': 'NANO:@Prompt+@ScoutMonitor'},
-                                                   steps['NANO_data14.0']])
+steps['scoutingNANO_monitor_data14.0'] = merge([{'-s': 'NANO:@Prompt+@ScoutMonitor'},
+                                                steps['NANO_data14.0']])
+
+steps['scoutingNANO_monitorWithPrompt_data14.0'] = merge([{'-s': 'NANO:@Prompt+@ScoutMonitor'},
+                                                           steps['NANO_data14.0']])
 
 steps['l1ScoutingNANO_data14.0'] = merge([{'-s': 'NANO:@L1Scout', '-n': '1000'},
                                           steps['NANO_data14.0']])
@@ -430,8 +460,11 @@ steps['jmeNANO_rePuppi_data15.0'] = merge([{'-s': 'NANO:@JMErePuppi,DQM:@nanojme
 steps['scoutingNANO_data15.0'] = merge([{'-s': 'NANO:@Scout'},
                                         steps['NANO_data15.0']])
 
-steps['scoutingNANO_withPrompt_data15.0'] = merge([{'-s': 'NANO:@Prompt+@ScoutMonitor'},
-                                                   steps['NANO_data15.0']])
+steps['scoutingNANO_monitor_data15.0'] = merge([{'-s': 'NANO:@ScoutMonitor'},
+                                                steps['NANO_data15.0']])
+
+steps['scoutingNANO_monitorWithPrompt_data15.0'] = merge([{'-s': 'NANO:@Prompt+@ScoutMonitor'},
+                                                          steps['NANO_data15.0']])
 
 ################################################################
 # NANOGEN
@@ -501,7 +534,10 @@ _wfn.subnext()
 
 # POG/PAG custom NANOs, data
 _wfn.subnext()
-workflows[_wfn()] = ['ScoutingNANOdata130Xrun3', ['ScoutingPFRun32022RAW13.0', 'scoutingNANO_data13.0']]
+workflows[_wfn()] = ['ScoutingNANOdata124Xrun3', ['ScoutingPFRun3_Run2022D_RAW_124X', 'scoutingNANO_data12.4']]
+workflows[_wfn()] = ['ScoutingNANOmonitordata124Xrun3', ['ScoutingPFMonitor_Run2022D_RAW_124X', 'scoutingNANO_monitor_data12.4']]
+workflows[_wfn()] = ['ScoutingNANOdata130Xrun3', ['ScoutingPFRun3_Run2023D_RAW_130X', 'scoutingNANO_data13.0']]
+workflows[_wfn()] = ['ScoutingNANOmonitordata130Xrun3', ['ScoutingPFMonitor_Run2023D_RAW_130X', 'scoutingNANO_monitor_data13.0']]
 
 # DPG custom NANOs, data
 _wfn.subnext()
@@ -534,7 +570,8 @@ workflows[_wfn()] = ['jmeNANOdata140Xrun3', ['MuonEG2024MINIAOD14.0', 'jmeNANO_d
 _wfn()  # workflows[_wfn()] = ['jmeNANOrePuppidata140Xrun3', ['MuonEG2024MINIAOD14.0', 'jmeNANO_rePuppi_data14.0']]
 workflows[_wfn()] = ['lepTrackInfoNANOdata140Xrun3', ['MuonEG2024MINIAOD14.0', 'lepTrackInfoNANO_data14.0']]
 workflows[_wfn()] = ['ScoutingNANOdata140Xrun3', ['ScoutingPFRun32024RAW14.0', 'scoutingNANO_data14.0']]
-workflows[_wfn()] = ['ScoutingNANOwithPromptdata140Xrun3', ['ScoutingPFMonitor2024MINIAOD14.0', 'scoutingNANO_withPrompt_data14.0']]
+workflows[_wfn()] = ['ScoutingNANOmonitordata140Xrun3', ['ScoutingPFMonitor2024MINIAOD14.0', 'scoutingNANO_monitor_data14.0']]
+workflows[_wfn()] = ['ScoutingNANOmonitorWithPromptdata140Xrun3', ['ScoutingPFMonitor2024MINIAOD14.0', 'scoutingNANO_monitorWithPrompt_data14.0']]
 workflows[_wfn()] = ['L1ScoutingNANOdata140Xrun3', ['L1Scouting2024RAW14.0', 'l1ScoutingNANO_data14.0']]
 workflows[_wfn()] = ['L1ScoutingSelectionNANOdata140Xrun3', ['L1ScoutingSelection2024RAW14.0', 'l1ScoutingSelectionNANO_data14.0']]
 
@@ -593,7 +630,8 @@ workflows[_wfn()] = ['jmeNANOdata150Xrun3', ['JetMET1_Run2025C_MINIAOD_150X', 'j
 workflows[_wfn()] = ['jmeNANOrePuppidata150Xrun3', ['JetMET1_Run2025C_MINIAOD_150X', 'jmeNANO_rePuppi_data15.0']]
 workflows[_wfn()] = ['lepTrackInfoNANOdata150Xrun3', ['JetMET1_Run2025C_MINIAOD_150X', 'lepTrackInfoNANO_data15.0']]
 workflows[_wfn()] = ['ScoutingNANOdata150Xrun3', ['ScoutingPFRun3_Run2025C_HLTSCOUT_150X', 'scoutingNANO_data15.0']]
-workflows[_wfn()] = ['ScoutingNANOwithPromptdata150Xrun3', ['ScoutingPFMonitor_Run2025C_MINIAOD_150X', 'scoutingNANO_withPrompt_data15.0']]  # noqa
+workflows[_wfn()] = ['ScoutingNANOmonitordata150Xrun3', ['ScoutingPFMonitor_Run2025C_MINIAOD_150X', 'scoutingNANO_monitor_data15.0']]  # noqa
+workflows[_wfn()] = ['ScoutingNANOmonitorWithPromptdata150Xrun3', ['ScoutingPFMonitor_Run2025C_MINIAOD_150X', 'scoutingNANO_monitorWithPrompt_data15.0']]  # noqa
 workflows[_wfn()] = ['BPHNANOdata150Xrun3', ['JetMET1_Run2025C_MINIAOD_150X', 'BPHNANO_data15.0']]
 
 # DPG custom NANOs, data
