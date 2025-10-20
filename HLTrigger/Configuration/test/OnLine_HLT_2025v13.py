@@ -1,6 +1,6 @@
 # hltGetConfiguration /frozen/2025/2e34/v1.3/CMSSW_15_1_X/HLT --full --data --type 2025v13 --unprescale --process HLT2025v13 --globaltag auto:run3_hlt_2025v13 --input file:RelVal_Raw_2025v13_DATA.root
 
-# /frozen/2025/2e34/v1.3/CMSSW_15_1_X/HLT/V5 (CMSSW_15_1_0)
+# /frozen/2025/2e34/v1.3/CMSSW_15_1_X/HLT/V6 (CMSSW_15_1_0)
 
 import FWCore.ParameterSet.Config as cms
 
@@ -9,7 +9,7 @@ process = cms.Process( "HLT2025v13" )
 process.load("Configuration.StandardSequences.Accelerators_cff")
 
 process.HLTConfigVersion = cms.PSet(
-  tableName = cms.string("/frozen/2025/2e34/v1.3/CMSSW_15_1_X/HLT/V5")
+  tableName = cms.string("/frozen/2025/2e34/v1.3/CMSSW_15_1_X/HLT/V6")
 )
 
 process.HLTGroupedCkfTrajectoryBuilderP5 = cms.PSet( 
@@ -7736,7 +7736,7 @@ process.hltSiPixelRecHitsSoA = cms.EDProducer( "SiPixelRecHitAlpakaPhase1@alpaka
     CPE = cms.string( "PixelCPEFastParams" ),
     alpaka = cms.untracked.PSet(  backend = cms.untracked.string( "" ) )
 )
-process.hltSiPixelRecHits = cms.EDProducer( "SiPixelRecHitFromSoAAlpakaPhase1",
+process.hltSiPixelRecHits = cms.EDProducer( "SiPixelRecHitFromSoAAlpaka",
     maxHitsInModules = cms.uint32( 1024 ),
     pixelRecHitSrc = cms.InputTag( "hltSiPixelRecHitsSoA" ),
     src = cms.InputTag( "hltSiPixelClusters" )
@@ -7792,7 +7792,7 @@ process.hltPixelTracksSoA = cms.EDProducer( "CAHitNtupletAlpakaPhase1@alpaka",
     ),
     alpaka = cms.untracked.PSet(  backend = cms.untracked.string( "" ) )
 )
-process.hltPixelTracks = cms.EDProducer( "PixelTrackProducerFromSoAAlpakaPhase1",
+process.hltPixelTracks = cms.EDProducer( "PixelTrackProducerFromSoAAlpaka",
     beamSpot = cms.InputTag( "hltOnlineBeamSpot" ),
     trackSrc = cms.InputTag( "hltPixelTracksSoA" ),
     pixelRecHitLegacySrc = cms.InputTag( "hltSiPixelRecHits" ),
@@ -12598,7 +12598,7 @@ process.hltSiPixelRecHitsSoASerialSync = cms.EDProducer( "alpaka_serial_sync::Si
     src = cms.InputTag( "hltSiPixelClustersSoASerialSync" ),
     CPE = cms.string( "PixelCPEFastParams" )
 )
-process.hltSiPixelRecHitsSerialSync = cms.EDProducer( "SiPixelRecHitFromSoAAlpakaPhase1",
+process.hltSiPixelRecHitsSerialSync = cms.EDProducer( "SiPixelRecHitFromSoAAlpaka",
     maxHitsInModules = cms.uint32( 1024 ),
     pixelRecHitSrc = cms.InputTag( "hltSiPixelRecHitsSoASerialSync" ),
     src = cms.InputTag( "hltSiPixelClustersSerialSync" )
@@ -12916,7 +12916,7 @@ process.hltPixelTracksSoASerialSync = cms.EDProducer( "alpaka_serial_sync::CAHit
       maxR = cms.vdouble( 20.0, 9.0, 9.0, 20.0, 7.0, 7.0, 5.0, 5.0, 20.0, 6.0, 6.0, 5.0, 5.0, 20.0, 20.0, 9.0, 9.0, 9.0, 9.0 )
     )
 )
-process.hltPixelTracksSerialSync = cms.EDProducer( "PixelTrackProducerFromSoAAlpakaPhase1",
+process.hltPixelTracksSerialSync = cms.EDProducer( "PixelTrackProducerFromSoAAlpaka",
     beamSpot = cms.InputTag( "hltOnlineBeamSpot" ),
     trackSrc = cms.InputTag( "hltPixelTracksSoASerialSync" ),
     pixelRecHitLegacySrc = cms.InputTag( "hltSiPixelRecHitsSerialSync" ),
