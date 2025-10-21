@@ -38,6 +38,8 @@ namespace edm {
 
     T& bareProduct() { return obj; }
 
+    void markAsPresent() { present = true; }
+
     //these are used by FWLite
     static std::type_info const& productTypeInfo() { return typeid(T); }
     static std::type_info const& typeInfo() { return typeid(Wrapper<T>); }
@@ -58,7 +60,6 @@ namespace edm {
     }
 
     bool isPresent_() const override { return present; }
-    void markAsPresent_() override { present = true; }
     std::type_info const& dynamicTypeInfo_() const override { return typeid(T); }
     std::type_info const& wrappedTypeInfo_() const override { return typeid(Wrapper<T>); }
 
