@@ -144,25 +144,22 @@ namespace edmtest {
 
       // get a "serialiserSource" object from the plugin factory.
       // serializeSource objects can produce, for a given type, both const and mutable TrivialSerialisers.
-      std::unique_ptr<ngt::TrivialSerialiserSourceBase> serialiserSource{
+      std::unique_ptr<ngt::TrivialSerialiserSourceBase> serialiser{
           ngt::TrivialSerialiserSourceFactory::get()->create(product.objectType_.typeInfo().name())};
 
       // initialise a const and a mutable TrivialSerialisers.
-      auto const_serialiser = serialiserSource->initialize(*wrapper);
-      auto mutable_serialiser = serialiserSource->initialize(*clone);
+      auto reader = serialiser->initialize(*wrapper);
+      auto writer = serialiser->initialize(*clone);
 
-      if (mutable_serialiser->hasTrivialCopyTraits()) {
-        // mark the clone as present
-        clone->markAsPresent();
-
+      if (writer->hasTrivialCopyTraits()) {
         // initialise the clone, if the type requires it
-        if (mutable_serialiser->hasTrivialCopyProperties()) {
-          mutable_serialiser->trivialCopyInitialize(const_serialiser->trivialCopyParameters());
+        if (writer->hasTrivialCopyProperties()) {
+          writer->trivialCopyInitialize(reader->trivialCopyParameters());
         }
 
         // copy the source regions to the target
-        auto targets = mutable_serialiser->trivialCopyRegions();
-        auto sources = const_serialiser->trivialCopyRegions();
+        auto targets = writer->trivialCopyRegions();
+        auto sources = reader->trivialCopyRegions();
 
         assert(sources.size() == targets.size());
         for (size_t i = 0; i < sources.size(); ++i) {
@@ -173,7 +170,7 @@ namespace edmtest {
         }
 
         // finalize the clone after the trivialCopy, if the type requires it
-        mutable_serialiser->trivialCopyFinalize();
+        writer->trivialCopyFinalize();
       } else {
         edm::LogInfo("GenericCloner") << "No specialization of TrivialCopyTraits found for type "
                                       << product.objectType_.typeInfo().name()
