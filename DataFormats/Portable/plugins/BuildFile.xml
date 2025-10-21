@@ -1,0 +1,22 @@
+
+<library file="*.cc" name="DataFormatsPlugins">
+  <use name="alpaka"/>
+  <use name="FWCore/Framework"/>
+  <use name="DataFormats/PortableTestObjects"/>
+  <use name="DataFormats/Portable"/>
+  <flags EDM_PLUGIN="1"/>
+</library>
+
+<library file="alpaka/*.cc" name="DataFormatsPluginsPortable">
+  <use name="DataFormats/SoATemplate"/>
+  <use name="catch2"/>
+  <use name="eigen"/>
+  <use name="HeterogeneousCore/AlpakaCore"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</library>
+
+<export>
+  <lib name="1"/>
+</export>
+
