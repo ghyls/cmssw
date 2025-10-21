@@ -10,6 +10,7 @@ namespace ngt {
   public:
     std::unique_ptr<TrivialSerialiserBase> initialize(edm::WrapperBase& wrapper) override {
       edm::Wrapper<T>& w = dynamic_cast<edm::Wrapper<T>&>(wrapper);
+      w.markAsPresent();
       return std::make_unique<TrivialSerialiser<T>>(w);
     }
     std::unique_ptr<const TrivialSerialiserBase> initialize(edm::WrapperBase const& wrapper) override {
