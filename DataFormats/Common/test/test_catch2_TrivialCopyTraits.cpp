@@ -11,6 +11,9 @@
 
 // A trivially copyable type to test TrivialCopyTraits
 struct S {
+  S() = default;
+  S(std::string m, std::vector<float> v) : msg{std::move(m)}, vec{std::move(v)} { setVecSum(); }
+
   std::string msg;
   std::vector<float> vec;
   float vec_sum = 0.0f;  // something that needs to be calculated after the copy is finished
@@ -46,13 +49,9 @@ struct edm::TrivialCopyTraits<S> {
   }
 };
 
-// concept to check if a type is supported by TrivialCopyTraits
-template <typename T>
-concept HasTrivialCopyTraits = requires { typename edm::TrivialCopyTraits<T>::value_type; };
-
 TEST_CASE("test TrivialCopyTraits", "[TrivialCopyTraits]") {
   SECTION("int") {
-    REQUIRE(std::is_same<edm::TrivialCopyTraits<int>::value_type, int>::value);
+    REQUIRE(std::is_same_v<edm::TrivialCopyTraits<int>::value_type, int>);
 
     auto checkInt = [](int v) {
       // test non-const regions
@@ -76,7 +75,7 @@ TEST_CASE("test TrivialCopyTraits", "[TrivialCopyTraits]") {
   }
 
   SECTION("double") {
-    REQUIRE(std::is_same<edm::TrivialCopyTraits<double>::value_type, double>::value);
+    REQUIRE(std::is_same_v<edm::TrivialCopyTraits<double>::value_type, double>);
 
     auto checkDouble = [](double v) {
       // test non-const regions
@@ -94,7 +93,7 @@ TEST_CASE("test TrivialCopyTraits", "[TrivialCopyTraits]") {
     };
 
     checkDouble(-1.0);
-    checkDouble(sqrt(2));
+    checkDouble(std::sqrt(2.));
     checkDouble(std::numeric_limits<double>::max());
     checkDouble(std::numeric_limits<double>::min());
     checkDouble(std::numeric_limits<double>::epsilon());
@@ -102,8 +101,8 @@ TEST_CASE("test TrivialCopyTraits", "[TrivialCopyTraits]") {
 
   SECTION("std::vector<float>") {
     using VectorType = std::vector<float>;
-    REQUIRE(std::is_same<edm::TrivialCopyTraits<VectorType>::value_type, VectorType>::value);
-    REQUIRE(std::is_same<edm::TrivialCopyTraits<VectorType>::Properties, VectorType::size_type>::value);
+    REQUIRE(std::is_same_v<edm::TrivialCopyTraits<VectorType>::value_type, VectorType>);
+    REQUIRE(std::is_same_v<edm::TrivialCopyTraits<VectorType>::Properties, VectorType::size_type>);
 
     VectorType vec = {-5.5f, -3.3f, -1.1f, 4.4f, 8.8f};
 
@@ -136,13 +135,10 @@ TEST_CASE("test TrivialCopyTraits", "[TrivialCopyTraits]") {
     float test_vec_sum = std::accumulate(test_vec.begin(), test_vec.end(), 0.0f);
 
     // initialize a memcpy-able struct s
-    S s;
-    s.vec = test_vec;
-    s.msg = test_msg;
-    s.setVecSum();
+    S s{test_msg, test_vec};
 
-    REQUIRE(std::is_same<edm::TrivialCopyTraits<S>::value_type, S>::value);
-    REQUIRE(std::is_same<edm::TrivialCopyTraits<S>::Properties, std::array<size_t, 2>>::value);
+    REQUIRE(std::is_same_v<edm::TrivialCopyTraits<S>::value_type, S>);
+    REQUIRE(std::is_same_v<edm::TrivialCopyTraits<S>::Properties, std::array<size_t, 2>>);
 
     // initialize a clone of s
     S s_clone;
@@ -182,6 +178,6 @@ TEST_CASE("test TrivialCopyTraits", "[TrivialCopyTraits]") {
     using MapType = std::map<int, int>;
 
     // there is no TrivialCopyTraits specialization for std::map (and there shouldn't be, since std::map is not trivially copyable)
-    static_assert(!HasTrivialCopyTraits<MapType>);
+    static_assert(!edm::HasTrivialCopyTraits<MapType>);
   }
 }
