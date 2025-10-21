@@ -1,11 +1,11 @@
-#ifndef TrivialSerialisation_Common_interface_TrivialCopyTraits_h
-#define TrivialSerialisation_Common_interface_TrivialCopyTraits_h
+#ifndef Dataformats_Common_interface_TrivialCopyTraits_h
+#define Dataformats_Common_interface_TrivialCopyTraits_h
 
 #include <cassert>
 #include <span>
 #include <type_traits>
-#include <utility>
 #include <vector>
+#include <string>
 
 namespace edm {
 
@@ -23,22 +23,22 @@ namespace edm {
   //
   // A specialisation may implement the type alias Properties to describe the
   // properties of an object that can be queried from an existing object via the
-  // properties() method, and used to initialise a newly allocated copy of the
+  // properties() method, and used to initialize a newly allocated copy of the
   // object via the initialize() method.
   //
   // If Properties is void, the properties() method should not be implemented,
   // and the initialize() method takes a single argument:
   //
   //   using Properties = void;
-  //   static void initialise(T& object);
+  //   static void initialize(T& object);
   //
   // If Properties is a concrete type, the properties() method should return an
-  // instance of Properties, and the initialise() method should take as a second
+  // instance of Properties, and the initialize() method should take as a second
   // parameter a const reference to a Properties object:
   //
   //   using Properties = ...;
   //   static Properties properties(T const& object);
-  //   static void initialise(T& object, Properties const& args);
+  //   static void initialize(T& object, Properties const& args);
   //
   //
   // A specialisation can optionally provide a static method
@@ -47,9 +47,23 @@ namespace edm {
   //
   // If present, it should be called to restore the object invariants after a
   // memcpy operation.
+  //
+  //
+  // The concept HasTrivialCopyTraits<T> can be used to check if a specialisation
+  // of TrivialCopyTraits exists for a type T.
+  //
+  //   static_assert(HasTrivialCopyTraits<int>);
+  //
 
   template <typename T>
   struct TrivialCopyTraits;
+
+  // Concept to check if there is a TrivialCopyTraits specialization for a type T
+  template <typename T>
+  concept HasTrivialCopyTraits = requires(T& object, T const& const_object) {
+    TrivialCopyTraits<T>::regions(object);
+    TrivialCopyTraits<T>::regions(const_object);
+  };
 
   // Specialisation for arithmetic types
   template <typename T>
@@ -66,16 +80,32 @@ namespace edm {
     }
   };
 
+  // Specialisation for std::string
+  template <>
+  struct TrivialCopyTraits<std::string> {
+    using value_type = std::string;
+    using Properties = std::string::size_type;
+
+    static Properties properties(value_type const& object) { return object.size(); }
+    static void initialize(value_type& object, Properties const& size) { object.resize(size); }
+
+    static std::vector<std::span<std::byte>> regions(value_type& object) {
+      return {{reinterpret_cast<std::byte*>(object.data()), object.size() * sizeof(char)}};
+    }
+
+    static std::vector<std::span<const std::byte>> regions(value_type const& object) {
+      return {{reinterpret_cast<std::byte const*>(object.data()), object.size() * sizeof(char)}};
+    }
+  };
+
   // Specialisation for vectors of arithmetic types
   template <typename T>
     requires(std::is_arithmetic_v<T> and not std::is_same_v<T, bool>)
   struct TrivialCopyTraits<std::vector<T>> {
     using value_type = std::vector<T>;
-
     using Properties = std::vector<T>::size_type;
 
     static Properties properties(value_type const& object) { return object.size(); }
-
     static void initialize(value_type& object, Properties const& size) { object.resize(size); }
 
     static std::vector<std::span<std::byte>> regions(value_type& object) {
@@ -89,4 +119,4 @@ namespace edm {
 
 }  // namespace edm
 
-#endif  // TrivialSerialisation_Common_interface_TrivialCopyTraits_h
+#endif  // Dataformats_Common_interface_TrivialCopyTraits_h
