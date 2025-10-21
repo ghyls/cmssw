@@ -129,35 +129,6 @@ private:
   View view_;                     //!
 };
 
-// Specialize the TrivialCopyTraits for PortableHostColletion
-namespace edm {
-
-  template <typename T>
-  struct TrivialCopyTraits<PortableHostCollection<T>> {
-    using Properties = int32_t;
-
-    static Properties properties(PortableHostCollection<T> const& object) { return object->metadata().size(); }
-
-    static void initialize(PortableHostCollection<T>& object, Properties const& size) {
-      // replace the default-constructed empty object with one where the buffer has been allocated in pageable system memory
-      object = PortableHostCollection<T>(size, cms::alpakatools::host());
-    }
-
-    static std::vector<std::span<std::byte>> regions(PortableHostCollection<T>& object) {
-      std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
-      size_t size = alpaka::getExtentProduct(object.buffer());
-      return {{address, size}};
-    }
-
-    static std::vector<std::span<const std::byte>> regions(PortableHostCollection<T> const& object) {
-      const std::byte* address = reinterpret_cast<const std::byte*>(object.buffer().data());
-      size_t size = alpaka::getExtentProduct(object.buffer());
-      return {{address, size}};
-    }
-  };
-
-}  // namespace edm
-
 // generic SoA-based product in host memory
 template <typename T0, typename... Args>
 class PortableHostMultiCollection {
@@ -402,5 +373,60 @@ using PortableHostCollection4 = ::PortableHostMultiCollection<T0, T1, T2, T3>;
 
 template <typename T0, typename T1, typename T2, typename T3, typename T4>
 using PortableHostCollection5 = ::PortableHostMultiCollection<T0, T1, T2, T3, T4>;
+
+namespace edm {
+
+  // Specialize the TrivialCopyTraits for PortableHostColletion
+  template <typename T>
+  struct TrivialCopyTraits<PortableHostCollection<T>> {
+    using value_type = PortableHostCollection<T>;
+    using Properties = int32_t;
+
+    static Properties properties(value_type const& object) { return object->metadata().size(); }
+
+    static void initialize(value_type& object, Properties const& size) {
+      // replace the default-constructed empty object with one where the buffer has been allocated in pageable system memory
+      object = value_type(size, cms::alpakatools::host());
+    }
+
+    static std::vector<std::span<std::byte>> regions(value_type& object) {
+      std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+
+    static std::vector<std::span<const std::byte>> regions(value_type const& object) {
+      const std::byte* address = reinterpret_cast<const std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+  };
+
+  // Specialize the TrivialCopyTraits for PortableHostMultiCollection
+  template <typename T0, typename... Args>
+  struct TrivialCopyTraits<PortableHostMultiCollection<T0, Args...>> {
+    using value_type = PortableHostMultiCollection<T0, Args...>;
+    using Properties = typename PortableHostMultiCollection<T0, Args...>::SizesArray;
+
+    static Properties properties(PortableHostMultiCollection<T0, Args...> const& object) { return object.sizes(); }
+
+    static void initialize(PortableHostMultiCollection<T0, Args...>& object, Properties const& sizes) {
+      // replace the default-constructed empty object with one where the buffer has been allocated in pageable system memory
+      object = PortableHostMultiCollection<T0, Args...>(sizes, cms::alpakatools::host());
+    }
+
+    static std::vector<std::span<std::byte>> regions(PortableHostMultiCollection<T0, Args...>& object) {
+      std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+
+    static std::vector<std::span<const std::byte>> regions(PortableHostMultiCollection<T0, Args...> const& object) {
+      const std::byte* address = reinterpret_cast<const std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+  };
+}  // namespace edm
 
 #endif  // DataFormats_Portable_interface_PortableHostCollection_h
