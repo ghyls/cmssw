@@ -3,7 +3,9 @@
 
 #include <cassert>
 #include <memory>
+#include <type_traits>
 
+#include "DataFormats/Common/interface/TrivialCopyTraits.h"
 #include "DataFormats/Common/interface/Uninitialized.h"
 
 namespace edm {
@@ -76,9 +78,56 @@ namespace edm {
       md.synchronize(std::forward<Args>(args)...);
       return data_;
     }
+    T const& product() const { return data_; }
+    T& product() { return data_; }
 
   private:
     T data_;  //!
   };
+}  // namespace edm
+
+
+namespace edm {
+
+  template <typename T>
+    requires HasTrivialCopyTraits<T> && HasTrivialCopyProperties<T>
+  struct TrivialCopyTraits<edm::DeviceProduct<T>> {
+    using Properties = TrivialCopyProperties<T>;
+    
+    static Properties properties(edm::DeviceProduct<T> const& wrapper) {
+      return TrivialCopyTraits<T>::properties(wrapper.product());
+    }
+    
+    static void initialize(edm::DeviceProduct<T>& wrapper, Properties const& props) {
+      TrivialCopyTraits<T>::initialize(wrapper.product(), props);
+    }
+    
+    static std::vector<std::span<std::byte>> regions(edm::DeviceProduct<T>& wrapper) {
+      return TrivialCopyTraits<T>::regions(wrapper.product());
+    }
+    
+    static std::vector<std::span<const std::byte>> regions(edm::DeviceProduct<T> const& wrapper) {
+      return TrivialCopyTraits<T>::regions(wrapper.product());
+    }
+  };
+
+  template <typename T>
+    requires HasTrivialCopyTraits<T> && (!HasTrivialCopyProperties<T>)
+  struct TrivialCopyTraits<edm::DeviceProduct<T>> {
+    using Properties = void;
+    
+    static void initialize(edm::DeviceProduct<T>& wrapper) {
+      TrivialCopyTraits<T>::initialize(wrapper.product());
+    }
+    
+    static std::vector<std::span<std::byte>> regions(edm::DeviceProduct<T>& wrapper) {
+      return TrivialCopyTraits<T>::regions(wrapper.product());
+    }
+    
+    static std::vector<std::span<const std::byte>> regions(edm::DeviceProduct<T> const& wrapper) {
+      return TrivialCopyTraits<T>::regions(wrapper.product());
+    }
+  };
+
 }  // namespace edm
 #endif

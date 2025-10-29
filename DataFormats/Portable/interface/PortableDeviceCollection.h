@@ -2,11 +2,14 @@
 #define DataFormats_Portable_interface_PortableDeviceCollection_h
 
 #include <cassert>
+#include <cstdint>
 #include <optional>
+#include <tuple>
 #include <type_traits>
 
 #include <alpaka/alpaka.hpp>
 
+#include "DataFormats/Common/interface/TrivialCopyTraits.h"
 #include "DataFormats/Common/interface/Uninitialized.h"
 #include "DataFormats/Portable/interface/PortableCollectionCommon.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
@@ -173,7 +176,7 @@ private:
 public:
   PortableDeviceMultiCollection() = delete;
 
-  explicit PortableDeviceMultiCollection(edm::Uninitialized) noexcept {};
+  explicit PortableDeviceMultiCollection(edm::Uninitialized) noexcept {}
 
   PortableDeviceMultiCollection(int32_t elements, TDev const& device)
       : buffer_{cms::alpakatools::make_device_buffer<std::byte[]>(device, Layout<>::computeDataSize(elements))},
@@ -327,5 +330,63 @@ private:
   std::optional<Buffer> buffer_;  //!
   Implementation impl_;           // (serialized: this is where the layouts live)
 };
+
+namespace edm {
+
+  // Specialize the TrivialCopyTraits for PortableDeviceCollection
+  template <typename T, typename TDev>
+  struct TrivialCopyTraits<PortableDeviceCollection<T, TDev>> {
+    using Properties = uint32_t;
+
+    static Properties properties(PortableDeviceCollection<T, TDev> const& object) {
+      return static_cast<uint32_t>(object.view().metadata().size());
+    }
+
+    static void initialize(PortableDeviceCollection<T, TDev>& object, Properties const& props) {
+      auto device = alpaka::getDevByIdx(alpaka::Platform<TDev>{}, 0u);
+      object = PortableDeviceCollection<T, TDev>(props, device);
+    }
+
+    static std::vector<std::span<std::byte>> regions(PortableDeviceCollection<T, TDev>& object) {
+      std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+
+    static std::vector<std::span<const std::byte>> regions(PortableDeviceCollection<T, TDev> const& object) {
+      const std::byte* address = reinterpret_cast<const std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+  };
+
+  // Specialize the TrivialCopyTraits for PortableDeviceMultiCollection
+  template <typename TDev, typename T0, typename... Args>
+  struct TrivialCopyTraits<PortableDeviceMultiCollection<TDev, T0, Args...>> {
+    using Properties = typename PortableDeviceMultiCollection<TDev, T0, Args...>::SizesArray;
+
+    static Properties properties(PortableDeviceMultiCollection<TDev, T0, Args...> const& object) {
+      return object.sizes();
+    }
+
+    static void initialize(PortableDeviceMultiCollection<TDev, T0, Args...>& object, Properties const& sizes) {
+      auto device = alpaka::getDevByIdx(alpaka::Platform<TDev>{}, 0u);
+      object = PortableDeviceMultiCollection<TDev, T0, Args...>(sizes, device);
+    }
+
+    static std::vector<std::span<std::byte>> regions(PortableDeviceMultiCollection<TDev, T0, Args...>& object) {
+      std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+
+    static std::vector<std::span<const std::byte>> regions(
+        PortableDeviceMultiCollection<TDev, T0, Args...> const& object) {
+      const std::byte* address = reinterpret_cast<const std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+  };
+}  // namespace edm
 
 #endif  // DataFormats_Portable_interface_PortableDeviceCollection_h

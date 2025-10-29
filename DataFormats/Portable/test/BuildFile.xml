@@ -5,11 +5,14 @@
   <use name="eigen"/>
 </bin>
 
-<bin name="TestDataFormatsPortableHeterogenous" file="alpaka/test_catch2_heterogeneousDeepCopy.dev.cc">
+<bin name="TestDataFormatsPortableHeterogenous" file="alpaka/test_catch2_heterogeneousDeepCopy.dev.cc,alpaka/test_catch2_portableCollectionsSerialiserPluginFactory.dev.cc">
   <use name="DataFormats/Portable"/>
+  <use name="FWCore/PluginManager"/>
   <use name="DataFormats/SoATemplate"/>
+  <use name="TrivialSerialisation/Common"/>
   <use name="catch2"/>
   <use name="eigen"/>
+  <use name="HeterogeneousCore/AlpakaCore"/>
   <use name="HeterogeneousCore/AlpakaInterface"/>
   <flags ALPAKA_BACKENDS="1"/>
 </bin>
