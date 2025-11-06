@@ -38,7 +38,7 @@
 #include <iostream>
 
 // local include files
-#include "api.h"
+#include "HeterogeneousCore/MPICore/interface/api.h"
 
 class MPISender : public edm::stream::EDProducer<edm::ExternalWork> {
 public:
@@ -155,12 +155,13 @@ public:
       index++;
     }
 
-    // Submit sending of all products to run in the additional asynchronous threadpool
-    edm::Service<edm::Async> as;
-    as->runAsync(
-        std::move(holder),
-        [this, token, meta = std::move(meta)]() { token.channel()->sendMetadata(instance_, meta); },
-        []() { return "Calling MPISender::acquire()"; });
+    token.channel()->sendMetadata(instance_, meta);
+    // // Submit sending of all products to run in the additional asynchronous threadpool
+    // edm::Service<edm::Async> as;
+    // as->runAsync(
+    //     std::move(holder),
+    //     [this, token, meta = std::move(meta)]() { token.channel()->sendMetadata(instance_, meta); },
+    //     []() { return "Calling MPISender::acquire()"; });
   }
 
   void produce(edm::Event& event, edm::EventSetup const&) final {

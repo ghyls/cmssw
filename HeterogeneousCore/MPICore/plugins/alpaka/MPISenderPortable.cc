@@ -19,7 +19,9 @@
 #include "FWCore/ParameterSet/interface/ParameterSetDescription.h"
 #include "FWCore/Reflection/interface/TypeWithDict.h"
 #include "FWCore/Utilities/interface/Exception.h"
-#include "HeterogeneousCore/MPICore/interface/MPIToken.h"
+#include "HeterogeneousCore/MPICore/interface/alpaka/MPIToken.h"
+#include "HeterogeneousCore/MPICore/interface/alpaka/api.h"
+
 
 #include "FWCore/Concurrency/interface/Async.h"
 #include "FWCore/Concurrency/interface/chain_first.h"
@@ -39,6 +41,7 @@
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/Event.h"
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/EventSetup.h"
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/EDProducer.h"
+#include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/SynchronizingEDProducer.h"
 
 
 #include <condition_variable>
@@ -47,24 +50,26 @@
 #include <iostream>
 
 // local include files
-#include "HeterogeneousCore/MPICore/plugins/api.h"
+#include "HeterogeneousCore/MPICore/interface/alpaka/api.h"
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
-class MPISender : public edm::stream::EDProducer<edm::ExternalWork> {
+class MPISenderPortable : public stream::SynchronizingEDProducer<> {
 public:
-  MPISender(edm::ParameterSet const& config)
-      : upstream_(consumes<MPIToken>(config.getParameter<edm::InputTag>("upstream"))),
-        token_(produces<MPIToken>()),
+  MPISenderPortable(edm::ParameterSet const& config)
+      : SynchronizingEDProducer<>(config),
+        upstream_(consumes<MPIToken>(config.getParameter<edm::InputTag>("upstream"))),
+        token_(produces()),
         patterns_(edm::productPatterns(config.getParameter<std::vector<std::string>>("products"))),
         instance_(config.getParameter<int32_t>("instance")),
         buffer_(std::make_unique<TBufferFile>(TBuffer::kWrite)),
         buffer_offset_(0),
-        metadata_size_(0) {
+        metadata_size_(0) 
+        {
     // instance 0 is reserved for the MPIController / MPISource pair
     // instance values greater than 255 may not fit in the MPI tag
     if (instance_ < 1 or instance_ > 255) {
-      throw cms::Exception("InvalidValue") << "Invalid MPISender instance value, please use a value between 1 and 255";
+      throw cms::Exception("InvalidValue") << "Invalid MPISenderPortable instance value, please use a value between 1 and 255";
     }
 
     products_.resize(patterns_.size());
@@ -83,11 +88,11 @@ public:
               entry.type = product.unwrappedType();
               entry.wrappedType = product.wrappedType();
               // TODO move this to EDConsumerBase::consumes() ?
-              entry.token = this->consumes(
+              entry.getToken_ = this->consumes(
                   edm::TypeToGet{product.unwrappedTypeID(), edm::PRODUCT_TYPE},
                   edm::InputTag{product.moduleLabel(), product.productInstanceName(), product.processName()});
 
-              edm::LogVerbatim("MPISender")
+              edm::LogVerbatim("MPISenderPortable")
                   << "send product \"" << product.friendlyClassName() << '_' << product.moduleLabel() << '_'
                   << product.productInstanceName() << '_' << product.processName() << "\" of type \""
                   << entry.type.name() << "\" over MPI channel instance " << instance_;
@@ -109,11 +114,13 @@ public:
               << "Unexpected branch type " << product.branchType() << "\nPlease contact a Framework developer\n";
       }
     });
-
+    printf("MPISenderPortable constructed with %zu patterns\n", patterns_.size());
     // TODO add an error if a pattern does not match any branches? how?
   }
 
-  void acquire(edm::Event const& event, edm::EventSetup const&, edm::WaitingTaskWithArenaHolder holder) final {
+  // void acquire(device::Event const& event, device::EventSetup const&, edm::WaitingTaskWithArenaHolder holder) {
+  void acquire(device::Event const& event, device::EventSetup const&) final {
+    printf("Entering MPISenderPortable::acquire()\n");
     MPIToken token = event.get(upstream_);
     // we need 1 byte for type, 8 bytes for size and at least 8 bytes for trivial copy parameters buffer
     auto meta = std::make_shared<ProductMetadataBuilder>(products_.size() * 24);
@@ -131,7 +138,7 @@ public:
     for (auto const& entry : products_) {
       // Get the product
       edm::Handle<edm::WrapperBase> handle(entry.type.typeInfo());
-      event.getByToken(entry.token, handle);
+      static_cast<edm::Event const&>(event).getByToken(entry.getToken_, handle);
 
       // product count -1 indicates that the event was filtered out on given path
       if (!handle.isValid() && entry.type.name() == "edm::PathStateToken") {
@@ -143,7 +150,7 @@ public:
       if (handle.isValid()) {
         edm::WrapperBase const* wrapper = handle.product();
         std::unique_ptr<ngt::SerialiserBase> serialiser{
-          ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())};
+          ngt::SerialiserFactoryPortable::get()->tryToCreate(entry.type.typeInfo().name())};
 
         if (serialiser) {
           auto reader = serialiser->initialize(*wrapper);
@@ -152,7 +159,7 @@ public:
         } else {
           TClass* cls = entry.wrappedType.getClass();
           if (!cls) {
-            throw cms::Exception("MPISender") << "Failed to get TClass for type: " << entry.type.name();
+            throw cms::Exception("MPISenderPortable") << "Failed to get TClass for type: " << entry.type.name();
           }
           size_t bufLen = serializeAndStoreBuffer_(index, cls, wrapper);
           meta->addSerialized(bufLen);
@@ -165,16 +172,18 @@ public:
       }
       index++;
     }
+    token.channel()->sendMetadata(instance_, meta);
 
-    // Submit sending of all products to run in the additional asynchronous threadpool
-    edm::Service<edm::Async> as;
-    as->runAsync(
-        std::move(holder),
-        [this, token, meta = std::move(meta)]() { token.channel()->sendMetadata(instance_, meta); },
-        []() { return "Calling MPISender::acquire()"; });
+    // // Submit sending of all products to run in the additional asynchronous threadpool
+    // edm::Service<edm::Async> as;
+    // as->runAsync(
+    //     std::move(holder),
+    //     [this, token, meta = std::move(meta)]() { token.channel()->sendMetadata(instance_, meta); },
+    //     []() { return "Calling MPISenderPortable::acquire()"; });
   }
 
-  void produce(device::Event& event, device::EventSetup const&) {
+  void produce(device::Event& event, device::EventSetup const&) override {
+    printf("Entering MPISenderPortable::produce()\n");
     MPIToken token = event.get(upstream_);
 
     if (!is_active_) {
@@ -188,12 +197,15 @@ public:
 
     for (auto const& entry : products_) {
       edm::Handle<edm::WrapperBase> handle(entry.type.typeInfo());
-      event.getByToken(entry.token, handle);
+      // event.getByToken(entry.token, handle);
+      static_cast<edm::Event const&>(event).getByToken(entry.getToken_, handle);
+
+
       edm::WrapperBase const* wrapper = handle.product();
       // we don't send missing products
       if (handle.isValid()) {
-        std::unique_ptr<ngt::SerialiserBase> serialiser{
-          ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())};
+      std::unique_ptr<ngt::SerialiserBase> serialiser{
+          ngt::SerialiserFactoryPortable::get()->tryToCreate(entry.type.typeInfo().name())};
         if (serialiser) {
           auto reader = serialiser->initialize(*wrapper);
           token.channel()->sendTrivialCopyProduct(instance_, *reader);
@@ -217,7 +229,7 @@ private:
   struct Entry {
     edm::TypeWithDict type;
     edm::TypeWithDict wrappedType;
-    edm::EDGetToken token;
+    edm::EDGetToken getToken_;
   };
 
   // TODO consider if upstream_ should be a vector instead of a single token ?
@@ -237,4 +249,4 @@ private:
 
 // #include "FWCore/Framework/interface/MakerMacros.h"
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/MakerMacros.h"
-DEFINE_FWK_ALPAKA_MODULE(MPISender);
+DEFINE_FWK_ALPAKA_MODULE(MPISenderPortable);

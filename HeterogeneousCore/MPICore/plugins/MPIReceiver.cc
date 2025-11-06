@@ -30,7 +30,7 @@
 #include <cassert>
 
 // local include files
-#include "api.h"
+#include "HeterogeneousCore/MPICore/interface/api.h"
 #include <TBufferFile.h>
 #include <TClass.h>
 
@@ -71,11 +71,14 @@ public:
     //also try unique or optional
     received_meta_ = std::make_shared<ProductMetadataBuilder>();
 
-    edm::Service<edm::Async> as;
-    as->runAsync(
-        std::move(holder),
-        [this, token]() { token.channel()->receiveMetadata(instance_, received_meta_); },
-        []() { return "Calling MPIReceiver::acquire()"; });
+
+    token.channel()->receiveMetadata(instance_, received_meta_);
+
+    // edm::Service<edm::Async> as;
+    // as->runAsync(
+    //     std::move(holder),
+    //     [this, token]() { token.channel()->receiveMetadata(instance_, received_meta_); },
+    //     []() { return "Calling MPIReceiver::acquire()"; });
   }
 
   void produce(edm::Event& event, edm::EventSetup const&) final {

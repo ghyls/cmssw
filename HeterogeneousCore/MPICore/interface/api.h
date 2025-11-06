@@ -17,8 +17,8 @@
 #include "TrivialSerialisation/Common/interface/SerialiserFactory.h"
 
 // local headers
-#include "messages.h"
-#include "metadata.h"
+#include "HeterogeneousCore/MPICore/interface/messages.h"
+#include "HeterogeneousCore/MPICore/interface/metadata.h"
 
 #include <iostream>
 #include <utility>
@@ -106,6 +106,20 @@ public:
         throw std::runtime_error("ROOT dictionary not found for type " + std::string(typeid(T).name()));
       }
       receiveSerializedProduct_(instance, type, &product);
+    }
+  }
+
+  // TODO: this might need to become an alpaka module
+  template <typename TQueue, typename TWriter> 
+  void receiveInitializedTrivialCopy(TQueue& queue, int instance, TWriter& writer) {
+    int tag = EDM_MPI_SendTrivialCopyProduct | instance * EDM_MPI_MessageTagWidth_;
+    MPI_Status status;
+    // receive the memory regions
+    auto regions = writer.regions();
+    // TODO receive and validate the number of regions ?
+    for (size_t i = 0; i < regions.size(); ++i) {
+      assert(regions[i].data() != nullptr);
+      MPI_Recv(regions[i].data(), regions[i].size_bytes(), MPI_BYTE, dest_, tag, comm_, &status);
     }
   }
 

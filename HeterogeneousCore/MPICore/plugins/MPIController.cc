@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -27,8 +28,8 @@
 #include "HeterogeneousCore/MPICore/interface/MPIToken.h"
 #include "HeterogeneousCore/MPIServices/interface/MPIService.h"
 
-#include "api.h"
-#include "messages.h"
+#include "HeterogeneousCore/MPICore/interface/api.h"
+#include "HeterogeneousCore/MPICore/interface/messages.h"
 
 /* MPIController class
  *
@@ -107,7 +108,9 @@ MPIController::MPIController(edm::ParameterSet const& config)
     edm::LogAbsolute("MPI") << "MPIController has rank " << rank << " in MPI_COMM_WORLD.";
     int other_rank = 1 - rank;
     comm_ = MPI_COMM_WORLD;
+    printf("MPI Controller: creating channel\n");
     channel_ = MPIChannel(comm_, other_rank);
+    printf("MPI Controller: channel created\n");
   } else if (mode_ == kIntercommunicator) {
     // Use an intercommunicator to let two groups of processes communicate with each other.
     // The current implementation supports only two processes: one controller and one source.
@@ -128,8 +131,11 @@ MPIController::MPIController(edm::ParameterSet const& config)
     edm::LogAbsolute("MPI") << "Trying to connect to the MPI server on port " << port;
 
     // Create an intercommunicator and connect to the server.
+    printf("Going to create a communicator\n");
     MPI_Comm_connect(port, MPI_INFO_NULL, 0, MPI_COMM_SELF, &comm_);
+    printf("Communicator created\n");
     MPI_Comm_remote_size(comm_, &size);
+    printf("Remote size: %d\n", size);
     if (size != 1) {
       throw edm::Exception(edm::errors::Configuration)
           << "The current implementation supports only two processes: one controller and one source.";
@@ -152,7 +158,9 @@ MPIController::~MPIController() {
 
 void MPIController::beginJob() {
   // signal the connection
+  printf("Sending connect message\n");
   channel_.sendConnect();
+  printf("Connect message sent\n");
 
   /* is there a way to access all known process histories ?
   edm::ProcessHistoryRegistry const& registry = * edm::ProcessHistoryRegistry::instance();

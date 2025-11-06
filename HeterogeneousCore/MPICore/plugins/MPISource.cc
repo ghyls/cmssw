@@ -39,9 +39,9 @@
 #include "HeterogeneousCore/MPIServices/interface/MPIService.h"
 
 // local headers
-#include "api.h"
-#include "conversion.h"
-#include "messages.h"
+#include "HeterogeneousCore/MPICore/interface/api.h"
+#include "HeterogeneousCore/MPICore/interface/conversion.h"
+#include "HeterogeneousCore/MPICore/interface/messages.h"
 
 class MPISource : public edm::ProducerSourceBase {
 public:
@@ -110,7 +110,9 @@ MPISource::MPISource(edm::ParameterSet const& config, edm::InputSourceDescriptio
     edm::LogAbsolute("MPI") << "MPISource has rank " << rank << " in MPI_COMM_WORLD.";
     int other_rank = 1 - rank;
     comm_ = MPI_COMM_WORLD;
+    printf("MPI Source: creating channel\n");
     channel_ = MPIChannel(comm_, other_rank);
+    printf("MPI Source: channel created\n");
   } else if (mode_ == kIntercommunicator) {
     // Use an intercommunicator to let two groups of processes communicate with each other.
     // The current implementation supports only two processes: one controller and one source.

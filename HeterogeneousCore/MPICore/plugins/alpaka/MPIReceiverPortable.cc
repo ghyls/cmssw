@@ -10,7 +10,9 @@
 #include "FWCore/ParameterSet/interface/ParameterSet.h"
 #include "FWCore/ParameterSet/interface/ParameterSetDescription.h"
 #include "FWCore/Utilities/interface/Exception.h"
-#include "HeterogeneousCore/MPICore/interface/MPIToken.h"
+#include "HeterogeneousCore/MPICore/interface/alpaka/MPIToken.h"
+#include "HeterogeneousCore/MPICore/interface/alpaka/api.h"
+#include "DataFormats/Provenance/interface/ProductNamePattern.h"
 
 #include "FWCore/Concurrency/interface/Async.h"
 #include "FWCore/Concurrency/interface/chain_first.h"
@@ -22,8 +24,8 @@
 #include "FWCore/ServiceRegistry/interface/Service.h"
 #include "FWCore/ServiceRegistry/interface/ServiceMaker.h"
 #include "FWCore/Utilities/interface/Exception.h"
-// #include "TrivialSerialisation/Common/interface/SerialiserBase.h"
-// #include "TrivialSerialisation/Common/interface/SerialiserFactory.h"
+#include "TrivialSerialisation/Common/interface/alpaka/SerialiserBase.h"
+#include "TrivialSerialisation/Common/interface/alpaka/SerialiserFactory.h"
 
 #include "alpaka/alpaka.hpp"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
@@ -34,13 +36,12 @@
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/EDProducer.h"
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/SynchronizingEDProducer.h"
 
-
 #include <condition_variable>
 #include <mutex>
 #include <cassert>
 
 // local include files
-#include "HeterogeneousCore/MPICore/plugins/api.h"
+#include "HeterogeneousCore/MPICore/interface/messages.h"
 #include <TBufferFile.h>
 #include <TClass.h>
 
@@ -58,29 +59,80 @@ public:
     upstream_ = consumes(config.getParameter<edm::InputTag>("upstream"));
     token_ = produces();
 
+    eventProducts_.reserve(eventPatterns_.size());
+
+    callWhenNewProductsRegistered([this](edm::ProductDescription const& product) {
+      static const std::string_view kPathStatus("edm::PathStatus");
+      static const std::string_view kEndPathStatus("edm::EndPathStatus");
+      static const std::string_view kBackend("backend");
+
+      switch (product.branchType()) {
+        case edm::InEvent:
+          if (product.className() == kPathStatus or product.className() == kEndPathStatus) {
+            return;
+          }
+          if (product.productInstanceName() == kBackend) {
+            return;
+          }
+          for (auto& pattern : eventPatterns_) {
+            if (pattern.match(product)) {
+              // check that the product is not transient
+              if (product.transient()) {
+                // edm::LogWarning("GenericClonerPortable")
+                // << "Event product " << product.branchName() << " of type " << product.unwrappedType()
+                // << " is transient, will not be cloned.";
+                // break;
+              }
+              if (verbose_) {
+                edm::LogInfo("GenericClonerPortable")
+                    << "will clone Event product " << product.branchName() << " of type " << product.unwrappedType();
+              }
+              Entry entry;
+              entry.objectType_ = product.unwrappedType();
+              entry.wrappedType_ = product.wrappedType();
+
+              // TODO move this to EDConsumerBase::consumes() ?
+              entry.getToken_ = this->consumes(
+                  edm::TypeToGet{product.unwrappedTypeID(), edm::PRODUCT_TYPE},
+                  edm::InputTag{product.moduleLabel(), product.productInstanceName(), product.processName()});
+              printf("Type name: %s\n", product.unwrappedTypeID().typeInfo().name());
+              printf("Event product: %s\n", product.branchName().c_str());
+              printf("Product Instance Name: %s\n", product.productInstanceName().c_str());
+              printf("process Name: %s\n", product.processName().c_str());
+
+              entry.putToken_ =
+                  this->producesCollector().produces(product.unwrappedTypeID(), product.productInstanceName());
+              eventProducts_.emplace_back(std::move(entry));
+              break;
+            }
+          }
+          break;
+
+        case edm::InLumi:
+        case edm::InRun:
+        case edm::InProcess:
+          // lumi, run and process products are not supported
+          break;
+
+        default:
+          throw edm::Exception(edm::errors::LogicError)
+              << "Unexpected product type " << product.branchType() << "\nPlease contact a Framework developer.";
+      }
+    });
+
+
     if (instance_ < 1 or instance_ > 255) {
       throw cms::Exception("InvalidValue")
           << "Invalid MPIReceiverPortable instance value, please use a value between 1 and 255";
     }
 
+    printf("MPIReceiverPortable constructed with %zu patterns\n", eventProducts_.size());
     auto const& products = config.getParameter<std::vector<edm::ParameterSet>>("products");
-    products_.reserve(products.size());
-    for (auto const& product : products) {
-      auto const& type = product.getParameter<std::string>("type");
-      auto const& label = product.getParameter<std::string>("label");
-      Entry entry;
-      entry.type = edm::TypeWithDict::byName(type);
-      entry.wrappedType = edm::TypeWithDict::byName("edm::Wrapper<" + type + ">");
-      entry.token = produces(edm::TypeID{entry.type.typeInfo()}, label);
-
-      edm::LogVerbatim("MPIReceiverPortable") << "receive type \"" << entry.type.name() << "\" for label \"" << label
-                                      << "\" over MPI channel instance " << this->instance_;
-
-      products_.emplace_back(std::move(entry));
-    }
+    printf("MPIReceiverPortable configured to receive %zu products\n", products.size());
   }
 
   void acquire(device::Event const& event, device::EventSetup const&) final {
+    printf("Entering MPIReceiverPortable::acquire()\n");
     MPIToken token = event.get(upstream_);
 
     //also try unique or optional
@@ -95,7 +147,8 @@ public:
     //     []() { return "Calling MPIReceiverPortable::acquire()"; });
   }
 
-  void produce(device::Event& event, device::EventSetup const&) {
+  void produce(device::Event& event, device::EventSetup const&) override{
+    printf("Entering MPIReceiverPortable::produce()\n");
     // read the MPIToken used to establish the communication channel
     MPIToken token = event.get(upstream_);
     // see the summary of metadata for dubug purposes
@@ -119,14 +172,16 @@ public:
       full_buffer_size = serialized_buffer->BufferSize();
     }
 
-    for (auto const& entry : products_) {
-      std::unique_ptr<edm::WrapperBase> wrapper(
-          reinterpret_cast<edm::WrapperBase*>(entry.wrappedType.getClass()->New()));
+    for (auto const& product : eventProducts_) {
 
+      // std::unique_ptr<edm::WrapperBase> wrapper(
+      //     reinterpret_cast<edm::WrapperBase*>(product.wrappedType_.getClass()->New()));
+
+      std::unique_ptr<edm::WrapperBase> wrapper(static_cast<edm::WrapperBase*>(product.wrappedType_.getClass()->New()));
       auto product_meta = received_meta_->getNext();
 
       if (product_meta.kind == ProductMetadata::Kind::Missing) {
-        edm::LogWarning("MPIReceiverPortable") << "Product " << entry.type.name() << " was not received.";
+        edm::LogWarning("MPIReceiverPortable") << "Product " << product.type_.name() << " was not received.";
         continue;  // Skip products that weren't sent
       }
 
@@ -136,7 +191,7 @@ public:
         assert(buffer_offset_ < full_buffer_size && "serialized data buffer is shorter than expected");
         productBuffer.SetBuffer(buf_ptr + buffer_offset_, product_meta.sizeMeta, kFALSE /* adopt = false */);
         buffer_offset_ += product_meta.sizeMeta;
-        entry.wrappedType.getClass()->Streamer(wrapper.get(), productBuffer);
+        product.wrappedType_.getClass()->Streamer(wrapper.get(), productBuffer);
       }
 
       else if (product_meta.kind == ProductMetadata::Kind::TrivialCopy) {
@@ -144,24 +199,28 @@ public:
         // wrapper->markAsPresent();
         // std::unique_ptr<ngt::SerialiserBase> serialiser{
         //   ngt::SerialiserFactory::get()->tryToCreate(entry.objectType_.typeInfo().name())};
-        std::unique_ptr<ngt::SerialiserBase> serialiser{
-          ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())}; // is this ame correct?
+      std::unique_ptr<ngt::SerialiserBase> serialiser{
+          ngt::SerialiserFactoryPortable::get()->tryToCreate(product.objectType_.typeInfo().name())};
+
         if (!serialiser) {
           throw cms::Exception("SerializerError")
           << "Receiver could not retrieve its serializer when it was expected";
         }
+
         auto writer = serialiser->initialize(*wrapper);
         edm::AnyBuffer buffer = writer->parameters();  // constructs buffer with typeid
         assert(buffer.size_bytes() == product_meta.sizeMeta);
         // TDL: can we add func to AnyBuffer to replace pointer to the data?
         std::memcpy(buffer.data(), product_meta.trivialCopyOffset, product_meta.sizeMeta);
         // why both of these methods are called initialize? I find this rather confusing
-        writer->initialize(buffer);
-        token.channel()->receiveInitializedTrivialCopy(instance_, *writer);
+        writer->initialize(buffer, event.queue());
+        token.channel()->receiveInitializedTrivialCopy(event.queue(), instance_, *writer);
+
+        
         writer->trivialCopyFinalize();
       }
       // put the data into the Event
-      event.put(entry.token, std::move(wrapper));
+      event.put(product.putToken_, std::move(wrapper));
     }
 
     if (received_meta_->hasSerialized()) {
@@ -176,17 +235,20 @@ public:
 
 private:
   struct Entry {
-    edm::TypeWithDict type;
-    edm::TypeWithDict wrappedType;
-    edm::EDPutToken token;
+    edm::TypeWithDict type_;
+    edm::TypeWithDict wrappedType_;
+    edm::TypeWithDict objectType_;
+    edm::EDPutToken putToken_;
+    edm::EDGetToken getToken_;
   };
 
   // TODO consider if upstream_ should be a vector instead of a single token ?
   edm::EDGetTokenT<MPIToken> upstream_;  // MPIToken used to establish the communication channel
   edm::EDPutTokenT<MPIToken> token_;  // copy of the MPIToken that may be used to implement an ordering relation
-  std::vector<Entry> products_;             // data to be read over the channel and put into the Event
+  std::vector<Entry> eventProducts_;             // data to be read over the channel and put into the Event
   int32_t const instance_;                  // instance used to identify the source-destination pair
-
+  std::vector<edm::ProductNamePattern> eventPatterns_;
+  bool verbose_;
   std::shared_ptr<ProductMetadataBuilder> received_meta_;
 };
 

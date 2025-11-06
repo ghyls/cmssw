@@ -3,7 +3,7 @@
 
 #include "DataFormats/Provenance/interface/ProvenanceFwd.h"
 
-#include "messages.h"
+#include "HeterogeneousCore/MPICore/interface/messages.h"
 
 // fill an edm::RunAuxiliary object from an EDM_MPI_RunAuxiliary_t buffer
 void edmFromBuffer(EDM_MPI_RunAuxiliary_t const &, edm::RunAuxiliary &);

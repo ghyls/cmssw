@@ -15,11 +15,14 @@
 // #include "TrivialSerialisation/Common/interface/alpaka/TrivialSerialiser.h"
 
 // local headers
-#include "HeterogeneousCore/MPICore/interface/api.h"
+#include "HeterogeneousCore/MPICore/interface/alpaka/api.h"
 #include "HeterogeneousCore/MPICore/interface/conversion.h"
 #include "HeterogeneousCore/MPICore/interface/messages.h"
 
 #include <iostream>
+
+
+namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
 namespace {
   // copy the content of an std::string-like object to an N-sized char buffer:
@@ -35,6 +38,9 @@ namespace {
     }
   }
 }  // namespace
+
+
+
 
 // build a new MPIChannel that uses a duplicate of the underlying communicator and the same destination
 MPIChannel MPIChannel::duplicate() const {
@@ -227,3 +233,5 @@ void MPIChannel::receiveInitializedTrivialCopy(int instance, ngt::TrivialSeriali
     MPI_Recv(regions[i].data(), regions[i].size_bytes(), MPI_BYTE, dest_, tag, comm_, &status);
   }
 }
+
+}  // namespace ALPAKA_ACCELERATOR_NAMESPACE

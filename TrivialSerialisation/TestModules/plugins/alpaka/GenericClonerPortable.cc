@@ -64,6 +64,12 @@
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
 #include "alpaka/dev/Traits.hpp"
 
+
+#include <alpaka/alpaka.hpp>
+#include "HeterogeneousCore/AlpakaCore/interface/alpaka/MakerMacros.h"
+#include "HeterogeneousCore/AlpakaInterface/interface/config.h"
+
+
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
   class GenericClonerPortable : public stream::EDProducer<> {
