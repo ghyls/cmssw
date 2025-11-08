@@ -1,5 +1,6 @@
 // C++ standard library headers
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <tuple>
 #include <cassert>
@@ -114,7 +115,9 @@ void MPIChannel::edmToBuffer_(EDM_MPI_EventAuxiliary_t& buffer, edm::EventAuxili
 void MPIChannel::sendEmpty_(int tag) {
   EDM_MPI_Empty_t buffer;
   buffer.messageTag = tag;
+  printf("non-alpaka api.cc: MPIChannel::sendEmpty_ calling MPI_Send\n");
   MPI_Send(&buffer, 1, EDM_MPI_Empty, dest_, tag, comm_);
+  printf("non-alpaka api.cc: MPIChannel::sendEmpty_ done\n");
 }
 
 // fill and send an EDM_MPI_RunAuxiliary_t buffer
@@ -138,6 +141,7 @@ void MPIChannel::sendEventAuxiliary_(edm::EventAuxiliary const& aux) {
   EDM_MPI_EventAuxiliary_t buffer;
   buffer.messageTag = EDM_MPI_ProcessEvent;
   edmToBuffer_(buffer, aux);
+  printf("MPIChannel::sendEventAuxiliary_ calling MPI_Send, dest_= %d\n", dest_);
   MPI_Send(&buffer, 1, EDM_MPI_EventAuxiliary, dest_, EDM_MPI_ProcessEvent, comm_);
 }
 
@@ -145,6 +149,7 @@ void MPIChannel::sendEventAuxiliary_(edm::EventAuxiliary const& aux) {
 MPI_Status MPIChannel::receiveEventAuxiliary_(edm::EventAuxiliary& aux, int source, int tag) {
   MPI_Status status;
   EDM_MPI_EventAuxiliary_t buffer;
+  printf("MPIChannel::receiveEventAuxiliary_ calling MPI_Recv, source= %d, tag= %d\n", source, tag);
   MPI_Recv(&buffer, 1, EDM_MPI_EventAuxiliary, source, tag, comm_, &status);
   edmFromBuffer_(buffer, aux);
   return status;

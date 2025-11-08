@@ -1,38 +1,37 @@
 
 
-// #include <alpaka/alpaka.hpp>
-// #include <Eigen/Core>
-//
-// #include "DataFormats/Common/interface/DeviceProduct.h"
-// #include "DataFormats/Portable/interface/PortableCollection.h"
-//
-// #include "DataFormats/HcalRecHit/interface/HcalRecHitSoA.h"
-// #include "DataFormats/ParticleFlowReco/interface/PFRecHitSoA.h"
-// #include "DataFormats/ParticleFlowReco/interface/PFClusterSoA.h"
-// #include "DataFormats/ParticleFlowReco/interface/PFRecHitFractionSoA.h"
-// #include "DataFormats/EcalRecHit/interface/EcalUncalibratedRecHitSoA.h"
-// #include "DataFormats/EcalDigi/interface/EcalDigiSoA.h"
-//
-// // #include "DataFormats/PortableTestObjects/interface/alpaka/TestDeviceObject.h"
-// #include "DataFormats/Portable/interface/PortableDeviceObject.h"
-// #include "DataFormats/PortableTestObjects/interface/TestStruct.h"
-// #include "DataFormats/Portable/interface/PortableObject.h"
-// #include "DataFormats/PortableTestObjects/interface/TestSoA.h"
-// #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
-// #include "TrivialSerialisation/Common/interface/alpaka/SerialiserFactory.h"
-// #include "TrivialSerialisation/Common/interface/alpaka/TrivialSerialiser.h"
-// #include "TrivialSerialisation/Common/interface/alpaka/SerialiserFactory.h"
-// #include "TrivialSerialisation/Common/interface/alpaka/Serialiser.h"
-//
-// using namespace ALPAKA_ACCELERATOR_NAMESPACE;
-//
-//
+#include <alpaka/alpaka.hpp>
+#include <Eigen/Core>
 
-// using DeviceProductPortableCollectionHcalRecHitSoALayout = edm::DeviceProduct<PortableCollection<hcal::HcalRecHitSoALayout<128, false>, Device>>;
-// DEFINE_EDM_PLUGIN(ngt::SerialiserFactory,
-//                   ngt::Serialiser<DeviceProductPortableCollectionHcalRecHitSoALayout>,
-//                   typeid(DeviceProductPortableCollectionHcalRecHitSoALayout).name());
-//
+#include "DataFormats/Common/interface/DeviceProduct.h"
+#include "DataFormats/Portable/interface/PortableCollection.h"
+
+#include "DataFormats/HcalRecHit/interface/HcalRecHitSoA.h"
+#include "DataFormats/ParticleFlowReco/interface/PFRecHitSoA.h"
+#include "DataFormats/ParticleFlowReco/interface/PFClusterSoA.h"
+#include "DataFormats/ParticleFlowReco/interface/PFRecHitFractionSoA.h"
+#include "DataFormats/EcalRecHit/interface/EcalUncalibratedRecHitSoA.h"
+#include "DataFormats/EcalDigi/interface/EcalDigiSoA.h"
+
+// #include "DataFormats/PortableTestObjects/interface/alpaka/TestDeviceObject.h"
+#include "DataFormats/Portable/interface/PortableDeviceObject.h"
+#include "DataFormats/PortableTestObjects/interface/TestStruct.h"
+#include "DataFormats/Portable/interface/PortableObject.h"
+#include "DataFormats/PortableTestObjects/interface/TestSoA.h"
+#include "HeterogeneousCore/AlpakaInterface/interface/config.h"
+#include "TrivialSerialisation/Common/interface/alpaka/SerialiserFactory.h"
+#include "TrivialSerialisation/Common/interface/alpaka/TrivialSerialiser.h"
+#include "TrivialSerialisation/Common/interface/alpaka/SerialiserFactory.h"
+#include "TrivialSerialisation/Common/interface/alpaka/Serialiser.h"
+
+namespace ALPAKA_ACCELERATOR_NAMESPACE {
+
+
+
+
+using DeviceProductPortableCollectionHcalRecHitSoALayout = edm::DeviceProduct<PortableCollection<hcal::HcalRecHitSoALayout<128, false>, Device>>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(DeviceProductPortableCollectionHcalRecHitSoALayout);
+
 // using PortableCollectionPFRecHitSoALayout = PortableCollection<reco::PFRecHitSoALayout<128, false>, Device>;
 // DEFINE_EDM_PLUGIN(ngt::SerialiserFactory,
 //                   ngt::Serialiser<PortableCollectionPFRecHitSoALayout>,
@@ -59,3 +58,6 @@
 // DEFINE_EDM_PLUGIN(ngt::SerialiserFactory,
 //                   ngt::Serialiser<PortableCollectionEcalUncalibratedRecHitSoALayout>,
 //                   typeid(PortableCollectionEcalUncalibratedRecHitSoALayout).name());
+
+
+}

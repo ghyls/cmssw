@@ -100,9 +100,11 @@ public:
     });
 
     // TODO add an error if a pattern does not match any branches? how?
+    printf("MPISender constructed with %zu products\n", products_.size());
   }
 
   void acquire(edm::Event const& event, edm::EventSetup const&, edm::WaitingTaskWithArenaHolder holder) final {
+    printf("Entering MPISender::acquire()\n");
     MPIToken token = event.get(upstream_);
     // we need 1 byte for type, 8 bytes for size and at least 8 bytes for trivial copy parameters buffer
     auto meta = std::make_shared<ProductMetadataBuilder>(products_.size() * 24);
@@ -165,6 +167,7 @@ public:
   }
 
   void produce(edm::Event& event, edm::EventSetup const&) final {
+    printf("Entering MPISender::produce()\n");
     MPIToken token = event.get(upstream_);
 
     if (!is_active_) {

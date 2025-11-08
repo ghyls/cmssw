@@ -83,6 +83,7 @@ MPIController::MPIController(edm::ParameterSet const& config)
     : token_(produces<MPIToken>()),
       mode_(parseMode(config.getUntrackedParameter<std::string>("mode")))  //
 {
+  printf("MPI Controller: entering constructor\n");
   // make sure that MPI is initialised
   MPIService::required();
 
@@ -147,13 +148,16 @@ MPIController::MPIController(edm::ParameterSet const& config)
     throw edm::Exception(edm::errors::Configuration)
         << "Invalid mode \"" << config.getUntrackedParameter<std::string>("mode") << "\"";
   }
+  printf("MPI Controller constructed\n");
 }
 
 MPIController::~MPIController() {
+  printf("Entering ~MPIController()\n");
   // Close the intercommunicator.
   if (mode_ == kIntercommunicator) {
     MPI_Comm_disconnect(&comm_);
   }
+  printf("Exiting ~MPIController()\n");
 }
 
 void MPIController::beginJob() {
@@ -172,11 +176,13 @@ void MPIController::beginJob() {
 }
 
 void MPIController::endJob() {
+  printf("Entering MPIController::endJob()\n");
   // signal the disconnection
   channel_.sendDisconnect();
 }
 
 void MPIController::beginRun(edm::Run const& run, edm::EventSetup const& setup) {
+  printf("MPIController::beginRun() - started\n");
   // signal a new run, and transmit the RunAuxiliary
   /* FIXME
    * Ideally the ProcessHistoryID stored in the run.runAuxiliary() should be the correct one, and
@@ -195,9 +201,11 @@ void MPIController::beginRun(edm::Run const& run, edm::EventSetup const& setup) 
 
   // transmit the ProcessHistory
   channel_.sendProduct(0, run.processHistory());
+  printf("MPIController::beginRun() - done\n");
 }
 
 void MPIController::endRun(edm::Run const& run, edm::EventSetup const& setup) {
+  printf("MPIController::endRun() - started\n");
   // signal the end of run
   /* FIXME
    * Ideally the ProcessHistoryID stored in the run.runAuxiliary() should be the correct one, and
@@ -213,9 +221,11 @@ void MPIController::endRun(edm::Run const& run, edm::EventSetup const& setup) {
   auto aux = run.runAuxiliary();
   aux.setProcessHistoryID(run.processHistory().id());
   channel_.sendEndRun(aux);
+  printf("MPIController::endRun() - done\n");
 }
 
 void MPIController::beginLuminosityBlock(edm::LuminosityBlock const& lumi, edm::EventSetup const& setup) {
+  printf("MPIController::beginLuminosityBlock() - started\n");
   // signal a new luminosity block, and transmit the LuminosityBlockAuxiliary
   /* FIXME
    * Ideally the ProcessHistoryID stored in the lumi.luminosityBlockAuxiliary() should be the
@@ -231,9 +241,11 @@ void MPIController::beginLuminosityBlock(edm::LuminosityBlock const& lumi, edm::
   auto aux = lumi.luminosityBlockAuxiliary();
   aux.setProcessHistoryID(lumi.processHistory().id());
   channel_.sendBeginLuminosityBlock(aux);
+  printf("MPIController::beginLuminosityBlock() - done\n");
 }
 
 void MPIController::endLuminosityBlock(edm::LuminosityBlock const& lumi, edm::EventSetup const& setup) {
+  printf("MPIController::endLuminosityBlock() - started\n");
   // signal the end of luminosity block
   /* FIXME
    * Ideally the ProcessHistoryID stored in the lumi.luminosityBlockAuxiliary() should be the
@@ -249,9 +261,11 @@ void MPIController::endLuminosityBlock(edm::LuminosityBlock const& lumi, edm::Ev
   auto aux = lumi.luminosityBlockAuxiliary();
   aux.setProcessHistoryID(lumi.processHistory().id());
   channel_.sendEndLuminosityBlock(aux);
+  printf("MPIController::endLuminosityBlock() - done\n");
 }
 
 void MPIController::produce(edm::Event& event, edm::EventSetup const& setup) {
+  printf("MPIController::produce() - started\n");
   {
     edm::LogInfo log("MPI");
     log << "processing run " << event.run() << ", lumi " << event.luminosityBlock() << ", event " << event.id().event();
@@ -268,6 +282,7 @@ void MPIController::produce(edm::Event& event, edm::EventSetup const& setup) {
   }
 
   // signal a new event, and transmit the EventAuxiliary
+  printf("MPIController: Sending event auxiliary\n");
   channel_.sendEvent(event.eventAuxiliary());
 
   // duplicate the MPIChannel and put the copy into the Event
@@ -276,6 +291,7 @@ void MPIController::produce(edm::Event& event, edm::EventSetup const& setup) {
     delete ptr;
   });
   event.emplace(token_, std::move(link));
+  printf("MPIController::produce() - done\n");
 }
 
 void MPIController::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {

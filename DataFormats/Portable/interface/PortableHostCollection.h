@@ -391,6 +391,11 @@ namespace edm {
       object = value_type(size, queue);
     }
 
+    static void initialize(value_type& object, Properties const& size) {
+      // replace the default-constructed empty object with one where the buffer has been allocated in pageable system memory
+      object = value_type(size, cms::alpakatools::host());
+    }
+
     static std::vector<std::span<std::byte>> regions(value_type& object) {
       std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
       size_t size = alpaka::getExtentProduct(object.buffer());

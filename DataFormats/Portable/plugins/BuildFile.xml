@@ -14,3 +14,17 @@
   <use name="FWCore/PluginManager"/>
   <flags ALPAKA_BACKENDS="1"></flags>
 </library>
+
+<library file="TrivialSerialisationPlugins.cc" name="DataFormatsPortableTrivialSerialisationPlugins">
+  <use name="TrivialSerialisation/Common"></use>
+  <use name="DataFormats/SoATemplate"></use>
+  <use name="catch2"></use>
+  <use name="eigen"></use>
+  <use name="DataFormats/Common"/>
+  <use name="DataFormats/Portable"/>
+  <use name="DataFormats/EcalDigi"/>
+  <use name="DataFormats/HcalRecHit"/>
+  <use name="DataFormats/ParticleFlowReco"/>
+  <use name="FWCore/Framework"/>
+  <use name="FWCore/PluginManager"/>
+</library>

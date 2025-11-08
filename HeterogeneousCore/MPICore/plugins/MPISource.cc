@@ -86,6 +86,7 @@ MPISource::MPISource(edm::ParameterSet const& config, edm::InputSourceDescriptio
 {
   // make sure that MPI is initialised
 
+  printf("MPISource: entering constructor\n");
   MPIService::required();
 
   // Make sure the EDM MPI types are available.
@@ -107,7 +108,7 @@ MPISource::MPISource(edm::ParameterSet const& config, edm::InputSourceDescriptio
     // Check the rank of this process, and determine the rank of the other process.
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    edm::LogAbsolute("MPI") << "MPISource has rank " << rank << " in MPI_COMM_WORLD.";
+    // edm::LogAbsolute("MPI") << "MPISource has rank " << rank << " in MPI_COMM_WORLD.";
     int other_rank = 1 - rank;
     comm_ = MPI_COMM_WORLD;
     printf("MPI Source: creating channel\n");
@@ -149,14 +150,19 @@ MPISource::MPISource(edm::ParameterSet const& config, edm::InputSourceDescriptio
         << "Invalid mode \"" << config.getUntrackedParameter<std::string>("mode") << "\"";
   }
 
+  printf("MPI Source: waiting for connection\n");
   // Wait for a client to connect.
   MPI_Status status;
   EDM_MPI_Empty_t buffer;
+  printf("MPI Source: Calling MPI_Recv\n");
   MPI_Recv(&buffer, 1, EDM_MPI_Empty, MPI_ANY_SOURCE, EDM_MPI_Connect, comm_, &status);
+  printf("MPI Source: MPI_Recv returned\n");
   edm::LogAbsolute("MPI") << "connected from " << status.MPI_SOURCE;
+  printf("MPI Source: constructor done\n");
 }
 
 MPISource::~MPISource() {
+  printf("MPISource: entering destructor\n");
   if (mode_ == kIntercommunicator) {
     // Close the intercommunicator.
     MPI_Comm_disconnect(&comm_);
@@ -175,6 +181,8 @@ MPISource::~MPISource() {
 bool MPISource::setRunAndEventInfo(edm::EventID& event,
                                    edm::TimeValue_t& time,
                                    edm::EventAuxiliary::ExperimentType& type) {
+
+  printf("MPISource: setting run and event info\n");
   while (true) {
     MPI_Status status;
     MPI_Message message;
@@ -280,6 +288,7 @@ bool MPISource::setRunAndEventInfo(edm::EventID& event,
       case EDM_MPI_ProcessEvent: {
         // receive the EventAuxiliary
         edm::EventAuxiliary aux;
+        printf("MPISource: receiving event auxiliary\n");
         status = channel_.receiveEvent(aux, message);
 
         // extract the rank of the other process (currently unused)

@@ -135,8 +135,37 @@ public:
   // transfer a wrapped object using its TrivialCopyTraits
   void sendTrivialCopyProduct(int instance, const ngt::TrivialSerialiserBase& reader);
 
+  // templated version for alpaka modules (works with alpaka serializers)
+  template <typename TReader>
+  void sendTrivialCopyProductTemplated(int instance, const TReader& reader) {
+    int tag = EDM_MPI_SendTrivialCopyProduct | instance * EDM_MPI_MessageTagWidth_;
+    // transfer the memory regions
+    auto regions = reader.regions();
+    // TODO send the number of regions ?
+    for (size_t i = 0; i < regions.size(); ++i) {
+      assert(regions[i].data() != nullptr);
+      MPI_Send(regions[i].data(), regions[i].size_bytes(), MPI_BYTE, dest_, tag, comm_);
+    }
+  }
+
   // receive into wrapped object
   void receiveInitializedTrivialCopy(int instance, ngt::TrivialSerialiserBase& writer);
+
+  // templated version for alpaka modules that need to pass a queue to initialize
+  template <typename TQueue, typename TWriter>
+  void receiveInitializedTrivialCopyWithQueue(int instance, TWriter& writer, TQueue& queue) {
+    int tag = EDM_MPI_SendTrivialCopyProduct | instance * EDM_MPI_MessageTagWidth_;
+    MPI_Status status;
+    // receive the memory regions
+    auto regions = writer.regions();
+    // TODO receive and validate the number of regions ?
+    for (size_t i = 0; i < regions.size(); ++i) {
+      assert(regions[i].data() != nullptr);
+      printf("MPIChannel: receiveInitializedTrivialCopyWithQueue receiving region %zu of size %zu\n", i, regions[i].size_bytes());
+      MPI_Recv(regions[i].data(), regions[i].size_bytes(), MPI_BYTE, dest_, tag, comm_, &status);
+      printf("MPIChannel: receiveInitializedTrivialCopyWithQueue received region %zu of size %zu\n", i, regions[i].size_bytes());
+    }
+  }
 
 private:
   // serialize an EDM object to a simplified representation that can be transmitted as an MPI message

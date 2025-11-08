@@ -62,10 +62,15 @@ public:
                                       << "\" over MPI channel instance " << this->instance_;
 
       products_.emplace_back(std::move(entry));
+      printf("entry.type: %s\n", entry.type.name().c_str());
+      printf("entry.wrappedType: %s\n", entry.wrappedType.name().c_str());
+
     }
+    printf("MPIReceiver constructed with %zu products\n", products_.size());
   }
 
   void acquire(edm::Event const& event, edm::EventSetup const&, edm::WaitingTaskWithArenaHolder holder) final {
+    printf("Entering MPIReceiver::acquire()\n");
     MPIToken token = event.get(upstream_);
 
     //also try unique or optional
@@ -73,6 +78,7 @@ public:
 
 
     token.channel()->receiveMetadata(instance_, received_meta_);
+    printf("MPIReceiver::acquire() received metadata\n");
 
     // edm::Service<edm::Async> as;
     // as->runAsync(
@@ -82,13 +88,16 @@ public:
   }
 
   void produce(edm::Event& event, edm::EventSetup const&) final {
+    printf("Entering MPIReceiver::produce()\n");
     // read the MPIToken used to establish the communication channel
     MPIToken token = event.get(upstream_);
+    printf("done event.get()\n");
     // see the summary of metadata for dubug purposes
     // received_meta_->debugPrintMetadataSummary();
 
     // if filter was false before the sender, receive nothing
     if (received_meta_->productCount() == -1) {
+      printf("MPIReceiver::produce(): FILTER A!\n");
       event.emplace(token_, token);
       return;
     }
@@ -106,6 +115,8 @@ public:
     }
 
     for (auto const& entry : products_) {
+
+      printf("doing product of type %s\n", entry.type.name().c_str());
       std::unique_ptr<edm::WrapperBase> wrapper(
           reinterpret_cast<edm::WrapperBase*>(entry.wrappedType.getClass()->New()));
 
@@ -117,6 +128,7 @@ public:
       }
 
       else if (product_meta.kind == ProductMetadata::Kind::Serialized) {
+        printf("here be dragons\n");
         auto productBuffer = TBufferFile(TBuffer::kRead, product_meta.sizeMeta);
         // assert(!wrapper->hasTrivialCopyTraits() && "mismatch between expected and factual metadata type");
         assert(buffer_offset_ < full_buffer_size && "serialized data buffer is shorter than expected");
@@ -126,10 +138,12 @@ public:
       }
 
       else if (product_meta.kind == ProductMetadata::Kind::TrivialCopy) {
+        printf("here be more dragons\n");
         // assert(wrapper->hasTrivialCopyTraits() && "mismatch between expected and factual metadata type");
         // wrapper->markAsPresent();
         // std::unique_ptr<ngt::SerialiserBase> serialiser{
         //   ngt::SerialiserFactory::get()->tryToCreate(entry.objectType_.typeInfo().name())};
+        printf("MPIReceiver: Trying to create a serializer for type \"%s\"\n", entry.type.typeInfo().name());
         std::unique_ptr<ngt::SerialiserBase> serialiser{
           ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())}; // is this ame correct?
         if (!serialiser) {
@@ -158,6 +172,7 @@ public:
     // write a shallow copy of the channel to the output, so other modules can consume it
     // to indicate that they should run after this
     event.emplace(token_, token);
+    printf("MPIReceiver::produce() done\n");
   }
 
 private:
