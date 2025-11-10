@@ -45,6 +45,7 @@
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/EventSetup.h"
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/EDProducer.h"
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/SynchronizingEDProducer.h"
+#include "alpaka/wait/Traits.hpp"
 
 
 #include <condition_variable>
@@ -137,6 +138,7 @@ public:
   // void acquire(device::Event const& event, device::EventSetup const&, edm::WaitingTaskWithArenaHolder holder) {
   void acquire(device::Event const& event, device::EventSetup const&) final {
     printf("Entering MPISenderPortable::acquire()\n");
+    
     MPIToken token = event.get(upstream_);
     // we need 1 byte for type, 8 bytes for size and at least 8 bytes for trivial copy parameters buffer
     auto meta = std::make_shared<ProductMetadataBuilder>(products_.size() * 24);
@@ -150,6 +152,11 @@ public:
     printf("MPISenderPortable::acquire(): BBBBBB product count: %zu\n", products_.size());
     has_serialized_ = false;
     is_active_ = true;
+
+    // Clear readers from previous event
+    // TODO: is reusing readers good? (we don't need to)
+    readers_.clear();
+    readers_.resize(products_.size());
 
     // estimate buffer size in the constructor
 
@@ -173,14 +180,21 @@ public:
 
       if (handle.isValid()) {
         edm::WrapperBase const* wrapper = handle.product();
+        alpaka::wait(event.queue());
         std::unique_ptr<ngt::SerialiserBase> serialiser{
           ngt::SerialiserFactoryPortable::get()->tryToCreate(entry.type.typeInfo().name())};
+        alpaka::wait(event.queue());
 
         if (serialiser) {
+          alpaka::wait(event.queue());
           auto reader = serialiser->initialize(*wrapper);
+          alpaka::wait(event.queue());
           edm::AnyBuffer buffer = reader->parameters();
           printf("MPISenderPortable::acquire(): DDD3DDD\n");
+          alpaka::wait(event.queue());
           meta->addTrivialCopy(buffer.data(), buffer.size_bytes());
+          alpaka::wait(event.queue());
+          readers_[index] = std::move(reader);
         } else {
           printf("MPISenderPortable::acquire(): EEEE3EEE\n");
           TClass* cls = entry.wrappedType.getClass();
@@ -188,7 +202,9 @@ public:
             throw cms::Exception("MPISenderPortable") << "Failed to get TClass for type: " << entry.type.name();
           }
           size_t bufLen = serializeAndStoreBuffer_(index, cls, wrapper);
+          alpaka::wait(event.queue());
           meta->addSerialized(bufLen);
+          alpaka::wait(event.queue());
           has_serialized_ = true;
         }
 
@@ -212,50 +228,55 @@ public:
     //     std::move(holder),
     //     [this, token, meta = std::move(meta)]() { token.channel()->sendMetadata(instance_, meta); },
     //     []() { return "Calling MPISenderPortable::acquire()"; });
+    alpaka::wait(event.queue());
   }
 
   void produce(device::Event& event, device::EventSetup const&) override {
 
     
     printf("Entering MPISenderPortable::produce()\n");
-
+    // alpaka::wait(event.device());
+    alpaka::wait(event.queue());
     MPIToken token = event.get(upstream_);
     // token.channel()->sendMetadata(instance_, meta_);
     // std::this_thread::sleep_for(std::chrono::seconds(1));
 
     if (!is_active_) {
+      alpaka::wait(event.queue());
       event.emplace(token_, token);
       return;
     }
 
     if (has_serialized_) {
+      alpaka::wait(event.queue());
       token.channel()->sendBuffer(buffer_->Buffer(), buffer_->Length(), instance_, EDM_MPI_SendSerializedProduct);
     }
 
+    size_t index = 0;
     for (auto const& entry : products_) {
+      
       edm::Handle<edm::WrapperBase> handle(entry.type.typeInfo());
       // event.getByToken(entry.token, handle);
+      alpaka::wait(event.queue());
       static_cast<edm::Event const&>(event).getByToken(entry.getToken_, handle);
 
-
-      edm::WrapperBase const* wrapper = handle.product();
+      alpaka::wait(event.queue());
       // we don't send missing products
       if (handle.isValid()) {
-        printf("MPISenderPortable: Trying to create a serializer for type \"%s\"\n", entry.type.name().c_str());
-      std::unique_ptr<ngt::SerialiserBase> serialiser{
-          ngt::SerialiserFactoryPortable::get()->tryToCreate(entry.type.typeInfo().name())};
-        if (serialiser) {
-          printf("MPISenderPortable: Successfully created a serializer for type \"%s\"\n", entry.type.name().c_str());
-          auto reader = serialiser->initialize(*wrapper);
-          printf("MPISenderPortable: initialized reader for type \"%s\"\n", entry.type.name().c_str());
-          token.channel()->sendTrivialCopyProductTemplated(instance_, *reader);
+        if (readers_[index]) {
+          alpaka::wait(event.queue());
+          token.channel()->sendTrivialCopyProductTemplated(instance_, *readers_[index]);
+          alpaka::wait(event.queue());
           printf("MPISenderPortable: sendTrivialCopyProduct done for type \"%s\"\n", entry.type.name().c_str());
         }
       }
+      index++;
     }
     // write a shallow copy of the channel to the output, so other modules can consume it
     // to indicate that they should run after this
+    alpaka::wait(event.queue());
     event.emplace(token_, token);
+    alpaka::wait(event.queue());
   }
 
 private:
@@ -274,6 +295,7 @@ private:
   };
 
   // TODO consider if upstream_ should be a vector instead of a single token ?
+  // edm::EDGetTokenT<MPIToken> const upstream_;  // MPIToken used to establish the communication channel
   edm::EDGetTokenT<MPIToken> const upstream_;  // MPIToken used to establish the communication channel
   edm::EDPutTokenT<MPIToken> const token_;  // copy of the MPIToken that may be used to implement an ordering relation
   std::vector<edm::ProductNamePattern> patterns_;  // branches to read from the Event and send over the MPI channel
@@ -284,6 +306,8 @@ private:
   size_t metadata_size_;
   bool has_serialized_ = false;
   bool is_active_ = true;
+
+  std::vector<std::unique_ptr<const ngt::TrivialSerialiserBase>> readers_;
 
   // metadata
   std::shared_ptr<ProductMetadataBuilder> meta_;

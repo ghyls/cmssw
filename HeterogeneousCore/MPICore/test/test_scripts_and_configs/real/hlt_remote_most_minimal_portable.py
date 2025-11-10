@@ -18,8 +18,8 @@ for module in _process.es_producers.keys():
     setattr(process, module, getattr(_process, module).clone())
 
 
-process.options.numberOfThreads = int(os.environ.get("EXPERIMENT_THREADS", 8))
-process.options.numberOfStreams = int(os.environ.get("EXPERIMENT_STREAMS", 8))
+process.options.numberOfThreads = int(os.environ.get("EXPERIMENT_THREADS", 1))
+process.options.numberOfStreams = int(os.environ.get("EXPERIMENT_STREAMS", 1))
 process.options.numberOfConcurrentLuminosityBlocks = 1
 
 

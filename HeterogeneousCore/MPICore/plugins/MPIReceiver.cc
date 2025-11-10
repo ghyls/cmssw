@@ -35,6 +35,7 @@
 #include <TClass.h>
 
 class MPIReceiver : public edm::stream::EDProducer<edm::ExternalWork> {
+// class MPIReceiver : public edm::stream::EDProducer<> {
 public:
   MPIReceiver(edm::ParameterSet const& config)
       : upstream_(consumes<MPIToken>(config.getParameter<edm::InputTag>("upstream"))),
@@ -91,6 +92,10 @@ public:
     printf("Entering MPIReceiver::produce()\n");
     // read the MPIToken used to establish the communication channel
     MPIToken token = event.get(upstream_);
+
+    // token.channel()->receiveMetadata(instance_, received_meta_);
+    // printf("MPIReceiver::acquire() received metadata\n");
+
     printf("done event.get()\n");
     // see the summary of metadata for dubug purposes
     // received_meta_->debugPrintMetadataSummary();

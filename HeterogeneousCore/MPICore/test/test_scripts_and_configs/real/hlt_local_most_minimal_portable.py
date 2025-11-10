@@ -9,8 +9,8 @@ from HLTrigger.Configuration.common import *
 process.load("FWCore.MessageLogger.MessageLogger_cfi")
 
 # run with 32 threads, 24 concurrent events, 1 concurrent lumisection, over 10k events
-process.options.numberOfThreads = int(os.environ.get("EXPERIMENT_THREADS", 8))
-process.options.numberOfStreams = int(os.environ.get("EXPERIMENT_STREAMS", 8))
+process.options.numberOfThreads = int(os.environ.get("EXPERIMENT_THREADS", 1))
+process.options.numberOfStreams = int(os.environ.get("EXPERIMENT_STREAMS", 1))
 
 process.options.numberOfConcurrentLuminosityBlocks = 1  # MPIController does not support concurrent lumisections
 process.maxEvents.input = 10300
