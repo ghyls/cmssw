@@ -32,11 +32,21 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 using DeviceProductPortableCollectionHcalRecHitSoALayout = edm::DeviceProduct<PortableCollection<hcal::HcalRecHitSoALayout<128, false>, Device>>;
 DEFINE_TRIVIAL_SERIALISER_PLUGIN(DeviceProductPortableCollectionHcalRecHitSoALayout);
 
-// using PortableCollectionPFRecHitSoALayout = PortableCollection<reco::PFRecHitSoALayout<128, false>, Device>;
-// DEFINE_EDM_PLUGIN(ngt::SerialiserFactory,
-//                   ngt::Serialiser<PortableCollectionPFRecHitSoALayout>,
-//                   typeid(PortableCollectionPFRecHitSoALayout).name());
-//
+//using PortableCollectionPFRecHitSoALayout = PortableCollection<reco::PFRecHitSoALayout<128, false>, Device>;
+
+using DeviceProductPortableCollectionPFRecHitSoALayout = edm::DeviceProduct<PortableCollection<reco::PFRecHitSoALayout<128, false>, Device>>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(DeviceProductPortableCollectionPFRecHitSoALayout);
+
+using DeviceProductPortableCollectionPFClusterSoALayout = edm::DeviceProduct<PortableCollection<reco::PFClusterSoALayout<128, false>, Device>>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(DeviceProductPortableCollectionPFClusterSoALayout);
+
+using DeviceProductPortableCollectionPFRecHitFractionSoALayout =
+    edm::DeviceProduct<PortableCollection<reco::PFRecHitFractionSoALayout<128, false>, Device>>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(DeviceProductPortableCollectionPFRecHitFractionSoALayout);
+
+
+
+
 // using PortableCollectionPFClusterSoALayout = PortableCollection<reco::PFClusterSoALayout<128, false>, Device>;
 // DEFINE_EDM_PLUGIN(ngt::SerialiserFactory,
 //                   ngt::Serialiser<PortableCollectionPFClusterSoALayout>,
