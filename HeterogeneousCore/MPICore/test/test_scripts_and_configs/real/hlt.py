@@ -1,16 +1,15 @@
-# /online/collisions/2024/2e34/v1.4/HLT/V2 (CMSSW_14_0_11)
-
 import FWCore.ParameterSet.Config as cms
 
 # load the "frozen" 2024 HLT menu
 from hlt_cff import process
 
 # run over HLTPhysics data from run 383363
-process.load('run383631_cff')
+#process.load('run383631_cff')
+process.load('run396102_cff')
 
 # override the GlobalTag
 from Configuration.AlCa.GlobalTag import GlobalTag as customiseGlobalTag
-process.GlobalTag = customiseGlobalTag(process.GlobalTag, globaltag = '141X_dataRun3_HLT_v1')
+process.GlobalTag = customiseGlobalTag(process.GlobalTag, globaltag = '150X_dataRun3_HLT_v1')
 
 # update the HLT menu for re-running offline using a recent release
 from HLTrigger.Configuration.customizeHLTforCMSSW import customizeHLTforCMSSW
@@ -24,7 +23,7 @@ os.makedirs('%s/run%d' % (process.EvFDaqDirector.baseDir.value(), process.EvFDaq
 process.options.numberOfThreads = 32
 process.options.numberOfStreams = 24
 process.options.numberOfConcurrentLuminosityBlocks = 2
-process.maxEvents.input = 1000
+process.maxEvents.input = 20
 
 # force the '2e34' prescale column
 process.PrescaleService.lvl1DefaultLabel = '2p0E34'
