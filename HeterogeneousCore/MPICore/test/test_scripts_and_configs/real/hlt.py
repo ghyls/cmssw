@@ -6,11 +6,12 @@ import FWCore.ParameterSet.Config as cms
 from hlt_cff import process
 
 # run over HLTPhysics data from run 383363
-process.load('run383631_cff')
+#process.load('run383631_cff')
+process.load('run396102_cff')
 
 # override the GlobalTag
 from Configuration.AlCa.GlobalTag import GlobalTag as customiseGlobalTag
-process.GlobalTag = customiseGlobalTag(process.GlobalTag, globaltag = '141X_dataRun3_HLT_v1')
+process.GlobalTag = customiseGlobalTag(process.GlobalTag, globaltag = '150X_dataRun3_HLT_v1')
 
 # update the HLT menu for re-running offline using a recent release
 from HLTrigger.Configuration.customizeHLTforCMSSW import customizeHLTforCMSSW
@@ -23,8 +24,8 @@ os.makedirs('%s/run%d' % (process.EvFDaqDirector.baseDir.value(), process.EvFDaq
 # run with 32 threads, 24 concurrent events, 2 concurrent lumisections, over 10k events
 process.options.numberOfThreads = 32
 process.options.numberOfStreams = 24
-process.options.numberOfConcurrentLuminosityBlocks = 2
-process.maxEvents.input = 1000
+process.options.numberOfConcurrentLuminosityBlocks = 1
+process.maxEvents.input = 1300
 
 # force the '2e34' prescale column
 process.PrescaleService.lvl1DefaultLabel = '2p0E34'
@@ -51,7 +52,7 @@ process.FastTimerService.writeJSONSummary = True
 process.ThroughputService = cms.Service('ThroughputService',
     enableDQM = cms.untracked.bool(False),
     printEventSummary = cms.untracked.bool(True),
-    eventResolution = cms.untracked.uint32(100),
+    eventResolution = cms.untracked.uint32(10),
     eventRange = cms.untracked.uint32(10300),
 )
 

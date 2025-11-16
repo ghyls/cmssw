@@ -11,8 +11,7 @@ output_dir = os.environ.get("EXPERIMENT_OUTPUT_DIR", "./test_results/local_pipel
 # threading configuration
 process.options.numberOfThreads = threads
 process.options.numberOfStreams = streams
-process.options.numberOfConcurrentLuminosityBlocks = 2
-process.maxEvents.input = 1000 #1k
+process.options.numberOfConcurrentLuminosityBlocks = 1
 
 # do not print a final summary
 process.options.wantSummary = False

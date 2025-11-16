@@ -13,7 +13,6 @@ process.options.numberOfThreads = int(os.environ.get("EXPERIMENT_THREADS", 32))
 process.options.numberOfStreams = int(os.environ.get("EXPERIMENT_STREAMS", 24))
 
 process.options.numberOfConcurrentLuminosityBlocks = 1  # MPIController does not support concurrent lumisections
-process.maxEvents.input = 1000
 
 # do not print a final summary
 # process.options.wantSummary = True
@@ -251,3 +250,15 @@ process.Offload = cms.Path(
 process.schedule.append(process.Offload)
 
 #process.Tracer = cms.Service("Tracer")
+
+process.ThroughputService = cms.Service('ThroughputService',
+    enableDQM = cms.untracked.bool(False),
+    printEventSummary = cms.untracked.bool(True),
+    eventResolution = cms.untracked.uint32(10),
+    eventRange = cms.untracked.uint32(10300),
+)
+
+process.MessageLogger.cerr.ThroughputService = cms.untracked.PSet(
+    limit = cms.untracked.int32(10000000),
+    reportEvery = cms.untracked.int32(1)
+)
