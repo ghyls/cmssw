@@ -224,7 +224,6 @@ process.HLTLocalECAL = cms.Path(
 process.hltOnlineBeamSpot = _process.hltOnlineBeamSpot.clone()
 process.hltOnlineBeamSpotDevice = _process.hltOnlineBeamSpotDevice.clone()
 process.hltSiPixelClustersSoA = _process.hltSiPixelClustersSoA.clone()
-process.hltSiPixelDigiErrors = _process.hltSiPixelDigiErrors.clone()
 process.hltSiPixelRecHitsSoA = _process.hltSiPixelRecHitsSoA.clone()
 process.hltPixelTracksSoA = _process.hltPixelTracksSoA.clone()
 process.hltPixelVerticesSoA = _process.hltPixelVerticesSoA.clone()
@@ -237,22 +236,11 @@ process.mpiSenderSiPixelClustersSoA = cms.EDProducer("MPISender",
         "SiPixelClustersHost_hltSiPixelClustersSoA__*",
         "SiPixelDigisHost_hltSiPixelClustersSoA__*",
         "SiPixelDigiErrorsHost_hltSiPixelClustersSoA__*",
+        "uintSiPixelRawDataErrorsstdmap_hltSiPixelClustersSoA__*",
         "ushort_hltSiPixelClustersSoA_backend_*",
         "*_PixelActivity__*"
     )
 )
-
-
-# # send the SiPixelDigiErrorsSoA over MPI
-# process.mpiSenderSiPixelDigiErrors = cms.EDProducer("MPISender",
-#     upstream = cms.InputTag("mpiSenderSiPixelClustersSoA"),
-#     instance = cms.int32(33),
-#     products = cms.vstring(
-#         "SiPixelDigiErrorsHost_hltSiPixelClustersSoA__*",
-#         "ushort_hltSiPixelDigiErrors_backend_*",
-#         "*_PixelActivity__*",
-#     )
-# )
 
 
 # send the SiPixelRecHitsSoA over MPI
@@ -298,7 +286,6 @@ process.HLTLocalPixel = cms.Path(
     process.hltOnlineBeamSpot +
     process.hltOnlineBeamSpotDevice +
     process.hltSiPixelClustersSoA +
-    process.hltSiPixelDigiErrors +
     process.hltSiPixelRecHitsSoA +
     process.hltPixelTracksSoA +
     process.hltPixelVerticesSoA +

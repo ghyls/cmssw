@@ -79,8 +79,7 @@ process.hltEcalDigisSoA = cms.EDProducer("MPIReceiver",
     ), cms.PSet(
        type = cms.string("ushort"),
        label = cms.string("backend")
-    ),
-    cms.PSet(
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
     ))
@@ -107,8 +106,7 @@ process.hltEcalUncalibRecHitSoA = cms.EDProducer("MPIReceiver",
     ), cms.PSet(
        type = cms.string("ushort"),
        label = cms.string("backend")
-    ),
-    cms.PSet(
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
     ))
@@ -133,8 +131,7 @@ process.hltHbheRecoSoA = cms.EDProducer("MPIReceiver",
     ), cms.PSet(
        type = cms.string("ushort"),
        label = cms.string("backend")
-    ),
-    cms.PSet(
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
     ))
@@ -158,8 +155,7 @@ process.hltParticleFlowRecHitHBHESoA = cms.EDProducer("MPIReceiver",
     ), cms.PSet(
        type = cms.string("ushort"),
        label = cms.string("backend")
-    ),
-    cms.PSet(
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
     ))
@@ -186,8 +182,7 @@ process.hltParticleFlowClusterHBHESoA = cms.EDProducer("MPIReceiver",
     ), cms.PSet(
        type = cms.string("ushort"),
        label = cms.string("backend")
-    ),
-    cms.PSet(
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
     ))
@@ -203,45 +198,23 @@ process.hltSiPixelClustersSoA = cms.EDProducer("MPIReceiver",
     cms.PSet(
         type = cms.string("SiPixelClustersHost"),
         label = cms.string("")
-    ), 
-    cms.PSet(
+    ), cms.PSet(
         type = cms.string("SiPixelDigisHost"),
         label = cms.string("")
-    ), 
-    cms.PSet(
+    ), cms.PSet(
         type = cms.string("SiPixelDigiErrorsHost"),
         label = cms.string("")
-    ),
-    cms.PSet(
-       type = cms.string("ushort"),
-       label = cms.string("backend")
-    ),
-    cms.PSet(
+    ), cms.PSet(
+        type = cms.string("std::map<unsigned int,std::vector<SiPixelRawDataError> >"),
+        label = cms.string("")
+    ), cms.PSet(
+        type = cms.string("ushort"),
+        label = cms.string("backend")
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
     ))
 )
-
-
-# del process.hltSiPixelDigiErrors
-
-# # # receive the SiPixelDigiErrorsSoA over MPI
-# # process.hltSiPixelDigiErrors = cms.EDProducer("MPIReceiver",
-# #     upstream = cms.InputTag("hltSiPixelClustersSoA"),
-# #     instance = cms.int32(34),
-# #     products = cms.VPSet(cms.PSet(
-# #         type = cms.string("SiPixelDigiErrorsHost"),
-# #         label = cms.string("")
-# #     ), cms.PSet(
-# #        type = cms.string("ushort"),
-# #        label = cms.string("backend")
-# #     ),
-# #     cms.PSet(
-# #         type = cms.string("edm::PathStateToken"),
-# #         label = cms.string("")
-# #     ))
-# # )
-
 
 
 del process.hltSiPixelRecHitsSoA
@@ -254,12 +227,10 @@ process.hltSiPixelRecHitsSoA = cms.EDProducer("MPIReceiver",
     cms.PSet(
         type = cms.string("reco::TrackingRecHitHost"),
         label = cms.string("")
-    ), 
-    cms.PSet(
-       type = cms.string("ushort"),
-       label = cms.string("backend")
-    ),
-    cms.PSet(
+    ), cms.PSet(
+        type = cms.string("ushort"),
+        label = cms.string("backend")
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
     ))
@@ -275,15 +246,14 @@ process.hltPixelTracksSoA = cms.EDProducer("MPIReceiver",
         type = cms.string("reco::TracksHost"),
         label = cms.string("")
     ), cms.PSet(
-       type = cms.string("ushort"),
-       label = cms.string("backend")
-    ),
-    cms.PSet(
+        type = cms.string("ushort"),
+        label = cms.string("backend")
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
-    ))
+    ),
+  )
 )
-
 
 del process.hltPixelVerticesSoA
 
@@ -297,8 +267,7 @@ process.hltPixelVerticesSoA = cms.EDProducer("MPIReceiver",
     ), cms.PSet(
        type = cms.string("ushort"),
        label = cms.string("backend")
-    ),
-    cms.PSet(
+    ), cms.PSet(
         type = cms.string("edm::PathStateToken"),
         label = cms.string("")
     ))
@@ -378,7 +347,7 @@ process.Offload = cms.Path(
 
 process.schedule.append(process.Offload)
 
-# process.Tracer = cms.Service("Tracer")
+#process.Tracer = cms.Service("Tracer")
 
 process.ThroughputService = cms.Service('ThroughputService',
     enableDQM = cms.untracked.bool(False),
