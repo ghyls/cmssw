@@ -1,0 +1,5 @@
+<library file="*.cc" name="DataFormatsTrackingRecHitSoAPlugins">
+  <use name="DataFormats/TrackingRecHitSoA"/>
+  <use name="TrivialSerialisation/Common"/>
+  <flags EDM_PLUGIN="1"/>
+</library>

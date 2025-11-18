@@ -5,6 +5,7 @@
 
 #include <alpaka/alpaka.hpp>
 
+#include "DataFormats/Common/interface/TrivialCopyTraits.h"
 #include "DataFormats/Common/interface/Uninitialized.h"
 #include "DataFormats/Portable/interface/PortableHostCollection.h"
 #include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsSoA.h"
@@ -25,6 +26,7 @@ namespace reco {
         : PortableHostMultiCollection<reco::TrackingRecHitSoA, reco::HitModuleSoA>{edm::kUninitialized} {}
 
     // Constructor which specifies only the SoA size, to be used when copying the results from the device to the host
+    // FIXME add an explicit overload for the host case
     template <typename TQueue>
     explicit TrackingRecHitHost(TQueue queue, uint32_t nHits, uint32_t nModules)
         : HitPortableCollectionHost({{int(nHits), int(nModules + 1)}}, queue) {}
@@ -58,5 +60,40 @@ namespace reco {
   };
 
 }  // namespace reco
+
+namespace edm {
+
+  template <>
+  struct TrivialCopyTraits<reco::TrackingRecHitHost> {
+    using value_type = reco::TrackingRecHitHost;
+
+    struct Properties {
+      uint32_t nHits;
+      uint32_t nModules;
+    };
+
+    static Properties properties(value_type const& object) {
+      return { object.nHits(), object.nModules() };
+    }
+
+    static void initialize(value_type& object, Properties const& prop) {
+      // replace the default-constructed empty object with one where the buffer has been allocated in pageable system memory
+      object = value_type(cms::alpakatools::host(), prop.nHits, prop.nModules);
+    }
+
+    static std::vector<std::span<std::byte>> regions(value_type& object) {
+      std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+
+    static std::vector<std::span<const std::byte>> regions(value_type const& object) {
+      const std::byte* address = reinterpret_cast<const std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}};
+    }
+  };
+
+}  // namespace edm
 
 #endif  // DataFormats_TrackingRecHitSoA_interface_TrackingRecHitsHost_h
