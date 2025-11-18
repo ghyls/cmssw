@@ -60,7 +60,7 @@ process.ThroughputService = cms.Service('ThroughputService',
     eventRange = cms.untracked.uint32(10300),
 )
 
-# process.MessageLogger.cerr.ThroughputService = cms.untracked.PSet(
-#     limit = cms.untracked.int32(10000000),
-#     reportEvery = cms.untracked.int32(1)
-# )
+process.MessageLogger.cerr.ThroughputService = cms.untracked.PSet(
+    limit = cms.untracked.int32(10000000),
+    reportEvery = cms.untracked.int32(1)
+)

@@ -43,4 +43,12 @@ process.options.wantSummary = False
 process.FastTimerService.writeJSONSummary = True
 process.FastTimerService.jsonFileName = cms.untracked.string(f"{output_dir}/whole_{experiment_name}.json")
 
+process.ThroughputService = cms.Service('ThroughputService',
+    enableDQM = cms.untracked.bool(False),
+    printEventSummary = cms.untracked.bool(True),
+    eventResolution = cms.untracked.uint32(10),
+    eventRange = cms.untracked.uint32(10300),
+)
+
+
 #process.Tracer = cms.Service("Tracer")
