@@ -37,7 +37,7 @@ process.PrescaleService.forceDefault = True
 
 # do not print a final summary
 # process.options.wantSummary = True
-process.MessageLogger.cerr.enableStatistics = cms.untracked.bool(False)
+# process.MessageLogger.cerr.enableStatistics = cms.untracked.bool(False)
 
 # process.writeResults = cms.OutputModule( "PoolOutputModule",
 #     fileName = cms.untracked.string( "results_reference.root" ),
@@ -60,7 +60,7 @@ process.ThroughputService = cms.Service('ThroughputService',
     eventRange = cms.untracked.uint32(10300),
 )
 
-process.MessageLogger.cerr.ThroughputService = cms.untracked.PSet(
-    limit = cms.untracked.int32(10000000),
-    reportEvery = cms.untracked.int32(1)
-)
+# process.MessageLogger.cerr.ThroughputService = cms.untracked.PSet(
+#     limit = cms.untracked.int32(10000000),
+#     reportEvery = cms.untracked.int32(1)
+# )

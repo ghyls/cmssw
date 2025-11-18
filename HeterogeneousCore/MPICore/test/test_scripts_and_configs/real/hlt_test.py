@@ -15,7 +15,7 @@ process.options.numberOfConcurrentLuminosityBlocks = 1
 
 # do not print a final summary
 process.options.wantSummary = False
-process.MessageLogger.cerr.enableStatistics = cms.untracked.bool(False)
+# process.MessageLogger.cerr.enableStatistics = cms.untracked.bool(False)
 
 # run the HBHE local reconstruction
 # process.HLTLocalHBHE = cms.Path(

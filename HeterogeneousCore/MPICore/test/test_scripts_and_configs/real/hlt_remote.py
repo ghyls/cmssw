@@ -7,7 +7,7 @@ from hlt import process as _process
 process = cms.Process("REMOTE")
 
 process.load("Configuration.StandardSequences.Accelerators_cff")
-process.load("FWCore.MessageLogger.MessageLogger_cfi")
+# process.load("FWCore.MessageLogger.MessageLogger_cfi")
 
 # load the event setup
 for module in _process.psets.keys():

@@ -6,7 +6,7 @@ from hlt import process
 
 from HLTrigger.Configuration.common import *
 
-process.load("FWCore.MessageLogger.MessageLogger_cfi")
+# process.load("FWCore.MessageLogger.MessageLogger_cfi")
 
 # run with 32 threads, 24 concurrent events, 1 concurrent lumisection, over 10k events
 process.options.numberOfThreads = int(os.environ.get("EXPERIMENT_THREADS", 32))
@@ -16,7 +16,7 @@ process.options.numberOfConcurrentLuminosityBlocks = 1  # MPIController does not
 
 # do not print a final summary
 # process.options.wantSummary = True
-process.MessageLogger.cerr.enableStatistics = cms.untracked.bool(False)
+# process.MessageLogger.cerr.enableStatistics = cms.untracked.bool(False)
 
 # process.writeResults = cms.OutputModule( "PoolOutputModule",
 #     fileName = cms.untracked.string( "results2.root" ),
@@ -30,7 +30,7 @@ process.MessageLogger.cerr.enableStatistics = cms.untracked.bool(False)
 # process.schedule.append( process.WriteResults )
 
 # Optional: Suppress FwkSummary messages from being printed to cerr or cout
-process.MessageLogger.cerr.FwkSummary = cms.untracked.PSet(limit = cms.untracked.int32(0))
+# process.MessageLogger.cerr.FwkSummary = cms.untracked.PSet(limit = cms.untracked.int32(0))
 
 # FastTimer output
 experiment_name = os.environ.get("EXPERIMENT_NAME", "unnamed")
@@ -356,7 +356,7 @@ process.ThroughputService = cms.Service('ThroughputService',
     eventRange = cms.untracked.uint32(10300),
 )
 
-process.MessageLogger.cerr.ThroughputService = cms.untracked.PSet(
-    limit = cms.untracked.int32(10000000),
-    reportEvery = cms.untracked.int32(1)
-)
+# process.MessageLogger.cerr.ThroughputService = cms.untracked.PSet(
+#     limit = cms.untracked.int32(10000000),
+#     reportEvery = cms.untracked.int32(1)
+# )
