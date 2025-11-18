@@ -252,7 +252,7 @@ process.hltSiPixelRecHitsSoA = cms.EDProducer("MPIReceiver",
     instance = cms.int32(33),
     products = cms.VPSet(
     cms.PSet(
-        type = cms.string("reco::TrackingRecHitHost"),
+        type = cms.string("asdasd"),
         label = cms.string("")
     ), 
     cms.PSet(
