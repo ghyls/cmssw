@@ -4,6 +4,11 @@
   <use name="DataFormats/EcalDigi"/>
   <use name="DataFormats/HcalRecHit"/>
   <use name="DataFormats/ParticleFlowReco"/>
+  <use name="DataFormats/BeamSpot"/>
+  <use name="DataFormats/SiPixelClusterSoA"/>
+  <use name="DataFormats/TrackingRecHitSoA"/>
+  <use name="DataFormats/TrackSoA"/>
+  <use name="DataFormats/VertexSoA"/>
   <use name="FWCore/Framework"/>
   <use name="FWCore/PluginManager"/>
   <use name="TrivialSerialisation/Common"/>

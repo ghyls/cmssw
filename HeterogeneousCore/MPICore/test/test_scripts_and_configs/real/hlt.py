@@ -6,12 +6,16 @@ import FWCore.ParameterSet.Config as cms
 from hlt_cff import process
 
 # run over HLTPhysics data from run 383363
-#process.load('run383631_cff')
+# process.load('run383631_cff')
 process.load('run396102_cff')
+
+# del process.HLTAnalyzerEndpath
 
 # override the GlobalTag
 from Configuration.AlCa.GlobalTag import GlobalTag as customiseGlobalTag
 process.GlobalTag = customiseGlobalTag(process.GlobalTag, globaltag = '150X_dataRun3_HLT_v1')
+# process.GlobalTag = customiseGlobalTag(process.GlobalTag, globaltag = '141X_dataRun3_HLT_v1')
+
 
 # update the HLT menu for re-running offline using a recent release
 from HLTrigger.Configuration.customizeHLTforCMSSW import customizeHLTforCMSSW

@@ -107,6 +107,19 @@ process.activityFilterRecoParticleFlow = cms.EDFilter("PathStateRelease",
     state = cms.InputTag("mpiReceiverhltHbheRecoSoAAParticleFlowActivity")
     )
 
+process.mpiReceiverPixelActivity = cms.EDProducer("MPIReceiver",
+    upstream = cms.InputTag("source"),
+    instance = cms.int32(4),
+    products = cms.VPSet(cms.PSet(
+        type = cms.string("edm::PathStateToken"),
+        label = cms.string("")
+    ))
+)
+
+process.activityFilterPixel = cms.EDFilter("PathStateRelease",
+    state = cms.InputTag("mpiReceiverPixelActivity")
+    )
+
 
 process.hltGetRaw = _process.hltGetRaw.clone()
 
@@ -207,21 +220,112 @@ process.HLTLocalECAL = cms.Path(
     process.ECALActivity
 )
 
+# Pixel local reconstruction from the HLT menu
+process.hltOnlineBeamSpot = _process.hltOnlineBeamSpot.clone()
+process.hltOnlineBeamSpotDevice = _process.hltOnlineBeamSpotDevice.clone()
+process.hltSiPixelClustersSoA = _process.hltSiPixelClustersSoA.clone()
+process.hltSiPixelDigiErrors = _process.hltSiPixelDigiErrors.clone()
+process.hltSiPixelRecHitsSoA = _process.hltSiPixelRecHitsSoA.clone()
+process.hltPixelTracksSoA = _process.hltPixelTracksSoA.clone()
+process.hltPixelVerticesSoA = _process.hltPixelVerticesSoA.clone()
+
+# send the SiPixelClustersSoA over MPI
+process.mpiSenderSiPixelClustersSoA = cms.EDProducer("MPISender",
+    upstream = cms.InputTag("rawDataCollector"),
+    instance = cms.int32(32),
+    products = cms.vstring(
+        "SiPixelClustersHost_hltSiPixelClustersSoA__*",
+        "SiPixelDigisHost_hltSiPixelClustersSoA__*",
+        "SiPixelDigiErrorsHost_hltSiPixelClustersSoA__*",
+        "ushort_hltSiPixelClustersSoA_backend_*",
+        "*_PixelActivity__*"
+    )
+)
+
+
+# # send the SiPixelDigiErrorsSoA over MPI
+# process.mpiSenderSiPixelDigiErrors = cms.EDProducer("MPISender",
+#     upstream = cms.InputTag("mpiSenderSiPixelClustersSoA"),
+#     instance = cms.int32(33),
+#     products = cms.vstring(
+#         "SiPixelDigiErrorsHost_hltSiPixelClustersSoA__*",
+#         "ushort_hltSiPixelDigiErrors_backend_*",
+#         "*_PixelActivity__*",
+#     )
+# )
+
+
+# send the SiPixelRecHitsSoA over MPI
+process.mpiSenderSiPixelRecHitsSoA = cms.EDProducer("MPISender",
+    upstream = cms.InputTag("mpiSenderSiPixelClustersSoA"),
+    instance = cms.int32(33),
+    products = cms.vstring(
+        "recoTrackingRecHitHost_hltSiPixelRecHitsSoA__*",
+        "ushort_hltSiPixelRecHitsSoA_backend_*",
+        "*_PixelActivity__*",
+    )
+)
+
+# # send the PixelTracksSoA over MPI
+# process.mpiSenderPixelTracksSoA = cms.EDProducer("MPISender",
+#     upstream = cms.InputTag("mpiSenderSiPixelRecHitsSoA"),
+#     instance = cms.int32(34),
+#     products = cms.vstring(
+#         "128falserecoTrackLayout128falserecoTrackHitsLayoutPortableHostMultiCollection_hltPixelTracksSoA__*",
+#         "ushort_hltPixelTracksSoA_backend_*",
+#         "*_PixelActivity__*",
+#     )
+# )
+
+# # send the PixelVerticesSoA over MPI
+# process.mpiSenderPixelVerticesSoA = cms.EDProducer("MPISender",
+#     upstream = cms.InputTag("mpiSenderPixelTracksSoA"),
+#     instance = cms.int32(35),
+#     products = cms.vstring(
+#         "128falserecoZVertexLayout128falserecoZVertexTracksLayoutPortableHostMultiCollection_hltPixelVerticesSoA__*",
+#         "ushort_hltPixelVerticesSoA_backend_*",
+#         "*_PixelActivity__*",
+#     )
+# )
+
+process.PixelActivity = cms.EDProducer("PathStateCapture")
+
+# run the Pixel local reconstruction
+process.HLTLocalPixel = cms.Path(
+    process.activityFilterRawData +
+    process.activityFilterPixel +
+    process.hltGetRaw +
+    process.hltOnlineBeamSpot +
+    process.hltOnlineBeamSpotDevice +
+    process.hltSiPixelClustersSoA +
+    process.hltSiPixelDigiErrors +
+    process.hltSiPixelRecHitsSoA +
+    process.hltPixelTracksSoA +
+    process.hltPixelVerticesSoA +
+    process.PixelActivity
+)
+
 process.MPIPath = cms.Path(
     process.rawDataCollector +
     process.mpiReceiverEcalDigisActivity +
     process.mpiReceiverhltHbheRecoSoAAParticleFlowActivity +
+    process.mpiReceiverPixelActivity +
     process.mpiSenderEcalDigisSoA +
     process.mpiSenderEcalUncalibRecHitSoA +
     process.mpiSenderHbheRecoSoA +
     process.mpiSenderParticleFlowRecHitHBHESoA +
-    process.mpiSenderParticleFlowClusterHBHESoA
+    process.mpiSenderParticleFlowClusterHBHESoA +
+    process.mpiSenderSiPixelClustersSoA +
+    process.mpiSenderSiPixelRecHitsSoA 
+    # process.mpiSenderPixelTracksSoA +
+    # process.mpiSenderPixelVerticesSoA
 )
 
 # schedule the reconstruction
 process.schedule = cms.Schedule(
     process.HLTLocalHBHE,
     process.HLTLocalECAL,
+    process.HLTLocalPixel,
     process.MPIPath
 )
 

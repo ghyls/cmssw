@@ -62,6 +62,11 @@ public:
       static const std::string_view kPathStatus("edm::PathStatus");
       static const std::string_view kEndPathStatus("edm::EndPathStatus");
 
+
+      // std::cout << "MPISender: considering product " << product.friendlyClassName() << '_'
+      //           << product.moduleLabel() << '_' << product.productInstanceName() << '_' << product.processName()
+      //           << " of type " << product.unwrappedType().name() << " branch type " << product.branchType() << "\n";
+
       switch (product.branchType()) {
         case edm::InEvent:
           if (product.className() == kPathStatus or product.className() == kEndPathStatus)
@@ -135,10 +140,12 @@ public:
           ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())};
 
         if (serialiser) {
+          // printf( "MPISender: found serializer for type %s\n", entry.type.typeInfo().name());
           auto reader = serialiser->initialize(*wrapper);
           edm::AnyBuffer buffer = reader->parameters();
           meta->addTrivialCopy(buffer.data(), buffer.size_bytes());
         } else {
+          // printf( "MPISender: no serializer for type %s, using ROOT serialization\n", entry.type.typeInfo().name());
           TClass* cls = entry.wrappedType.getClass();
           if (!cls) {
             throw cms::Exception("MPISender") << "Failed to get TClass for type: " << entry.type.name();

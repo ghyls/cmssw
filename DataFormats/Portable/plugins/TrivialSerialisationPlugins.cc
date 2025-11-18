@@ -12,6 +12,11 @@
 #include "DataFormats/ParticleFlowReco/interface/PFRecHitSoA.h"
 #include "DataFormats/ParticleFlowReco/interface/PFClusterSoA.h"
 #include "DataFormats/ParticleFlowReco/interface/PFRecHitFractionSoA.h"
+#include "DataFormats/BeamSpot/interface/BeamSpotPOD.h"
+#include "DataFormats/SiPixelClusterSoA/interface/SiPixelClustersSoA.h"
+#include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsSoA.h"
+#include "DataFormats/TrackSoA/interface/TracksSoA.h"
+#include "DataFormats/VertexSoA/interface/ZVertexSoA.h"
 
 
 // DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollection<EcalDigiSoALayout<128,false> >);
@@ -45,3 +50,23 @@ DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionPFCluster);
 
 using PortableHostCollectionPFRecHitFraction = PortableHostCollection<reco::PFRecHitFractionSoALayout<128, false>>;
 DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionPFRecHitFraction);
+
+using PortableHostObjectBeamSpotPOD = PortableHostObject<BeamSpotPOD>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostObjectBeamSpotPOD);
+
+using PortableHostCollectionSiPixelClusters = PortableHostCollection<SiPixelClustersSoA>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionSiPixelClusters);
+
+// ?
+using PortableHostCollectionTrackingRecHit = PortableHostCollection<reco::TrackingRecHitSoA>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionTrackingRecHit);
+
+
+using PortableHostMultiCollectionTrackingRecHits = PortableHostMultiCollection<reco::TrackingHitsLayout<128>, reco::HitModulesLayout<128>>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionTrackingRecHits);
+
+using PortableHostMultiCollectionTracks = PortableHostMultiCollection<reco::TrackLayout<128>, reco::TrackHitsLayout<128>>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionTracks);
+
+using PortableHostMultiCollectionZVertex = PortableHostMultiCollection<reco::ZVertexLayout<128>, reco::ZVertexTracksLayout<128>>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionZVertex);

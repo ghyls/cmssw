@@ -193,6 +193,117 @@ process.hltParticleFlowClusterHBHESoA = cms.EDProducer("MPIReceiver",
     ))
 )
 
+del process.hltSiPixelClustersSoA
+
+# receive the SiPixelClustersSoA over MPI
+process.hltSiPixelClustersSoA = cms.EDProducer("MPIReceiver",
+    upstream = cms.InputTag("mpiSenderRawData"),
+    instance = cms.int32(32),
+    products = cms.VPSet(
+    cms.PSet(
+        type = cms.string("SiPixelClustersHost"),
+        label = cms.string("")
+    ), 
+    cms.PSet(
+        type = cms.string("SiPixelDigisHost"),
+        label = cms.string("")
+    ), 
+    cms.PSet(
+        type = cms.string("SiPixelDigiErrorsHost"),
+        label = cms.string("")
+    ),
+    cms.PSet(
+       type = cms.string("ushort"),
+       label = cms.string("backend")
+    ),
+    cms.PSet(
+        type = cms.string("edm::PathStateToken"),
+        label = cms.string("")
+    ))
+)
+
+
+# del process.hltSiPixelDigiErrors
+
+# # # receive the SiPixelDigiErrorsSoA over MPI
+# # process.hltSiPixelDigiErrors = cms.EDProducer("MPIReceiver",
+# #     upstream = cms.InputTag("hltSiPixelClustersSoA"),
+# #     instance = cms.int32(34),
+# #     products = cms.VPSet(cms.PSet(
+# #         type = cms.string("SiPixelDigiErrorsHost"),
+# #         label = cms.string("")
+# #     ), cms.PSet(
+# #        type = cms.string("ushort"),
+# #        label = cms.string("backend")
+# #     ),
+# #     cms.PSet(
+# #         type = cms.string("edm::PathStateToken"),
+# #         label = cms.string("")
+# #     ))
+# # )
+
+
+
+del process.hltSiPixelRecHitsSoA
+
+# receive the SiPixelRecHitsSoA over MPI
+process.hltSiPixelRecHitsSoA = cms.EDProducer("MPIReceiver",
+    upstream = cms.InputTag("hltSiPixelClustersSoA"),
+    instance = cms.int32(33),
+    products = cms.VPSet(
+    cms.PSet(
+        type = cms.string("reco::TrackingRecHitHost"),
+        label = cms.string("")
+    ), 
+    cms.PSet(
+       type = cms.string("ushort"),
+       label = cms.string("backend")
+    ),
+    cms.PSet(
+        type = cms.string("edm::PathStateToken"),
+        label = cms.string("")
+    ))
+)
+
+# del process.hltPixelTracksSoA
+
+# # receive the PixelTracksSoA over MPI
+# process.hltPixelTracksSoA = cms.EDProducer("MPIReceiver",
+#     upstream = cms.InputTag("hltSiPixelRecHitsSoA"),
+#     instance = cms.int32(34),
+#     products = cms.VPSet(cms.PSet(
+#         type = cms.string("reco::TracksHost"),
+#         label = cms.string("")
+#     ), cms.PSet(
+#        type = cms.string("ushort"),
+#        label = cms.string("backend")
+#     ),
+#     cms.PSet(
+#         type = cms.string("edm::PathStateToken"),
+#         label = cms.string("")
+#     ))
+# )
+#
+
+# del process.hltPixelVerticesSoA
+
+# # receive the PixelVerticesSoA over MPI
+# process.hltPixelVerticesSoA = cms.EDProducer("MPIReceiver",
+#     upstream = cms.InputTag("hltPixelTracksSoA"),
+#     instance = cms.int32(35),
+#     products = cms.VPSet(cms.PSet(
+#         type = cms.string("ZVertexHost"),
+#         label = cms.string("")
+#     ), cms.PSet(
+#        type = cms.string("ushort"),
+#        label = cms.string("backend")
+#     ),
+#     cms.PSet(
+#         type = cms.string("edm::PathStateToken"),
+#         label = cms.string("")
+#     ))
+# )
+
 # General path state to validate if the event is active (sometimes it's not apparently)
 process.rawDataCollectorActivity = cms.EDProducer("PathStateCapture")
 
@@ -201,6 +312,9 @@ process.EcalDigisAndRecoActivity = cms.EDProducer("PathStateCapture")
 
 # StateCapture for remote path HLTLocalHBHE
 process.hltHbheRecoSoAAParticleFlowActivity = cms.EDProducer("PathStateCapture")
+
+# StateCapture for remote path HLTLocalPixel
+process.PixelActivity = cms.EDProducer("PathStateCapture")
 
 
 # schedule the communication before the ECAL local reconstruction
@@ -220,6 +334,10 @@ process.HLTStoppedHSCPLocalHcalReco.insert(1, process.hltHbheRecoSoAAParticleFlo
 process.HLTPFHcalClustering.insert(0, process.rawDataCollectorActivity) # hltParticleFlowRecHitHBHESoA hltParticleFlowClusterHBHESoA
 process.HLTPFHcalClustering.insert(1, process.hltHbheRecoSoAAParticleFlowActivity)
 
+# schedule the communication before the Pixel local reconstruction
+process.HLTDoLocalPixelSequence.insert(0, process.rawDataCollectorActivity) # pixel tracking
+process.HLTDoLocalPixelSequence.insert(1, process.PixelActivity)
+
 process.mpiSenderEcalDigisAndRecoActivity = cms.EDProducer("MPISender",
     upstream = cms.InputTag("mpiController"),
     instance = cms.int32(2),
@@ -233,6 +351,12 @@ process.mpiSenderhltHbheRecoSoAAParticleFlowActivity = cms.EDProducer("MPISender
     products = cms.vstring("hltHbheRecoSoAAParticleFlowActivity")
 )
 
+process.mpiSenderPixelActivity = cms.EDProducer("MPISender",
+    upstream = cms.InputTag("mpiController"),
+    instance = cms.int32(4),
+    products = cms.vstring("PixelActivity")
+)
+
 
 # schedule the communication for every event
 process.Offload = cms.Path(
@@ -240,11 +364,16 @@ process.Offload = cms.Path(
     process.mpiSenderRawData +
     process.mpiSenderEcalDigisAndRecoActivity +
     process.mpiSenderhltHbheRecoSoAAParticleFlowActivity +
+    process.mpiSenderPixelActivity +
     process.hltHbheRecoSoA +
     process.hltParticleFlowRecHitHBHESoA +
     process.hltParticleFlowClusterHBHESoA +
     process.hltEcalDigisSoA +
-    process.hltEcalUncalibRecHitSoA
+    process.hltEcalUncalibRecHitSoA +
+    process.hltSiPixelClustersSoA +
+    process.hltSiPixelRecHitsSoA 
+    # process.hltPixelTracksSoA +
+    # process.hltPixelVerticesSoA
 )
 
 process.schedule.append(process.Offload)
