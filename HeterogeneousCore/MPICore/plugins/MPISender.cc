@@ -81,7 +81,7 @@ public:
                   edm::TypeToGet{product.unwrappedTypeID(), edm::PRODUCT_TYPE},
                   edm::InputTag{product.moduleLabel(), product.productInstanceName(), product.processName()});
 
-              edm::LogVerbatim("MPISender")
+              edm::LogSystem("MPISender")
                   << "send product \"" << product.friendlyClassName() << '_' << product.moduleLabel() << '_'
                   << product.productInstanceName() << '_' << product.processName() << "\" of type \""
                   << entry.type.name() << "\" over MPI channel instance " << instance_;
@@ -140,12 +140,12 @@ public:
           ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())};
 
         if (serialiser) {
-          printf( "MPISender: found serializer for type %s\n", entry.type.typeInfo().name());
+          edm::LogSystem("MPISender") << "Found serializer for type " << entry.type.typeInfo().name();
           auto reader = serialiser->initialize(*wrapper);
           edm::AnyBuffer buffer = reader->parameters();
           meta->addTrivialCopy(buffer.data(), buffer.size_bytes());
         } else {
-          printf( "MPISender: no serializer for type %s, using ROOT serialization\n", entry.type.typeInfo().name());
+          edm::LogSystem("MPISender") << "No serializer for type " << entry.type.typeInfo().name() << ", using ROOT serialization";
           TClass* cls = entry.wrappedType.getClass();
           if (!cls) {
             throw cms::Exception("MPISender") << "Failed to get TClass for type: " << entry.type.name();
