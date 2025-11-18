@@ -266,27 +266,27 @@ process.mpiSenderSiPixelRecHitsSoA = cms.EDProducer("MPISender",
     )
 )
 
-# # send the PixelTracksSoA over MPI
-# process.mpiSenderPixelTracksSoA = cms.EDProducer("MPISender",
-#     upstream = cms.InputTag("mpiSenderSiPixelRecHitsSoA"),
-#     instance = cms.int32(34),
-#     products = cms.vstring(
-#         "128falserecoTrackLayout128falserecoTrackHitsLayoutPortableHostMultiCollection_hltPixelTracksSoA__*",
-#         "ushort_hltPixelTracksSoA_backend_*",
-#         "*_PixelActivity__*",
-#     )
-# )
+# send the PixelTracksSoA over MPI
+process.mpiSenderPixelTracksSoA = cms.EDProducer("MPISender",
+    upstream = cms.InputTag("mpiSenderSiPixelRecHitsSoA"),
+    instance = cms.int32(34),
+    products = cms.vstring(
+        "128falserecoTrackLayout128falserecoTrackHitsLayoutPortableHostMultiCollection_hltPixelTracksSoA__*",
+        "ushort_hltPixelTracksSoA_backend_*",
+        "*_PixelActivity__*",
+    )
+)
 
-# # send the PixelVerticesSoA over MPI
-# process.mpiSenderPixelVerticesSoA = cms.EDProducer("MPISender",
-#     upstream = cms.InputTag("mpiSenderPixelTracksSoA"),
-#     instance = cms.int32(35),
-#     products = cms.vstring(
-#         "128falserecoZVertexLayout128falserecoZVertexTracksLayoutPortableHostMultiCollection_hltPixelVerticesSoA__*",
-#         "ushort_hltPixelVerticesSoA_backend_*",
-#         "*_PixelActivity__*",
-#     )
-# )
+# send the PixelVerticesSoA over MPI
+process.mpiSenderPixelVerticesSoA = cms.EDProducer("MPISender",
+    upstream = cms.InputTag("mpiSenderPixelTracksSoA"),
+    instance = cms.int32(35),
+    products = cms.vstring(
+        "128falserecoZVertexLayout128falserecoZVertexTracksLayoutPortableHostMultiCollection_hltPixelVerticesSoA__*",
+        "ushort_hltPixelVerticesSoA_backend_*",
+        "*_PixelActivity__*",
+    )
+)
 
 process.PixelActivity = cms.EDProducer("PathStateCapture")
 
@@ -316,9 +316,9 @@ process.MPIPath = cms.Path(
     process.mpiSenderParticleFlowRecHitHBHESoA +
     process.mpiSenderParticleFlowClusterHBHESoA +
     process.mpiSenderSiPixelClustersSoA +
-    process.mpiSenderSiPixelRecHitsSoA 
-    # process.mpiSenderPixelTracksSoA +
-    # process.mpiSenderPixelVerticesSoA
+    process.mpiSenderSiPixelRecHitsSoA +
+    process.mpiSenderPixelTracksSoA +
+    process.mpiSenderPixelVerticesSoA
 )
 
 # schedule the reconstruction

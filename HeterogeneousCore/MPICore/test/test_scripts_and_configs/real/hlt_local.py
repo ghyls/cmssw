@@ -48,7 +48,7 @@ process.MPIService.pmix_server_uri = "file:server.uri"
 from HeterogeneousCore.MPICore.mpiController_cfi import mpiController as mpiController_
 process.mpiController = mpiController_.clone()
 
-# process.load("FWCore/Services/Tracer_cfi")
+process.load("FWCore/Services/Tracer_cfi")
 
 # send the raw data over MPI
 process.mpiSenderRawData = cms.EDProducer("MPISender",
@@ -252,7 +252,7 @@ process.hltSiPixelRecHitsSoA = cms.EDProducer("MPIReceiver",
     instance = cms.int32(33),
     products = cms.VPSet(
     cms.PSet(
-        type = cms.string("asdasd"),
+        type = cms.string("reco::TrackingRecHitHost"),
         label = cms.string("")
     ), 
     cms.PSet(
@@ -265,44 +265,44 @@ process.hltSiPixelRecHitsSoA = cms.EDProducer("MPIReceiver",
     ))
 )
 
-# del process.hltPixelTracksSoA
+del process.hltPixelTracksSoA
 
-# # receive the PixelTracksSoA over MPI
-# process.hltPixelTracksSoA = cms.EDProducer("MPIReceiver",
-#     upstream = cms.InputTag("hltSiPixelRecHitsSoA"),
-#     instance = cms.int32(34),
-#     products = cms.VPSet(cms.PSet(
-#         type = cms.string("reco::TracksHost"),
-#         label = cms.string("")
-#     ), cms.PSet(
-#        type = cms.string("ushort"),
-#        label = cms.string("backend")
-#     ),
-#     cms.PSet(
-#         type = cms.string("edm::PathStateToken"),
-#         label = cms.string("")
-#     ))
-# )
-#
+# receive the PixelTracksSoA over MPI
+process.hltPixelTracksSoA = cms.EDProducer("MPIReceiver",
+    upstream = cms.InputTag("hltSiPixelRecHitsSoA"),
+    instance = cms.int32(34),
+    products = cms.VPSet(cms.PSet(
+        type = cms.string("reco::TracksHost"),
+        label = cms.string("")
+    ), cms.PSet(
+       type = cms.string("ushort"),
+       label = cms.string("backend")
+    ),
+    cms.PSet(
+        type = cms.string("edm::PathStateToken"),
+        label = cms.string("")
+    ))
+)
 
-# del process.hltPixelVerticesSoA
 
-# # receive the PixelVerticesSoA over MPI
-# process.hltPixelVerticesSoA = cms.EDProducer("MPIReceiver",
-#     upstream = cms.InputTag("hltPixelTracksSoA"),
-#     instance = cms.int32(35),
-#     products = cms.VPSet(cms.PSet(
-#         type = cms.string("ZVertexHost"),
-#         label = cms.string("")
-#     ), cms.PSet(
-#        type = cms.string("ushort"),
-#        label = cms.string("backend")
-#     ),
-#     cms.PSet(
-#         type = cms.string("edm::PathStateToken"),
-#         label = cms.string("")
-#     ))
-# )
+del process.hltPixelVerticesSoA
+
+# receive the PixelVerticesSoA over MPI
+process.hltPixelVerticesSoA = cms.EDProducer("MPIReceiver",
+    upstream = cms.InputTag("hltPixelTracksSoA"),
+    instance = cms.int32(35),
+    products = cms.VPSet(cms.PSet(
+        type = cms.string("ZVertexHost"),
+        label = cms.string("")
+    ), cms.PSet(
+       type = cms.string("ushort"),
+       label = cms.string("backend")
+    ),
+    cms.PSet(
+        type = cms.string("edm::PathStateToken"),
+        label = cms.string("")
+    ))
+)
 
 # General path state to validate if the event is active (sometimes it's not apparently)
 process.rawDataCollectorActivity = cms.EDProducer("PathStateCapture")
@@ -371,14 +371,14 @@ process.Offload = cms.Path(
     process.hltEcalDigisSoA +
     process.hltEcalUncalibRecHitSoA +
     process.hltSiPixelClustersSoA +
-    process.hltSiPixelRecHitsSoA 
-    # process.hltPixelTracksSoA +
-    # process.hltPixelVerticesSoA
+    process.hltSiPixelRecHitsSoA +
+    process.hltPixelTracksSoA +
+    process.hltPixelVerticesSoA
 )
 
 process.schedule.append(process.Offload)
 
-#process.Tracer = cms.Service("Tracer")
+process.Tracer = cms.Service("Tracer")
 
 process.ThroughputService = cms.Service('ThroughputService',
     enableDQM = cms.untracked.bool(False),

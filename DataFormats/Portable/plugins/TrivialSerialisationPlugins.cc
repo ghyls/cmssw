@@ -58,15 +58,24 @@ using PortableHostCollectionSiPixelClusters = PortableHostCollection<SiPixelClus
 DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionSiPixelClusters);
 
 // ?
-using PortableHostCollectionTrackingRecHit = PortableHostCollection<reco::TrackingRecHitSoA>;
-DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionTrackingRecHit);
+// using PortableHostCollectionTrackingRecHit = reco::TrackingRecHitSoA;
+// DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionTrackingRecHit);
+
+using PortableHostCollectionTracks = PortableHostCollection<reco::TrackLayout<128, false>>;
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionTracks);
+
+// TrackingRecHitHost
 
 
-using PortableHostMultiCollectionTrackingRecHits = PortableHostMultiCollection<reco::TrackingHitsLayout<128>, reco::HitModulesLayout<128>>;
-DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionTrackingRecHits);
-
-using PortableHostMultiCollectionTracks = PortableHostMultiCollection<reco::TrackLayout<128>, reco::TrackHitsLayout<128>>;
+// PortableHostMultiCollection<TrackSoA, TrackHitSoA>
+using PortableHostMultiCollectionTracks = PortableHostMultiCollection<reco::TrackSoA, reco::TrackHitSoA>;
 DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionTracks);
 
-using PortableHostMultiCollectionZVertex = PortableHostMultiCollection<reco::ZVertexLayout<128>, reco::ZVertexTracksLayout<128>>;
-DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionZVertex);
+// using PortableHostMultiCollectionTrackingRecHits = PortableHostMultiCollection<reco::TrackingHitsLayout<128>, reco::HitModulesLayout<128>>;
+// DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionTrackingRecHits);
+
+// using PortableHostMultiCollectionTracks = PortableHostMultiCollection<reco::TrackLayout<128>, reco::TrackHitsLayout<128>>;
+// DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionTracks);
+
+// using PortableHostMultiCollectionZVertex = PortableHostMultiCollection<reco::ZVertexLayout<128>, reco::ZVertexTracksLayout<128>>;
+// DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostMultiCollectionZVertex);

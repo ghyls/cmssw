@@ -140,12 +140,12 @@ public:
           ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())};
 
         if (serialiser) {
-          // printf( "MPISender: found serializer for type %s\n", entry.type.typeInfo().name());
+          printf( "MPISender: found serializer for type %s\n", entry.type.typeInfo().name());
           auto reader = serialiser->initialize(*wrapper);
           edm::AnyBuffer buffer = reader->parameters();
           meta->addTrivialCopy(buffer.data(), buffer.size_bytes());
         } else {
-          // printf( "MPISender: no serializer for type %s, using ROOT serialization\n", entry.type.typeInfo().name());
+          printf( "MPISender: no serializer for type %s, using ROOT serialization\n", entry.type.typeInfo().name());
           TClass* cls = entry.wrappedType.getClass();
           if (!cls) {
             throw cms::Exception("MPISender") << "Failed to get TClass for type: " << entry.type.name();
