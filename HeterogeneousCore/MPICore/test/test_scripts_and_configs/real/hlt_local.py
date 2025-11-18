@@ -48,7 +48,7 @@ process.MPIService.pmix_server_uri = "file:server.uri"
 from HeterogeneousCore.MPICore.mpiController_cfi import mpiController as mpiController_
 process.mpiController = mpiController_.clone()
 
-process.load("FWCore/Services/Tracer_cfi")
+# process.load("FWCore/Services/Tracer_cfi")
 
 # send the raw data over MPI
 process.mpiSenderRawData = cms.EDProducer("MPISender",
@@ -378,7 +378,7 @@ process.Offload = cms.Path(
 
 process.schedule.append(process.Offload)
 
-process.Tracer = cms.Service("Tracer")
+# process.Tracer = cms.Service("Tracer")
 
 process.ThroughputService = cms.Service('ThroughputService',
     enableDQM = cms.untracked.bool(False),

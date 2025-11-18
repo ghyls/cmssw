@@ -9,6 +9,7 @@
   <use name="DataFormats/TrackingRecHitSoA"/>
   <use name="DataFormats/TrackSoA"/>
   <use name="DataFormats/VertexSoA"/>
+  <use name="DataFormats/SiPixelDigiSoA"/>
   <use name="FWCore/Framework"/>
   <use name="FWCore/PluginManager"/>
   <use name="TrivialSerialisation/Common"/>

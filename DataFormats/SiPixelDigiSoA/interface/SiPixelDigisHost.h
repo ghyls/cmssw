@@ -1,6 +1,7 @@
 #ifndef DataFormats_SiPixelDigiSoA_interface_SiPixelDigisHost_h
 #define DataFormats_SiPixelDigiSoA_interface_SiPixelDigisHost_h
 
+#include "DataFormats/Common/interface/TrivialCopyTraits.h"
 #include "DataFormats/Common/interface/Uninitialized.h"
 #include "DataFormats/Portable/interface/PortableHostCollection.h"
 #include "DataFormats/SiPixelDigiSoA/interface/SiPixelDigisSoA.h"
@@ -24,5 +25,41 @@ public:
 private:
   uint32_t nModules_h = 0;
 };
+
+// Specialize the TrivialCopyTraits for SiPixelDigisHost
+namespace edm {
+
+  template <>
+  struct TrivialCopyTraits<SiPixelDigisHost> {
+    using value_type = SiPixelDigisHost;
+    struct Properties {
+      int32_t size;
+      uint32_t nModules;
+    };
+
+    static Properties properties(value_type const& object) {
+      return {static_cast<int32_t>(object->metadata().size()), object.nModules()};
+    }
+
+    static void initialize(value_type& object, Properties const& props) {
+      // replace the default-constructed empty object with one where the buffer has been allocated in pageable system memory
+      object = value_type(props.size - 1, cms::alpakatools::host());
+      object.setNModules(props.nModules);
+    }
+
+    static std::vector<std::span<std::byte>> regions(value_type& object) {
+      std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}, {reinterpret_cast<std::byte*>(object.nModules()), sizeof(uint32_t)}};
+    }
+
+    static std::vector<std::span<const std::byte>> regions(value_type const& object) {
+      const std::byte* address = reinterpret_cast<const std::byte*>(object.buffer().data());
+      size_t size = alpaka::getExtentProduct(object.buffer());
+      return {{address, size}, {reinterpret_cast<const std::byte*>(object.nModules()), sizeof(uint32_t)}};
+    }
+  };
+
+}  // namespace edm
 
 #endif  // DataFormats_SiPixelDigiSoA_interface_SiPixelDigisHost_h

@@ -17,6 +17,7 @@
 #include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsSoA.h"
 #include "DataFormats/TrackSoA/interface/TracksSoA.h"
 #include "DataFormats/VertexSoA/interface/ZVertexSoA.h"
+#include "DataFormats/SiPixelDigiSoA/interface/SiPixelDigisHost.h"
 
 
 // DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollection<EcalDigiSoALayout<128,false> >);
@@ -64,7 +65,8 @@ DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionSiPixelClusters);
 using PortableHostCollectionTracks = PortableHostCollection<reco::TrackLayout<128, false>>;
 DEFINE_TRIVIAL_SERIALISER_PLUGIN(PortableHostCollectionTracks);
 
-// TrackingRecHitHost
+// SiPixelDigisHost
+DEFINE_TRIVIAL_SERIALISER_PLUGIN(SiPixelDigisHost);
 
 
 // PortableHostMultiCollection<TrackSoA, TrackHitSoA>
