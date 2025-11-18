@@ -1,5 +1,5 @@
-#ifndef DataFormats_Common_Wrapper_h
-#define DataFormats_Common_Wrapper_h
+#ifndef DataFormats_Common_interface_Wrapper_h
+#define DataFormats_Common_interface_Wrapper_h
 
 /*----------------------------------------------------------------------
 
@@ -38,8 +38,6 @@ namespace edm {
 
     T& bareProduct() { return obj; }
     T const& bareProduct() const { return obj; }
-
-    void markAsPresent() { present = true; }
 
     //these are used by FWLite
     static std::type_info const& productTypeInfo() { return typeid(T); }
@@ -178,7 +176,6 @@ namespace edm {
       }
     };
   }  // namespace soa
-
   template <typename T>
   inline std::shared_ptr<edm::soa::TableExaminerBase> Wrapper<T>::tableExaminer_() const {
     return soa::MakeTableExaminer<T>::make(&obj);
@@ -188,4 +185,4 @@ namespace edm {
 
 #include "DataFormats/Common/interface/WrapperView.icc"
 
-#endif  // DataFormats_Common_Wrapper_h
+#endif  // DataFormats_Common_interface_Wrapper_h
