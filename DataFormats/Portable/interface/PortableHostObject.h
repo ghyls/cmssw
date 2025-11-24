@@ -7,11 +7,11 @@
 
 #include <alpaka/alpaka.hpp>
 
-#include "DataFormats/Common/interface/TrivialCopyTraits.h"
 #include "DataFormats/Common/interface/Uninitialized.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/host.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/memory.h"
+#include "HeterogeneousCore/SerialisationCore/interface/MemoryCopyTraits.h"
 
 // generic object in host memory
 template <typename T>
@@ -116,18 +116,17 @@ private:
   Product* product_ = nullptr;
 };
 
-// Specialize the TrivialCopyTraits for PortableHostObject
-namespace edm {
+// Specialize the MemoryCopyTraits for PortableHostObject
+namespace ngt {
 
   template <typename T>
-  struct TrivialCopyTraits<PortableHostObject<T>> {
-    // this specialisation requires a initialize() method, but does not need to pass any parameters to it
+  struct MemoryCopyTraits<PortableHostObject<T>> {
+    // This specialisation requires a initialize() method, but does not need to pass any parameters to it.
     using Properties = void;
 
-    template <typename TQueue, typename = std::enable_if_t<alpaka::isQueue<TQueue>>>
-    static void initialize(PortableHostObject<T>& object, TQueue && queue) {
-      // replace the default-constructed empty object with one where the buffer has been allocated in pageable system memory
-      object = PortableHostObject<T>(std::forward<TQueue>(queue));
+    static void initialize(PortableHostObject<T>& object) {
+      // Replace the default-constructed empty object with one where the buffer has been allocated in pageable system memory.
+      object = PortableHostObject<T>(cms::alpakatools::host());
     }
 
     static std::vector<std::span<std::byte>> regions(PortableHostObject<T>& object) {
@@ -139,6 +138,6 @@ namespace edm {
     }
   };
 
-}  // namespace edm
+}  // namespace ngt
 
 #endif  // DataFormats_Portable_interface_PortableHostObject_h

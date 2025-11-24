@@ -1,8 +1,10 @@
 #ifndef DataFormats_Portable_interface_PortableDeviceCollection_h
 #define DataFormats_Portable_interface_PortableDeviceCollection_h
 
+#include <array>
 #include <cassert>
 #include <concepts>
+#include <cstddef>
 #include <optional>
 #include <tuple>
 #include <type_traits>
