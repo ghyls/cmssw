@@ -3,13 +3,13 @@
 import FWCore.ParameterSet.Config as cms
 
 # load the "frozen" 2024 HLT menu
-from hlt_cff import process
+from hlt_v6_cff import process
 
 # run over HLTPhysics data from run 383363
 # process.load('run383631_cff')
 process.load('run396102_cff')
 
-# del process.HLTAnalyzerEndpath
+del process.HLTAnalyzerEndpath
 
 # override the GlobalTag
 from Configuration.AlCa.GlobalTag import GlobalTag as customiseGlobalTag
