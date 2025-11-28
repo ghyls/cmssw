@@ -8,6 +8,7 @@
 
 #include "DataFormats/Common/interface/TrivialCopyTraits.h"
 #include "DataFormats/Common/interface/Uninitialized.h"
+#include "HeterogeneousCore/SerialisationCore/interface/MemoryCopyTraits.h"
 
 namespace edm {
   class DeviceProductBase {
@@ -87,53 +88,51 @@ namespace edm {
   };
 }  // namespace edm
 
-namespace edm {
+namespace ngt {
 
   template <typename T>
-    requires HasTrivialCopyTraits<T> && HasTrivialCopyProperties<T>
-  struct TrivialCopyTraits<edm::DeviceProduct<T>> {
+    requires HasMemoryCopyTraits<T> && HasTrivialCopyProperties<T>
+  struct MemoryCopyTraits<edm::DeviceProduct<T>> {
     using Properties = TrivialCopyProperties<T>;
 
-
     static Properties properties(edm::DeviceProduct<T> const& wrapper) {
-      return TrivialCopyTraits<T>::properties(wrapper.product());
+      return MemoryCopyTraits<T>::properties(wrapper.product());
     }
 
     template <typename... Args>
     static void initialize(edm::DeviceProduct<T>& wrapper, Args&&... args) {
-      TrivialCopyTraits<T>::initialize(wrapper.product(), std::forward<Args>(args)...);
+      MemoryCopyTraits<T>::initialize(wrapper.product(), std::forward<Args>(args)...);
     }
 
     static std::vector<std::span<std::byte>> regions(edm::DeviceProduct<T>& wrapper) {
-      return TrivialCopyTraits<T>::regions(wrapper.product());
+      return MemoryCopyTraits<T>::regions(wrapper.product());
     }
 
     static std::vector<std::span<const std::byte>> regions(edm::DeviceProduct<T> const& wrapper) {
-      return TrivialCopyTraits<T>::regions(wrapper.product());
+      return MemoryCopyTraits<T>::regions(wrapper.product());
     }
   };
 
   template <typename T>
-    requires HasTrivialCopyTraits<T> && (!HasTrivialCopyProperties<T>)
-  struct TrivialCopyTraits<edm::DeviceProduct<T>> {
+    requires HasMemoryCopyTraits<T> && (!HasTrivialCopyProperties<T>)
+  struct MemoryCopyTraits<edm::DeviceProduct<T>> {
     using Properties = void;
-
 
     template <typename... Args>
     static void initialize(edm::DeviceProduct<T>& wrapper, Args&&... args) {
-      TrivialCopyTraits<T>::initialize(wrapper.product(), std::forward<Args>(args)...);
+      MemoryCopyTraits<T>::initialize(wrapper.product(), std::forward<Args>(args)...);
     }
 
     template <typename... Args>
     static std::vector<std::span<std::byte>> regions(edm::DeviceProduct<T>& wrapper, Args&&... args) {
-      return TrivialCopyTraits<T>::regions(wrapper.product(), std::forward<Args>(args)...);
+      return MemoryCopyTraits<T>::regions(wrapper.product(), std::forward<Args>(args)...);
     }
 
     template <typename... Args>
     static std::vector<std::span<const std::byte>> regions(edm::DeviceProduct<T> const& wrapper, Args&&... args) {
-      return TrivialCopyTraits<T>::regions(wrapper.product(), std::forward<Args>(args)...);
+      return MemoryCopyTraits<T>::regions(wrapper.product(), std::forward<Args>(args)...);
     }
   };
 
-}  // namespace edm
+}  // namespace ngt
 #endif

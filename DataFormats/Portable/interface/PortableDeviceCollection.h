@@ -16,6 +16,7 @@
 #include "DataFormats/Portable/interface/PortableCollectionCommon.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/memory.h"
+#include "HeterogeneousCore/SerialisationCore/interface/MemoryCopyTraits.h"
 
 // generic SoA-based product in device memory
 template <typename T, typename TDev, typename = std::enable_if_t<alpaka::isDevice<TDev>>>
@@ -376,11 +377,11 @@ private:
   Implementation impl_;           // (serialized: this is where the layouts live)
 };
 
-namespace edm {
+namespace ngt {
 
-  // Specialize the TrivialCopyTraits for PortableDeviceCollection
+  // Specialize the MemoryCopyTraits for PortableDeviceCollection
   template <typename T, typename TDev>
-  struct TrivialCopyTraits<PortableDeviceCollection<T, TDev>> {
+  struct MemoryCopyTraits<PortableDeviceCollection<T, TDev>> {
     using Properties = uint32_t;
 
     static Properties properties(PortableDeviceCollection<T, TDev> const& object) {
@@ -405,18 +406,19 @@ namespace edm {
     }
   };
 
-  // Specialize the TrivialCopyTraits for PortableDeviceMultiCollection
+  // Specialize the MemoryCopyTraits for PortableDeviceMultiCollection
   template <typename TDev, typename T0, typename... Args>
-  struct TrivialCopyTraits<PortableDeviceMultiCollection<TDev, T0, Args...>> {
+  struct MemoryCopyTraits<PortableDeviceMultiCollection<TDev, T0, Args...>> {
     using Properties = typename PortableDeviceMultiCollection<TDev, T0, Args...>::SizesArray;
-
 
     static Properties properties(PortableDeviceMultiCollection<TDev, T0, Args...> const& object) {
       return object.sizes();
     }
 
     template <typename TQueue, typename = std::enable_if_t<alpaka::isQueue<TQueue>>>
-    static void initialize(PortableDeviceMultiCollection<TDev, T0, Args...>& object, TQueue& queue, Properties const& sizes) {
+    static void initialize(PortableDeviceMultiCollection<TDev, T0, Args...>& object,
+                           TQueue& queue,
+                           Properties const& sizes) {
       object = PortableDeviceMultiCollection<TDev, T0, Args...>(sizes, queue);
     }
 
@@ -433,6 +435,6 @@ namespace edm {
       return {{address, size}};
     }
   };
-}  // namespace edm
+}  // namespace ngt
 
 #endif  // DataFormats_Portable_interface_PortableDeviceCollection_h
