@@ -9,28 +9,26 @@
 // CMSSW include files
 #include "DataFormats/Provenance/interface/ProductDescription.h"
 #include "DataFormats/Provenance/interface/ProductNamePattern.h"
-#include "FWCore/Framework/interface/Event.h"
-#include "FWCore/Concurrency/interface/Async.h"
-#include "FWCore/Framework/interface/GenericHandle.h"
-#include "FWCore/Framework/interface/WrapperBaseHandle.h"
-#include "FWCore/Framework/interface/global/EDProducer.h"
-#include "FWCore/MessageLogger/interface/MessageLogger.h"
-#include "FWCore/ParameterSet/interface/ParameterSet.h"
-#include "FWCore/ParameterSet/interface/ParameterSetDescription.h"
-#include "FWCore/Reflection/interface/TypeWithDict.h"
-#include "FWCore/Utilities/interface/Exception.h"
-#include "HeterogeneousCore/MPICore/interface/MPIToken.h"
-
 #include "FWCore/Concurrency/interface/Async.h"
 #include "FWCore/Concurrency/interface/chain_first.h"
-#include "FWCore/Framework/interface/stream/EDProducer.h"
+#include "FWCore/Framework/interface/Event.h"
+#include "FWCore/Framework/interface/GenericHandle.h"
 #include "FWCore/Framework/interface/MakerMacros.h"
+#include "FWCore/Framework/interface/WrapperBaseHandle.h"
+#include "FWCore/Framework/interface/global/EDProducer.h"
+#include "FWCore/Framework/interface/stream/EDProducer.h"
+#include "FWCore/MessageLogger/interface/MessageLogger.h"
 #include "FWCore/ParameterSet/interface/ConfigurationDescriptions.h"
 #include "FWCore/ParameterSet/interface/ParameterSet.h"
 #include "FWCore/ParameterSet/interface/ParameterSetDescription.h"
+#include "FWCore/Reflection/interface/TypeWithDict.h"
 #include "FWCore/ServiceRegistry/interface/Service.h"
 #include "FWCore/ServiceRegistry/interface/ServiceMaker.h"
 #include "FWCore/Utilities/interface/Exception.h"
+#include "HeterogeneousCore/MPICore/interface/MPIToken.h"
+#include "HeterogeneousCore/SerialisationCore/interface/AnyBuffer.h"
+#include "HeterogeneousCore/SerialisationCore/interface/SerialiserBase.h"
+#include "HeterogeneousCore/SerialisationCore/interface/SerialiserFactory.h"
 
 #include <condition_variable>
 #include <mutex>
@@ -100,12 +98,10 @@ public:
     });
 
     // TODO add an error if a pattern does not match any branches? how?
-    printf("MPISender constructed with %zu products\n", products_.size());
   }
 
   void acquire(edm::Event const& event, edm::EventSetup const&, edm::WaitingTaskWithArenaHolder holder) final {
-    printf("Entering MPISender::acquire()\n");
-    MPIToken token = event.get(upstream_);
+    const MPIToken& token = event.get(upstream_);
     // we need 1 byte for type, 8 bytes for size and at least 8 bytes for trivial copy parameters buffer
     auto meta = std::make_shared<ProductMetadataBuilder>(products_.size() * 24);
     size_t index = 0;
@@ -133,14 +129,17 @@ public:
 
       if (handle.isValid()) {
         edm::WrapperBase const* wrapper = handle.product();
-        std::unique_ptr<ngt::SerialiserBase> serialiser{
-          ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())};
+        std::unique_ptr<ngt::SerialiserBase> serialiser =
+            ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name());
 
         if (serialiser) {
-          auto reader = serialiser->initialize(*wrapper);
-          edm::AnyBuffer buffer = reader->parameters();
+          edm::LogVerbatim("MPISender") << "Found serializer for type " << entry.type.typeInfo().name();
+          auto reader = serialiser->reader(*wrapper);
+          ngt::AnyBuffer buffer = reader->parameters();
           meta->addTrivialCopy(buffer.data(), buffer.size_bytes());
         } else {
+          edm::LogVerbatim("MPISender") << "No serializer for type " << entry.type.typeInfo().name()
+                                        << ", using ROOT serialization";
           TClass* cls = entry.wrappedType.getClass();
           if (!cls) {
             throw cms::Exception("MPISender") << "Failed to get TClass for type: " << entry.type.name();
@@ -157,17 +156,15 @@ public:
       index++;
     }
 
-    token.channel()->sendMetadata(instance_, meta);
-    // // Submit sending of all products to run in the additional asynchronous threadpool
-    // edm::Service<edm::Async> as;
-    // as->runAsync(
-    //     std::move(holder),
-    //     [this, token, meta = std::move(meta)]() { token.channel()->sendMetadata(instance_, meta); },
-    //     []() { return "Calling MPISender::acquire()"; });
+    // Submit sending of all products to run in the additional asynchronous threadpool
+    edm::Service<edm::Async> as;
+    as->runAsync(
+        std::move(holder),
+        [this, token, meta = std::move(meta)]() { token.channel()->sendMetadata(instance_, meta); },
+        []() { return "Calling MPISender::acquire()"; });
   }
 
   void produce(edm::Event& event, edm::EventSetup const&) final {
-    printf("Entering MPISender::produce()\n");
     MPIToken token = event.get(upstream_);
 
     if (!is_active_) {
@@ -185,10 +182,10 @@ public:
       edm::WrapperBase const* wrapper = handle.product();
       // we don't send missing products
       if (handle.isValid()) {
-        std::unique_ptr<ngt::SerialiserBase> serialiser{
-          ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())};
+        std::unique_ptr<ngt::SerialiserBase> serialiser =
+            ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name());
         if (serialiser) {
-          auto reader = serialiser->initialize(*wrapper);
+          auto reader = serialiser->reader(*wrapper);
           token.channel()->sendTrivialCopyProduct(instance_, *reader);
         }
       }

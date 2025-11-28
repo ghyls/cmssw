@@ -9,8 +9,7 @@
   <use name="FWCore/Utilities"/>
   <use name="HeterogeneousCore/MPICore"/>
   <use name="HeterogeneousCore/MPIServices"/>
-  <use name="TrivialSerialisation/Common"/>
-   <use name="fmt"/>
+  <use name="HeterogeneousCore/SerialisationCore"/>
   <flags EDM_PLUGIN="1"/>
 </library>
 

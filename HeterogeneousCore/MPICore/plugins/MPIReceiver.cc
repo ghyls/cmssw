@@ -16,14 +16,24 @@
 #include "FWCore/Concurrency/interface/chain_first.h"
 #include "FWCore/Framework/interface/stream/EDProducer.h"
 #include "FWCore/Framework/interface/MakerMacros.h"
+#include "FWCore/Concurrency/interface/Async.h"
+#include "FWCore/Concurrency/interface/chain_first.h"
+#include "FWCore/Framework/interface/Event.h"
+#include "FWCore/Framework/interface/MakerMacros.h"
+#include "FWCore/Framework/interface/WrapperBaseOrphanHandle.h"
+#include "FWCore/Framework/interface/global/EDProducer.h"
+#include "FWCore/Framework/interface/stream/EDProducer.h"
+#include "FWCore/MessageLogger/interface/MessageLogger.h"
 #include "FWCore/ParameterSet/interface/ConfigurationDescriptions.h"
 #include "FWCore/ParameterSet/interface/ParameterSet.h"
 #include "FWCore/ParameterSet/interface/ParameterSetDescription.h"
 #include "FWCore/ServiceRegistry/interface/Service.h"
 #include "FWCore/ServiceRegistry/interface/ServiceMaker.h"
 #include "FWCore/Utilities/interface/Exception.h"
-// #include "TrivialSerialisation/Common/interface/SerialiserBase.h"
-// #include "TrivialSerialisation/Common/interface/SerialiserFactory.h"
+#include "HeterogeneousCore/MPICore/interface/MPIToken.h"
+#include "HeterogeneousCore/SerialisationCore/interface/AnyBuffer.h"
+#include "HeterogeneousCore/SerialisationCore/interface/SerialiserBase.h"
+#include "HeterogeneousCore/SerialisationCore/interface/SerialiserFactory.h"
 
 #include <condition_variable>
 #include <mutex>
@@ -35,7 +45,6 @@
 #include <TClass.h>
 
 class MPIReceiver : public edm::stream::EDProducer<edm::ExternalWork> {
-// class MPIReceiver : public edm::stream::EDProducer<> {
 public:
   MPIReceiver(edm::ParameterSet const& config)
       : upstream_(consumes<MPIToken>(config.getParameter<edm::InputTag>("upstream"))),
@@ -63,46 +72,30 @@ public:
                                       << "\" over MPI channel instance " << this->instance_;
 
       products_.emplace_back(std::move(entry));
-      printf("entry.type: %s\n", entry.type.name().c_str());
-      printf("entry.wrappedType: %s\n", entry.wrappedType.name().c_str());
-
     }
-    printf("MPIReceiver constructed with %zu products\n", products_.size());
   }
 
   void acquire(edm::Event const& event, edm::EventSetup const&, edm::WaitingTaskWithArenaHolder holder) final {
-    printf("Entering MPIReceiver::acquire()\n");
-    MPIToken token = event.get(upstream_);
+    const MPIToken& token = event.get(upstream_);
 
     //also try unique or optional
     received_meta_ = std::make_shared<ProductMetadataBuilder>();
 
-
-    token.channel()->receiveMetadata(instance_, received_meta_);
-    printf("MPIReceiver::acquire() received metadata\n");
-
-    // edm::Service<edm::Async> as;
-    // as->runAsync(
-    //     std::move(holder),
-    //     [this, token]() { token.channel()->receiveMetadata(instance_, received_meta_); },
-    //     []() { return "Calling MPIReceiver::acquire()"; });
+    edm::Service<edm::Async> as;
+    as->runAsync(
+        std::move(holder),
+        [this, token]() { token.channel()->receiveMetadata(instance_, received_meta_); },
+        []() { return "Calling MPIReceiver::acquire()"; });
   }
 
   void produce(edm::Event& event, edm::EventSetup const&) final {
-    printf("Entering MPIReceiver::produce()\n");
     // read the MPIToken used to establish the communication channel
     MPIToken token = event.get(upstream_);
-
-    // token.channel()->receiveMetadata(instance_, received_meta_);
-    // printf("MPIReceiver::acquire() received metadata\n");
-
-    printf("done event.get()\n");
     // see the summary of metadata for dubug purposes
     // received_meta_->debugPrintMetadataSummary();
 
     // if filter was false before the sender, receive nothing
     if (received_meta_->productCount() == -1) {
-      printf("MPIReceiver::produce(): FILTER A!\n");
       event.emplace(token_, token);
       return;
     }
@@ -120,53 +113,45 @@ public:
     }
 
     for (auto const& entry : products_) {
-
-      printf("doing product of type %s\n", entry.type.name().c_str());
-      std::unique_ptr<edm::WrapperBase> wrapper(
-          reinterpret_cast<edm::WrapperBase*>(entry.wrappedType.getClass()->New()));
-
       auto product_meta = received_meta_->getNext();
-
       if (product_meta.kind == ProductMetadata::Kind::Missing) {
         edm::LogWarning("MPIReceiver") << "Product " << entry.type.name() << " was not received.";
         continue;  // Skip products that weren't sent
       }
 
       else if (product_meta.kind == ProductMetadata::Kind::Serialized) {
-        printf("here be dragons\n");
+        std::unique_ptr<edm::WrapperBase> wrapper(
+            reinterpret_cast<edm::WrapperBase*>(entry.wrappedType.getClass()->New()));
         auto productBuffer = TBufferFile(TBuffer::kRead, product_meta.sizeMeta);
         // assert(!wrapper->hasTrivialCopyTraits() && "mismatch between expected and factual metadata type");
         assert(buffer_offset_ < full_buffer_size && "serialized data buffer is shorter than expected");
         productBuffer.SetBuffer(buf_ptr + buffer_offset_, product_meta.sizeMeta, kFALSE /* adopt = false */);
         buffer_offset_ += product_meta.sizeMeta;
         entry.wrappedType.getClass()->Streamer(wrapper.get(), productBuffer);
+        // put the data into the Event
+        event.put(entry.token, std::move(wrapper));
       }
 
       else if (product_meta.kind == ProductMetadata::Kind::TrivialCopy) {
-        printf("here be more dragons\n");
         // assert(wrapper->hasTrivialCopyTraits() && "mismatch between expected and factual metadata type");
-        // wrapper->markAsPresent();
-        // std::unique_ptr<ngt::SerialiserBase> serialiser{
-        //   ngt::SerialiserFactory::get()->tryToCreate(entry.objectType_.typeInfo().name())};
-        printf("MPIReceiver: Trying to create a serializer for type \"%s\"\n", entry.type.typeInfo().name());
-        std::unique_ptr<ngt::SerialiserBase> serialiser{
-          ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name())}; // is this ame correct?
-        if (!serialiser) {
-          throw cms::Exception("SerializerError")
-          << "Receiver could not retrieve its serializer when it was expected";
+        std::unique_ptr<ngt::SerialiserBase> serialiser =
+            //  ngt::SerialiserFactory::get()->tryToCreate(entry.objectType_.typeInfo().name());
+            ngt::SerialiserFactory::get()->tryToCreate(entry.type.typeInfo().name());
+        if (not serialiser) {
+          throw cms::Exception("SerializerError") << "Receiver could not retrieve its serializer when it was expected";
         }
-        auto writer = serialiser->initialize(*wrapper);
-        edm::AnyBuffer buffer = writer->parameters();  // constructs buffer with typeid
+        auto writer = serialiser->writer();
+        ngt::AnyBuffer buffer = writer->uninitialized_parameters();  // constructs buffer with typeid
         assert(buffer.size_bytes() == product_meta.sizeMeta);
         // TDL: can we add func to AnyBuffer to replace pointer to the data?
         std::memcpy(buffer.data(), product_meta.trivialCopyOffset, product_meta.sizeMeta);
         // why both of these methods are called initialize? I find this rather confusing
         writer->initialize(buffer);
         token.channel()->receiveInitializedTrivialCopy(instance_, *writer);
-        writer->trivialCopyFinalize();
+        writer->finalize();
+        // put the data into the Event
+        event.put(entry.token, writer->get());
       }
-      // put the data into the Event
-      event.put(entry.token, std::move(wrapper));
     }
 
     if (received_meta_->hasSerialized()) {
@@ -177,7 +162,6 @@ public:
     // write a shallow copy of the channel to the output, so other modules can consume it
     // to indicate that they should run after this
     event.emplace(token_, token);
-    printf("MPIReceiver::produce() done\n");
   }
 
 private:
