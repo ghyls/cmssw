@@ -1,3 +1,4 @@
+#include "DataFormats/HcalDigi/interface/HcalDigiHostCollection.h"
 #include "DataFormats/HcalDigi/interface/alpaka/HcalDigiDeviceCollection.h"
 #include "HeterogeneousCore/TrivialSerialisation/interface/alpaka/SerialiserFactoryDevice.h"
 

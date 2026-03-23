@@ -1,3 +1,6 @@
+#include "DataFormats/HGCalDigi/interface/HGCalDigiHost.h"
+#include "DataFormats/HGCalDigi/interface/HGCalECONDPacketInfoHost.h"
+#include "DataFormats/HGCalDigi/interface/HGCalFEDPacketInfoHost.h"
 #include "DataFormats/HGCalDigi/interface/alpaka/HGCalDigiDevice.h"
 #include "DataFormats/HGCalDigi/interface/alpaka/HGCalECONDPacketInfoDevice.h"
 #include "DataFormats/HGCalDigi/interface/alpaka/HGCalFEDPacketInfoDevice.h"

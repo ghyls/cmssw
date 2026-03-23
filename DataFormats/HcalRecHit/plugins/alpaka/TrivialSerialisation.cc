@@ -1,3 +1,4 @@
+#include "DataFormats/HcalRecHit/interface/HcalRecHitHostCollection.h"
 #include "DataFormats/HcalRecHit/interface/alpaka/HcalRecHitDeviceCollection.h"
 #include "HeterogeneousCore/TrivialSerialisation/interface/alpaka/SerialiserFactoryDevice.h"
 

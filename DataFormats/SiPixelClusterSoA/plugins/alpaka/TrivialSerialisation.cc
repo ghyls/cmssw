@@ -1,3 +1,4 @@
+#include "DataFormats/SiPixelClusterSoA/interface/SiPixelClustersHost.h"
 #include "DataFormats/SiPixelClusterSoA/interface/alpaka/SiPixelClustersSoACollection.h"
 #include "HeterogeneousCore/TrivialSerialisation/interface/alpaka/SerialiserFactoryDevice.h"
 

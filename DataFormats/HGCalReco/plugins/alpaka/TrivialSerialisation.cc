@@ -1,3 +1,6 @@
+#include "DataFormats/HGCalReco/interface/HGCalSoAClustersHostCollection.h"
+#include "DataFormats/HGCalReco/interface/HGCalSoARecHitsExtraHostCollection.h"
+#include "DataFormats/HGCalReco/interface/HGCalSoARecHitsHostCollection.h"
 #include "DataFormats/HGCalReco/interface/alpaka/HGCalSoAClustersDeviceCollection.h"
 #include "DataFormats/HGCalReco/interface/alpaka/HGCalSoARecHitsExtraDeviceCollection.h"
 #include "DataFormats/HGCalReco/interface/alpaka/HGCalSoARecHitsDeviceCollection.h"

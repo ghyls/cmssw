@@ -1,3 +1,4 @@
+#include "DataFormats/BeamSpot/interface/BeamSpotHost.h"
 #include "DataFormats/BeamSpot/interface/alpaka/BeamSpotDevice.h"
 #include "HeterogeneousCore/TrivialSerialisation/interface/alpaka/SerialiserFactoryDevice.h"
 

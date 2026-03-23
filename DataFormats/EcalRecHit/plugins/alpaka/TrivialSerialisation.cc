@@ -1,3 +1,5 @@
+#include "DataFormats/EcalRecHit/interface/EcalRecHitHostCollection.h"
+#include "DataFormats/EcalRecHit/interface/EcalUncalibratedRecHitHostCollection.h"
 #include "DataFormats/EcalRecHit/interface/alpaka/EcalRecHitDeviceCollection.h"
 #include "DataFormats/EcalRecHit/interface/alpaka/EcalUncalibratedRecHitDeviceCollection.h"
 #include "HeterogeneousCore/TrivialSerialisation/interface/alpaka/SerialiserFactoryDevice.h"
