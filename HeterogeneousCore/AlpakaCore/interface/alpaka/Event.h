@@ -137,6 +137,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::device {
       }
     }
 
+    // Access the EDMetadata shared pointer (needed by MPI modules for serialiser operations)
+    std::shared_ptr<EDMetadata> const& metadata() const { return metadata_; }
+
+    // Type-erased put for use with runtime-resolved product types
+    template <typename T>
+    void put(edm::EDPutToken token, std::unique_ptr<T> product) {
+      event_->put(std::move(token), std::move(product));
+    }
+
     // implementation details
     bool wasQueueUsed() const { return queueUsed_; }
 
