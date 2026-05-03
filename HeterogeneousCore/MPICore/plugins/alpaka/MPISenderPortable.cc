@@ -245,9 +245,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       auto productMetadataRequest =
           std::make_shared<MPI_Request>(token.channel()->sendMetadataAsync(instance_, productMetadata));
 
-      // Lambda that waits for the metadata send and then sends all data
-      // products, to be passed to runAsync.
-      auto sendData = [token, instance = instance_, productMetadata, productMetadataRequest, toBeSent, isActive]() {
+      // Lambda that waits for device work and the metadata send, then sends
+      // all data products, to be passed to runAsync.
+      auto sendData = [token, instance = instance_, productMetadata, productMetadataRequest, toBeSent, isActive, deviceMetadata]() {
+        if (deviceMetadata) {
+          alpaka::wait(deviceMetadata->queue());
+        }
         MPIChannel::waitMetadata(*productMetadataRequest);
         if (isActive) {
           if (toBeSent->rootBuffer)
@@ -261,23 +264,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       };
 
       edm::Service<edm::Async> asyncService;
-      if (deviceMetadata) {
-        // Enqueue a callback to runAsync on the device queue, so that we wait
-        // for the device work to finish (including the synchronizations
-        // required by deviceSerialiser->reader()) without blocking an async
-        // thread.
-        edm::Async& async = *asyncService;
-        auto holderPtr = std::make_shared<edm::WaitingTaskWithArenaHolder>(std::move(holder));
-        alpaka::enqueue(
-            deviceMetadata->queue(),
-            [&async, holderPtr = std::move(holderPtr), sendData, deviceMetadata]() {
-              async.runAsync(
-                  std::move(*holderPtr), sendData, []() { return "Calling MPISenderPortable::acquire()"; });
-            });
-      } else {
-        asyncService->runAsync(
-            std::move(holder), std::move(sendData), []() { return "Calling MPISenderPortable::acquire()"; });
-      }
+      asyncService->runAsync(
+          std::move(holder), std::move(sendData), []() { return "Calling MPISenderPortable::acquire()"; });
     }
 
     void produce(edm::Event& event, edm::EventSetup const&) final {
