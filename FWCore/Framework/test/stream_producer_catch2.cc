@@ -19,6 +19,7 @@
 #include "FWCore/Framework/interface/stream/EDProducerAdaptor.h"
 #include "FWCore/Framework/interface/OccurrenceTraits.h"
 #include "FWCore/Framework/interface/ProductResolversFactory.h"
+#include "DataFormats/Common/interface/Wrapper.h"
 #include "DataFormats/Provenance/interface/ProductRegistry.h"
 #include "DataFormats/Provenance/interface/BranchIDListHelper.h"
 #include "DataFormats/Provenance/interface/ThinnedAssociationsHelper.h"
@@ -28,6 +29,7 @@
 #include "FWCore/ServiceRegistry/interface/StreamContext.h"
 #include "FWCore/Concurrency/interface/FinalWaitingTask.h"
 #include "FWCore/Utilities/interface/GlobalIdentifier.h"
+#include "FWCore/Utilities/interface/TypeID.h"
 
 #include "FWCore/Utilities/interface/Exception.h"
 
@@ -350,6 +352,33 @@ namespace {
     edm::EDPutTokenT<float> token_;
   };
 
+  class TransformAsyncUntypedProd : public edm::stream::EDProducer<edm::Transformer> {
+  public:
+    struct IntHolder {
+      IntHolder() : value_(0) {}
+      IntHolder(int iV) : value_(iV) {}
+      int value_;
+    };
+    TransformAsyncUntypedProd(edm::ParameterSet const&) {
+      edm::EDPutToken token = produces<float>();
+      registerTransformAsync(
+          token,
+          [](edm::StreamID, edm::WrapperBase const& iGotProduct, edm::WaitingTaskWithArenaHolder) {
+            return std::any(IntHolder(*static_cast<edm::Wrapper<float> const&>(iGotProduct).product()));
+          },
+          [](edm::StreamID, std::any iCache) -> std::unique_ptr<edm::WrapperBase> {
+            return std::make_unique<edm::Wrapper<int>>(edm::WrapperBase::Emplace{},
+                                                       std::any_cast<IntHolder>(iCache).value_);
+          },
+          edm::TypeID(typeid(int)),
+          std::string{});
+    }
+
+    void produce(edm::Event& iEvent, edm::EventSetup const&) final {
+      //iEvent.emplace(token_, 3.625);
+    }
+  };
+
   unsigned int BasicProd::m_count = 0;
   unsigned int GlobalProd::m_count = 0;
   unsigned int GlobalProdWithBeginJob::m_count = 0;
@@ -644,6 +673,11 @@ namespace {
                                            Trans::kGlobalBeginLuminosityBlock,
                                            Trans::kStreamEndLuminosityBlock,
                                            Trans::kGlobalEndLuminosityBlock});
+    }
+
+    SECTION("transformAsyncUntypedProdTest") {
+      auto mod = createModule<TransformAsyncUntypedProd>();
+      REQUIRE(mod.get() != nullptr);
     }
   }
 }  // namespace
