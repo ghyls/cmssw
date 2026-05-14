@@ -50,7 +50,7 @@ def main():
             print(f"\n=== Process {i} ===")
             print(cfg)
 
-    local_process = processFromFile(str(configs[0].config))
+    local_process = processFromFile(str(configs[0].config), args=[])
 
     # -- get c++ names --
 
