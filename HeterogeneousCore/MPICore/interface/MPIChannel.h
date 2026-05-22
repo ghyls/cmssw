@@ -3,6 +3,7 @@
 
 // C++ standard library headers
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -159,7 +160,7 @@ public:
   std::unique_ptr<TBufferFile> receiveSerializedBuffer(int instance, int bufSize);
 
   // transfer a pre-formed list of memory regions
-  void sendTrivialCopyProduct(int instance, std::vector<std::span<const std::byte>> const& regions);
+  void sendTrivialCopyProduct(int instance, std::vector<std::span<const std::byte>> const& regions, bool fromGpu = false);
 
   // transfer a wrapped object using its MemoryCopyTraits
   void sendTrivialCopyProduct(int instance, const ngt::ReaderBase& reader);
@@ -240,6 +241,7 @@ private:
   template <typename T>
   void sendTrivialProduct_(int instance, T const& product) {
     int tag = EDM_MPI_SendTrivialProduct | instance * EDM_MPI_MessageTagWidth_;
+    { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, sizeof(T)); fflush(stdout); }
     MPI_Send(&product, sizeof(T), MPI_BYTE, dest_, tag, comm_);
   }
 

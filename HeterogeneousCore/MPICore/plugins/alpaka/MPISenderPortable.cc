@@ -173,6 +173,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       struct DataToBeSent {
         using Regions = std::vector<std::span<const std::byte>>;
         std::vector<Regions> pendingRegions;
+        std::vector<bool> pendingIsGpu;
         // Anything we pass to runAsync needs to be copyable, so we wrap
         // rootBuffer in this struct and pass to runAsync the
         // std::make_shared<DataToBeSent>() below.
@@ -209,12 +210,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
             ::ngt::AnyBuffer buffer = reader->parameters();
             productMetadata->addTrivialCopy(buffer.data(), buffer.size_bytes());
             toBeSent->pendingRegions.push_back(reader->regions());
+            toBeSent->pendingIsGpu.push_back(true);
           } else if (entry.hostSerialiser) {
             // If the product is on host and we have a serialiser for it
             auto reader = entry.hostSerialiser->reader(*wrapper);
             ::ngt::AnyBuffer buffer = reader->parameters();
             productMetadata->addTrivialCopy(buffer.data(), buffer.size_bytes());
             toBeSent->pendingRegions.push_back(reader->regions());
+            toBeSent->pendingIsGpu.push_back(false);
           } else {
             // If the product is serialised via ROOT
             TClass* cls = entry.wrappedType.getClass();
@@ -251,8 +254,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                             toBeSent->rootBuffer->Length(),
                                             instance,
                                             EDM_MPI_SendSerializedProduct);
-              for (auto const& regions : toBeSent->pendingRegions)
-                token.channel()->sendTrivialCopyProduct(instance, regions);
+              for (size_t i = 0; i < toBeSent->pendingRegions.size(); ++i)
+                token.channel()->sendTrivialCopyProduct(instance, toBeSent->pendingRegions[i], toBeSent->pendingIsGpu[i]);
             }
           };
 

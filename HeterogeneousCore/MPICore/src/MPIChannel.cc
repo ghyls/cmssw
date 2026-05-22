@@ -1,6 +1,7 @@
 // C++ standard library headers
 #include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -235,6 +236,7 @@ void MPIChannel::edmToBuffer_(EDM_MPI_EventAuxiliary_t& buffer, edm::EventAuxili
 void MPIChannel::sendEmpty_(int tag) {
   EDM_MPI_Empty_t buffer;
   buffer.messageTag = tag;
+  { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, sizeof(EDM_MPI_Empty_t)); fflush(stdout); }
   MPI_Send(&buffer, 1, EDM_MPI_Empty, dest_, tag, comm_);
 }
 
@@ -243,6 +245,7 @@ void MPIChannel::sendRunAuxiliary_(int tag, edm::RunAuxiliary const& aux) {
   EDM_MPI_RunAuxiliary_t buffer;
   buffer.messageTag = tag;
   edmToBuffer_(buffer, aux);
+  { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, sizeof(EDM_MPI_RunAuxiliary_t)); fflush(stdout); }
   MPI_Send(&buffer, 1, EDM_MPI_RunAuxiliary, dest_, tag, comm_);
 }
 
@@ -251,6 +254,7 @@ void MPIChannel::sendLuminosityBlockAuxiliary_(int tag, edm::LuminosityBlockAuxi
   EDM_MPI_LuminosityBlockAuxiliary_t buffer;
   buffer.messageTag = tag;
   edmToBuffer_(buffer, aux);
+  { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, sizeof(EDM_MPI_LuminosityBlockAuxiliary_t)); fflush(stdout); }
   MPI_Send(&buffer, 1, EDM_MPI_LuminosityBlockAuxiliary, dest_, tag, comm_);
 }
 
@@ -259,6 +263,7 @@ void MPIChannel::sendEventAuxiliary_(edm::EventAuxiliary const& aux, unsigned in
   EDM_MPI_EventAuxiliary_t buffer;
   buffer.messageTag = EDM_MPI_ProcessEvent;
   edmToBuffer_(buffer, aux, slot);
+  { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, sizeof(EDM_MPI_EventAuxiliary_t)); fflush(stdout); }
   MPI_Send(&buffer, 1, EDM_MPI_EventAuxiliary, dest_, EDM_MPI_ProcessEvent, comm_);
 }
 
@@ -287,12 +292,14 @@ MPI_Status MPIChannel::receiveEventAuxiliary_(edm::EventAuxiliary& aux, unsigned
 
 void MPIChannel::sendMetadata(int instance, std::shared_ptr<ProductMetadataBuilder> meta) {
   int tag = EDM_MPI_SendMetadata | instance * EDM_MPI_MessageTagWidth_;
+  { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, meta->size()); fflush(stdout); }
   MPI_Ssend(meta->data(), meta->size(), MPI_BYTE, dest_, tag, comm_);
 }
 
 MPI_Request MPIChannel::sendMetadataAsync(int instance, std::shared_ptr<ProductMetadataBuilder> meta) {
   int tag = EDM_MPI_SendMetadata | instance * EDM_MPI_MessageTagWidth_;
   MPI_Request request;
+  { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, meta->size()); fflush(stdout); }
   MPI_Isend(meta->data(), meta->size(), MPI_BYTE, dest_, tag, comm_, &request);
   return request;
 }
@@ -311,6 +318,7 @@ void MPIChannel::receiveMetadataAsync(int instance, std::shared_ptr<ProductMetad
 
 void MPIChannel::sendBuffer(const void* buf, size_t size, int instance, EDM_MPI_MessageTag tag) {
   int commtag = tag | instance * EDM_MPI_MessageTagWidth_;
+  { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, size); fflush(stdout); }
   MPI_Send(buf, size, MPI_BYTE, dest_, commtag, comm_);
 }
 
@@ -318,6 +326,7 @@ void MPIChannel::sendSerializedProduct_(int instance, TClass const* type, void c
   TBufferFile buffer{TBuffer::kWrite};
   type->Streamer(const_cast<void*>(product), buffer);
   int tag = EDM_MPI_SendSerializedProduct | instance * EDM_MPI_MessageTagWidth_;
+  { int _wr; MPI_Comm_rank(comm_, &_wr); printf("awkdata %d 0 %zu\n", _wr, (size_t)buffer.Length()); fflush(stdout); }
   MPI_Send(buffer.Buffer(), buffer.Length(), MPI_BYTE, dest_, tag, comm_);
 }
 
@@ -347,11 +356,17 @@ void MPIChannel::receiveSerializedProduct_(int instance, TClass const* type, voi
   type->Streamer(product, buffer);
 }
 
-void MPIChannel::sendTrivialCopyProduct(int instance, std::vector<std::span<const std::byte>> const& regions) {
+void MPIChannel::sendTrivialCopyProduct(int instance,
+                                        std::vector<std::span<const std::byte>> const& regions,
+                                        bool fromGpu) {
   int tag = EDM_MPI_SendTrivialCopyProduct | instance * EDM_MPI_MessageTagWidth_;
+  int _wr;
+  MPI_Comm_rank(comm_, &_wr);
   // TODO send the number of regions ?
   for (size_t i = 0; i < regions.size(); ++i) {
     assert(regions[i].data() != nullptr);
+    printf("awkdata %d %d %zu\n", _wr, (int)fromGpu, regions[i].size_bytes());
+    fflush(stdout);
     MPI_Send(regions[i].data(), regions[i].size_bytes(), MPI_BYTE, dest_, tag, comm_);
   }
 }
