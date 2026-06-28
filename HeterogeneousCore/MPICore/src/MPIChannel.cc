@@ -1,10 +1,11 @@
 // C++ standard library headers
-#include <atomic>
 #include <cassert>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 // ROOT headers
 #include <TBufferFile.h>
@@ -256,6 +257,7 @@ void MPIChannel::sendEventAuxiliary_(edm::EventAuxiliary const& aux, unsigned in
   EDM_MPI_EventAuxiliary_t buffer;
   buffer.messageTag = EDM_MPI_ProcessEvent;
   edmToBuffer_(buffer, aux, slot);
+  currentEvent_ = buffer.event;
   MPI_Send(&buffer, 1, EDM_MPI_EventAuxiliary, dest_, EDM_MPI_ProcessEvent, comm_);
 }
 
@@ -292,7 +294,15 @@ void MPIChannel::receiveMetadata(int instance, std::shared_ptr<ProductMetadataBu
   meta->receiveMetadata(dest_, tag, comm_);
 }
 
+void MPIChannel::dumpToFile_(const void* data, size_t size, std::string_view type, size_t regionIndex) const {
+  std::string filename = "evt_" + std::to_string(currentEvent_) + "_" + direction_ + "_region_" +
+                         std::to_string(regionIndex) + "_type_" + std::string(type) + ".bin";
+  std::ofstream f(filename, std::ios::binary);
+  f.write(static_cast<const char*>(data), size);
+}
+
 void MPIChannel::sendBuffer(const void* buf, size_t size, int instance, EDM_MPI_MessageTag tag) {
+  dumpToFile_(buf, size, "rootSerializedProductPack", 0);
   int commtag = tag | instance * EDM_MPI_MessageTagWidth_;
   MPI_Send(buf, size, MPI_BYTE, dest_, commtag, comm_);
 }
@@ -300,6 +310,7 @@ void MPIChannel::sendBuffer(const void* buf, size_t size, int instance, EDM_MPI_
 void MPIChannel::sendSerializedProduct_(int instance, TClass const* type, void const* product) {
   TBufferFile buffer{TBuffer::kWrite};
   type->Streamer(const_cast<void*>(product), buffer);
+  dumpToFile_(buffer.Buffer(), static_cast<size_t>(buffer.Length()), type->GetName(), 0);
   int tag = EDM_MPI_SendSerializedProduct | instance * EDM_MPI_MessageTagWidth_;
   MPI_Send(buffer.Buffer(), buffer.Length(), MPI_BYTE, dest_, tag, comm_);
 }
@@ -337,6 +348,7 @@ void MPIChannel::sendTrivialCopyProduct(int instance, const ngt::ReaderBase& rea
   // TODO send the number of regions ?
   for (size_t i = 0; i < regions.size(); ++i) {
     assert(regions[i].data() != nullptr);
+    dumpToFile_(regions[i].data(), regions[i].size_bytes(), reader.typeName(), i);
     MPI_Send(regions[i].data(), regions[i].size_bytes(), MPI_BYTE, dest_, tag, comm_);
   }
 }

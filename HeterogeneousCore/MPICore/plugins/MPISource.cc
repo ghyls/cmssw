@@ -334,7 +334,9 @@ bool MPISource::setRunAndEventInfo(edm::EventID& event,
         }
         if (not channels_[slot]) {
           channels_[slot] = controller_.duplicate(slot);
+          channels_[slot]->setDirection("SC");
         }
+        channels_[slot]->setCurrentEvent(static_cast<uint32_t>(aux.id().event()));
 
         // store the channel to use it in produce()
         channel_ = channels_[slot].get();

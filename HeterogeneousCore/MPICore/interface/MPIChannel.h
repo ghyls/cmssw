@@ -3,10 +3,14 @@
 
 // C++ standard library headers
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 
 // MPI headers
@@ -76,6 +80,9 @@ public:
   // close the underlying communicator and reset the MPIChannel to an invalid state
   // Note: this is a blocking collective operation.
   void reset();
+
+  void setCurrentEvent(uint32_t event) { currentEvent_ = event; }
+  void setDirection(const char* dir) { direction_ = dir; }
 
   // announce that a client has just connected
   void sendConnect() { sendEmpty_(EDM_MPI_Connect); }
@@ -193,6 +200,7 @@ private:
   template <typename T>
   void sendTrivialProduct_(int instance, T const& product) {
     int tag = EDM_MPI_SendTrivialProduct | instance * EDM_MPI_MessageTagWidth_;
+    dumpToFile_(&product, sizeof(T), typeid(T).name(), 0);
     MPI_Send(&product, sizeof(T), MPI_BYTE, dest_, tag, comm_);
   }
 
@@ -208,6 +216,8 @@ private:
     assert(static_cast<int>(sizeof(T)) == size);
     MPI_Mrecv(&product, size, MPI_BYTE, &message, MPI_STATUS_IGNORE);
   }
+
+  void dumpToFile_(const void* data, size_t size, std::string_view type, size_t regionIndex) const;
 
   enum ChannelStatus {
     kInvalid = 0,
@@ -226,6 +236,9 @@ private:
   int dest_ = MPI_UNDEFINED;
 
   int slot_ = -1;
+
+  uint32_t currentEvent_ = 0;
+  const char* direction_ = "??";
 
   // Note: the state_ flag is accessed atomically because it can be written to and read from by
   // different threads.

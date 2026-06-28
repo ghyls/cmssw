@@ -3,6 +3,8 @@
 
 #include <cstddef>
 #include <span>
+#include <string_view>
+#include <typeinfo>
 #include <vector>
 
 #include "DataFormats/Common/interface/Wrapper.h"
@@ -30,6 +32,8 @@ namespace ngt {
     ngt::AnyBuffer parameters() const override { return ngt::get_properties<T>(object()); }
 
     std::vector<std::span<const std::byte>> regions() const override { return ngt::get_regions<T>(object()); }
+
+    std::string_view typeName() const override { return typeid(T).name(); }
 
   private:
     const T& object() const {
