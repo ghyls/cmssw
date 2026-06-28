@@ -367,6 +367,9 @@ void MPIController::produce(edm::Event& event, edm::EventSetup const& setup) {
     channels.emplace_back(follower.duplicate(slot));
   }
 
+  channels[slot]->setDirection("CS");
+  channels[slot]->setCurrentEvent(static_cast<uint32_t>(event.id().event()));
+
   // The destructor of the last copy of the token will call channels[slot]->sync().
   // The channel is ready to send a new event after the call is made by both local and remote processes.
   event.emplace(token_, *channels[slot]);

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "DataFormats/Common/interface/WrapperBase.h"
@@ -17,6 +18,7 @@ namespace ngt {
 
     virtual ngt::AnyBuffer parameters() const = 0;
     virtual std::vector<std::span<const std::byte>> regions() const = 0;
+    virtual std::string_view typeName() const = 0;
 
     virtual ~ReaderBase() = default;
 
