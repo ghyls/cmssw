@@ -25,21 +25,21 @@ process.maxEvents.input = -1
 process.receiver = cms.EDProducer("MPIReceiverPortable@alpaka",
     upstream = cms.InputTag("source"),
     instance = cms.int32(42),
-    products = cms.VPSet(
+    deviceProducts = cms.VPSet(
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceObject"),
+            type = cms.string("portabletest::TestHostObject"),
             src = cms.InputTag("", ""),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection"),
+            type = cms.string("portabletest::TestHostCollection"),
             src = cms.InputTag("", ""),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection2"),
+            type = cms.string("portabletest::TestHostCollection2"),
             src = cms.InputTag("", ""),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection3"),
+            type = cms.string("portabletest::TestHostCollection3"),
             src = cms.InputTag("", ""),
         ),
     )

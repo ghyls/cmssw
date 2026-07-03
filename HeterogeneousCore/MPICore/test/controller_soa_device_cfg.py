@@ -41,21 +41,21 @@ process.producePortableObjects = cms.EDProducer("TestAlpakaProducer@alpaka",
 process.sender = cms.EDProducer("MPISenderPortable@alpaka",
     upstream = cms.InputTag("mpiController"),
     instance = cms.int32(42),
-    products = cms.VPSet(
+    deviceProducts = cms.VPSet(
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceObject"),
+            type = cms.string("portabletest::TestHostObject"),
             src = cms.InputTag("producePortableObjects", ""),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection"),
+            type = cms.string("portabletest::TestHostCollection"),
             src = cms.InputTag("producePortableObjects", ""),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection2"),
+            type = cms.string("portabletest::TestHostCollection2"),
             src = cms.InputTag("producePortableObjects", ""),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection3"),
+            type = cms.string("portabletest::TestHostCollection3"),
             src = cms.InputTag("producePortableObjects", ""),
         ),
     )
