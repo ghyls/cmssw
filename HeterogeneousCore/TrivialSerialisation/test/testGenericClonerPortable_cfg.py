@@ -30,19 +30,19 @@ process.clonePortableObjectsHtoH = cms.EDProducer("ngt::GenericClonerPortable@al
     products = cms.VPSet(
         cms.PSet(
             src = cms.InputTag("producePortableObjects"),
-            type = cms.string("portabletest::TestHostObject")
+            hostType = cms.string("portabletest::TestHostObject")
         ),
         cms.PSet(
             src = cms.InputTag("producePortableObjects"),
-            type = cms.string("portabletest::TestHostCollection")
+            hostType = cms.string("portabletest::TestHostCollection")
         ),
         cms.PSet(
             src = cms.InputTag("producePortableObjects"),
-            type = cms.string("portabletest::TestHostCollection2")
+            hostType = cms.string("portabletest::TestHostCollection2")
         ),
         cms.PSet(
             src = cms.InputTag("producePortableObjects"),
-            type = cms.string("portabletest::TestHostCollection3")
+            hostType = cms.string("portabletest::TestHostCollection3")
         ),
     ),
     verbose = cms.untracked.bool(True),
@@ -56,19 +56,23 @@ process.clonePortableObjectsDtoD = cms.EDProducer("ngt::GenericClonerPortable@al
     products = cms.VPSet(
         cms.PSet(
             src = cms.InputTag("clonePortableObjectsHtoH"),
-            type = cms.string("portabletest::TestDeviceObject")
+            hostType = cms.string("portabletest::TestHostObject"),
+            isPortableType = cms.bool(True)
         ),
         cms.PSet(
             src = cms.InputTag("clonePortableObjectsHtoH"),
-            type = cms.string("portabletest::TestDeviceCollection")
+            hostType = cms.string("portabletest::TestHostCollection"),
+            isPortableType = cms.bool(True)
         ),
         cms.PSet(
             src = cms.InputTag("clonePortableObjectsHtoH"),
-            type = cms.string("portabletest::TestDeviceCollection2")
+            hostType = cms.string("portabletest::TestHostCollection2"),
+            isPortableType = cms.bool(True)
         ),
         cms.PSet(
             src = cms.InputTag("clonePortableObjectsHtoH"),
-            type = cms.string("portabletest::TestDeviceCollection3")
+            hostType = cms.string("portabletest::TestHostCollection3"),
+            isPortableType = cms.bool(True)
         ),
     ),
     verbose = cms.untracked.bool(True),

@@ -2,16 +2,21 @@
  * This Alpaka EDProducer clones host or device event products declared in
  * its configuration, using the plugin-based NGT trivial serialisation.
  *
- * - Host type aliases (e.g. "portabletest::TestHostCollection") are cloned
- *   using the host TrivialSerialisation mechanism with std::memcpy. If a
- *   matching device serialiser is registered, the H->D transformation is
- *   also registered at construction time.
+ * Products are configured as a single "products" VPSet, each entry shaped
+ * {hostType, src, isPortableType}:
  *
- * - Device type aliases (e.g. "sistrip::SiStripClusterDevice") are cloned on
- *   device using alpaka::memcpy. The D->H transformation is registered if
- *   available.
+ * - Entries with "isPortableType" false (the default) are cloned using the
+ *   host TrivialSerialisation mechanism with std::memcpy. If a matching
+ *   device serialiser is registered, the H->D transformation is also
+ *   registered at construction time.
  *
- * Products are configured as a VPSet with type and InputTag.
+ * - Entries with "isPortableType" true are cloned on device using
+ *   alpaka::memcpy, consuming and producing the corresponding device
+ *   product. The D->H transformation is registered if available.
+ *
+ * In both cases "hostType" is always the host type alias; a device
+ * serialiser is looked up by the mangled typeid of that host type, which is
+ * always registered regardless of backend.
  */
 
 // C++ include files
@@ -84,26 +89,32 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::ngt {
     eventProducts_.reserve(products.size());
 
     for (auto const& product : products) {
-      auto const& type = product.getParameter<std::string>("type");
+      auto const& hostType = product.getParameter<std::string>("hostType");
       auto const& src = product.getParameter<edm::InputTag>("src");
+      bool const isPortableType = product.getParameter<bool>("isPortableType");
 
       Entry entry;
-      entry.typeName = type;
+      entry.typeName = hostType;
 
-      // Lookup the right serialiser. In order of preference:
-      // SerialiserFactoryDevice, SerialiserFactory, ROOT Serialisation.
-      //
-      // Check 1: Construct the mangled typeid of a device type from the type
-      // alias given in the config (e.g. "sistrip::SiStripClusterDevice"), and
-      // use this mangled type to look up a device serialiser.
-      edm::TypeWithDict const deviceTypeTwd =
-          edm::TypeWithDict::byName(std::string(EDM_STRINGIZE(ALPAKA_ACCELERATOR_NAMESPACE)) + "::" + type);
-      std::unique_ptr<ngt::SerialiserBase> deviceSerialiser;
-      if (deviceTypeTwd.typeInfo() != typeid(void)) {
-        deviceSerialiser = ngt::SerialiserFactoryDevice::get()->tryToCreate(deviceTypeTwd.typeInfo().name());
-      }
+      if (isPortableType) {
+        // "hostType" is always the host type alias (e.g.
+        // "portabletest::TestHostObject"), which is resolved via ROOT and used
+        // to look up a device serialiser registered under the mangled typeid
+        // of the host type (this key is always present, on every backend).
+        // The product is consumed/produced wrapped in edm::DeviceProduct<T>,
+        // and cloned on device via alpaka::memcpy.
+        edm::TypeWithDict const twd = edm::TypeWithDict::byName(hostType);
+        std::unique_ptr<ngt::SerialiserBase> deviceSerialiser;
+        if (twd.typeInfo() != typeid(void)) {
+          deviceSerialiser = ngt::SerialiserFactoryDevice::get()->tryToCreate(twd.typeInfo().name());
+        }
 
-      if (deviceSerialiser) {
+        if (!deviceSerialiser) {
+          throw cms::Exception("GenericClonerPortable")
+              << "No device serialiser found for type '" << hostType
+              << "'. Please register one via DEFINE_TRIVIAL_SERIALISER_PORTABLE_PLUGIN.";
+        }
+
         entry.typeID = edm::TypeID{deviceSerialiser->productTypeID()};
         entry.getToken = this->consumes(edm::TypeToGet{entry.typeID, edm::PRODUCT_TYPE}, src);
         hasDeviceProducts_ = true;
@@ -123,17 +134,19 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::ngt {
         entry.deviceSerialiser = std::move(deviceSerialiser);
 
         if (verbose_) {
-          edm::LogInfo("GenericClonerPortable") << "will clone device product of type '" << type << "', " << src;
+          edm::LogInfo("GenericClonerPortable") << "will clone device product of type '" << hostType << "', " << src;
         }
 
         eventProducts_.emplace_back(std::move(entry));
         continue;
       }
 
-      // Check 2: "type" could be a host type alias "T" for which a host
-      // serialiser (and perhaps a portable serialiser for the H->D transform)
-      // exists.
-      edm::TypeWithDict twd = edm::TypeWithDict::byName(type);
+      // Lookup the right serialiser. In order of preference: SerialiserFactory
+      // (host), ROOT Serialisation.
+      //
+      // "hostType" is a host type alias "T" for which a host serialiser (and
+      // perhaps a portable serialiser for the H->D transform) exists.
+      edm::TypeWithDict twd = edm::TypeWithDict::byName(hostType);
       std::unique_ptr<ngt::SerialiserBase> portableSerialiser;
       std::unique_ptr<::ngt::SerialiserBase> hostSerialiser;
       if (twd.typeInfo() != typeid(void)) {
@@ -159,7 +172,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::ngt {
         entry.hostSerialiser = std::move(hostSerialiser);
 
         if (verbose_) {
-          edm::LogInfo("GenericClonerPortable") << "will clone host product of type '" << type << "', label '"
+          edm::LogInfo("GenericClonerPortable") << "will clone host product of type '" << hostType << "', label '"
                                                 << src.label() << "', instance '" << src.instance() << "'";
         }
 
@@ -167,14 +180,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::ngt {
         continue;
       }
 
-      // Check 3: Fall back to ROOT serialisation, if a ROOT dictionary is
-      // found for this type.
-      edm::TypeWithDict wrappedTwd = edm::TypeWithDict::byName("edm::Wrapper<" + type + ">");
+      // Fall back to ROOT serialisation, if a ROOT dictionary is found for
+      // this type.
+      edm::TypeWithDict wrappedTwd = edm::TypeWithDict::byName("edm::Wrapper<" + hostType + ">");
       if (twd.typeInfo() == typeid(void) || !wrappedTwd.getClass()) {
         throw cms::Exception("GenericClonerPortable")
             << "No serialisation mechanism (device or host TrivialSerialisation, or ROOT dictionaries) found for "
                "type '"
-            << type
+            << hostType
             << "'. Please register a serialiser via DEFINE_TRIVIAL_SERIALISER_PLUGIN or "
                "DEFINE_TRIVIAL_SERIALISER_PORTABLE_PLUGIN, or ensure a ROOT dictionary exists for this type.";
       }
@@ -186,12 +199,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::ngt {
       entry.wrappedType = wrappedTwd;
 
       if (verbose_) {
-        edm::LogInfo("GenericClonerPortable") << "will clone ROOT-serialised product of type '" << type << "', label '"
-                                              << src.label() << "', instance '" << src.instance() << "'";
+        edm::LogInfo("GenericClonerPortable") << "will clone ROOT-serialised product of type '" << hostType
+                                              << "', label '" << src.label() << "', instance '" << src.instance()
+                                              << "'";
       }
 
       eventProducts_.emplace_back(std::move(entry));
-      continue;
     }
   }
 
@@ -286,15 +299,21 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::ngt {
         "using the Host or Device TrivialSerialisation mechanism. ");
 
     edm::ParameterSetDescription product;
-    product.add<std::string>("type")->setComment(
-        "Type alias of the product to clone. Use the host type alias "
-        "(e.g. \"portabletest::TestHostCollection\") to clone a host product, or the device type alias "
-        "without the ALPAKA_ACCELERATOR_NAMESPACE prefix "
-        "(e.g. \"sistrip::SiStripClusterDevice\") to clone a device product.");
+    product.add<std::string>("hostType")->setComment(
+        "Host type alias of the product to clone (e.g. \"portabletest::TestHostCollection\"). If "
+        "\"isPortableType\" is true, a device serialiser must be registered for this type via "
+        "DEFINE_TRIVIAL_SERIALISER_PORTABLE_PLUGIN.");
     product.add<edm::InputTag>("src")->setComment("InputTag (label and instance) of the product to clone.");
+    product.add<bool>("isPortableType", false)
+        ->setComment(
+            "Whether this product is to be consumed and produced as a device-resident product, cloned via "
+            "alpaka::memcpy, rather than as a host-resident product.");
 
     edm::ParameterSetDescription desc;
-    desc.addVPSet("products", product, {})->setComment("Host or device products to be cloned.");
+    desc.addVPSet("products", product, {})
+        ->setComment(
+            "Host, device, or ROOT-serialised products to be cloned. Set \"isPortableType\" to true for products "
+            "that are consumed and produced as device-resident products.");
     desc.addUntracked<bool>("verbose", false)->setComment("Print the type names of the products that will be cloned.");
 
     descriptions.addWithDefaultLabel(desc);

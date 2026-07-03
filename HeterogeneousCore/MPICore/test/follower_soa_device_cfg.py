@@ -27,20 +27,24 @@ process.receiver = cms.EDProducer("MPIReceiverPortable@alpaka",
     instance = cms.int32(42),
     products = cms.VPSet(
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceObject"),
+            hostType = cms.string("portabletest::TestHostObject"),
             src = cms.InputTag("", ""),
+            isPortableType = cms.bool(True),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection"),
+            hostType = cms.string("portabletest::TestHostCollection"),
             src = cms.InputTag("", ""),
+            isPortableType = cms.bool(True),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection2"),
+            hostType = cms.string("portabletest::TestHostCollection2"),
             src = cms.InputTag("", ""),
+            isPortableType = cms.bool(True),
         ),
         cms.PSet(
-            type = cms.string("portabletest::TestDeviceCollection3"),
+            hostType = cms.string("portabletest::TestHostCollection3"),
             src = cms.InputTag("", ""),
+            isPortableType = cms.bool(True),
         ),
     )
 )
