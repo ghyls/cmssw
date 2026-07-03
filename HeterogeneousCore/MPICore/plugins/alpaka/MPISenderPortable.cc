@@ -60,8 +60,52 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
             << "Invalid MPISenderPortable instance value, please use a value between 1 and 255";
       }
 
+      auto const& deviceProducts = config.getParameter<std::vector<edm::ParameterSet>>("deviceProducts");
       auto const& products = config.getParameter<std::vector<edm::ParameterSet>>("products");
-      products_.reserve(products.size());
+      products_.reserve(deviceProducts.size() + products.size());
+
+      // Device products: "type" is always the host type alias (e.g.
+      // "portabletest::TestHostObject"), resolved via ROOT and used to look
+      // up a device serialiser registered under the mangled typeid of the
+      // host type (this key is always present, on every backend).
+      for (auto const& product : deviceProducts) {
+        auto const& type = product.getParameter<std::string>("type");
+        auto const& src = product.getParameter<edm::InputTag>("src");
+
+        Entry entry;
+        entry.typeName = type;
+
+        LogDebug("MPISenderPortable") << "looking for device serialiser for type \"" << type << "\"";
+        edm::TypeWithDict const twd = edm::TypeWithDict::byName(type);
+        std::unique_ptr<ngt::SerialiserBase> deviceSerialiser;
+        if (twd.typeInfo() != typeid(void)) {
+          deviceSerialiser = ngt::SerialiserFactoryDevice::get()->tryToCreate(twd.typeInfo().name());
+        }
+
+        if (!deviceSerialiser) {
+          throw cms::Exception("MPISenderPortable")
+              << "No device serialiser found for type '" << type
+              << "'. Please register one via DEFINE_TRIVIAL_SERIALISER_PORTABLE_PLUGIN.";
+        }
+
+        LogDebug("MPISenderPortable") << "found device serialiser for type \"" << type << "\"";
+        // Get the edm::TypeID type from the serialiser, which we will later
+        // need to construct the edm::Handle where we will put the product we get
+        // from the event. This typeID is the product type wrapped in
+        // edm::DeviceProduct, and includes the alpaka device.
+        edm::TypeID typeID{deviceSerialiser->productTypeID()};
+        hasDeviceProducts_ = true;
+        entry.typeID = typeID;
+        entry.token = this->consumes(edm::TypeToGet{typeID, edm::PRODUCT_TYPE}, src);
+        entry.deviceSerialiser = std::move(deviceSerialiser);
+
+        LogDebug("MPISenderPortable") << "send device type \"" << typeID << "\" (" << type << "), label \""
+                                      << src.label() << "\" instance \"" << src.instance()
+                                      << "\" over MPI channel instance " << instance_;
+
+        products_.emplace_back(std::move(entry));
+      }
+
       for (auto const& product : products) {
         auto const& type = product.getParameter<std::string>("type");
         auto const& src = product.getParameter<edm::InputTag>("src");
@@ -79,42 +123,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           continue;
         }
 
-        // Lookup the right serialiser. In order of preference:
-        // SerialiserFactoryDevice, SerialiserFactory, ROOT Serialisation.
-        //
-        // Check 1: Construct the mangled typeid of a device type from the type
-        // alias given in the config (e.g. "sistrip::SiStripClusterDevice"), and
-        // use this mangled type to look up a device serialiser.
-        LogDebug("MPISenderPortable") << "looking for device serialiser for type \"" << type << "\"";
-        edm::TypeWithDict const deviceTypeTwd =
-            edm::TypeWithDict::byName(std::string(EDM_STRINGIZE(ALPAKA_ACCELERATOR_NAMESPACE)) + "::" + type);
-        std::unique_ptr<ngt::SerialiserBase> deviceSerialiser;
-        if (deviceTypeTwd.typeInfo() != typeid(void)) {
-          deviceSerialiser = ngt::SerialiserFactoryDevice::get()->tryToCreate(deviceTypeTwd.typeInfo().name());
-        }
-
-        if (deviceSerialiser) {
-          LogDebug("MPISenderPortable") << "found device serialiser for type \"" << type << "\"";
-          // Get the edm::TypeID type from the serialiser, which we will later
-          // need to construct the edm::Handle where we will put the product we get
-          // from the event. This typeID is the product type wrapped in
-          // edm::DeviceProduct, and includes the alpaka device.
-          edm::TypeID typeID{deviceSerialiser->productTypeID()};
-          hasDeviceProducts_ = true;
-          entry.typeID = typeID;
-          entry.token = this->consumes(edm::TypeToGet{typeID, edm::PRODUCT_TYPE}, src);
-          entry.deviceSerialiser = std::move(deviceSerialiser);
-
-          LogDebug("MPISenderPortable") << "send device type \"" << typeID << "\" (" << type << "), label \""
-                                        << src.label() << "\" instance \"" << src.instance()
-                                        << "\" over MPI channel instance " << instance_;
-
-          products_.emplace_back(std::move(entry));
-          continue;
-        }
-
-        // Check 2: Lookup a host serialiser registered in the host
-        // SerialiserFactory.
+        // Lookup a host serialiser registered in the host SerialiserFactory.
         edm::TypeWithDict twd = edm::TypeWithDict::byName(type);
         std::unique_ptr<::ngt::SerialiserBase> hostSerialiser;
 
@@ -136,7 +145,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           continue;
         }
 
-        // Check 3: Fall back to ROOT serialisation, if a ROOT dictionary is
+        // Fall back to ROOT serialisation, if a ROOT dictionary is
         // found for this type
         edm::TypeWithDict wrappedTwd = edm::TypeWithDict::byName("edm::Wrapper<" + type + ">");
         LogDebug("MPISenderPortable") << "looking for ROOT serialisation of type \"" << type << "\"";
@@ -283,10 +292,17 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           "Products are serialised using the device serialiser (if available), the host "
           "serialiser (if available), or ROOT as a fallback.");
 
+      edm::ParameterSetDescription deviceProduct;
+      deviceProduct.add<std::string>("type")->setComment(
+          "Host type alias of the device product to consume (e.g. \"portabletest::TestHostObject\"). A device "
+          "serialiser must be registered for this type via DEFINE_TRIVIAL_SERIALISER_PORTABLE_PLUGIN.");
+      deviceProduct.add<edm::InputTag>("src")->setComment(
+          "InputTag identifying the device product to consume: label is the producer module label, "
+          "instance is the product instance name.");
+
       edm::ParameterSetDescription product;
       product.add<std::string>("type")->setComment(
-          "Type alias of the device product without the ALPAKA_ACCELERATOR_NAMESPACE prefix "
-          "(e.g. \"sistrip::SiStripClusterDevice\"). For host and ROOT products, the plain C++ type name.");
+          "Plain C++ type name of the host or ROOT product to consume.");
       product.add<edm::InputTag>("src")->setComment(
           "InputTag identifying the product to consume: label is the producer module label, "
           "instance is the product instance name.");
@@ -298,8 +314,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
               "\"MPISenderPortable\"/\"MPIReceiverPortable\". Passing an \"MPIController\" or \"MPISource\" "
               "only identifies the pair of local and remote applications. Passing a sender or receiver "
               "in addition imposes a scheduling dependency.");
+      desc.addVPSet("deviceProducts", deviceProduct, {})
+          ->setComment("Device products to be consumed and copied over to a separate CMSSW job.");
       desc.addVPSet("products", product, {})
-          ->setComment("Host or device products to be consumed and copied over to a separate CMSSW job.");
+          ->setComment("Host or ROOT products to be consumed and copied over to a separate CMSSW job.");
       desc.add<int32_t>("instance", 0)
           ->setComment(
               "A value between 1 and 255 used to identify a matching pair of "

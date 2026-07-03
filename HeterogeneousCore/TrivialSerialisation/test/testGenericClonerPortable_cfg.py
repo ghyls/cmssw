@@ -53,22 +53,22 @@ process.clonePortableObjectsHtoH = cms.EDProducer("ngt::GenericClonerPortable@al
 
 # Clone from device to device, registering the D->H transformation
 process.clonePortableObjectsDtoD = cms.EDProducer("ngt::GenericClonerPortable@alpaka",
-    products = cms.VPSet(
+    deviceProducts = cms.VPSet(
         cms.PSet(
             src = cms.InputTag("clonePortableObjectsHtoH"),
-            type = cms.string("portabletest::TestDeviceObject")
+            type = cms.string("portabletest::TestHostObject")
         ),
         cms.PSet(
             src = cms.InputTag("clonePortableObjectsHtoH"),
-            type = cms.string("portabletest::TestDeviceCollection")
+            type = cms.string("portabletest::TestHostCollection")
         ),
         cms.PSet(
             src = cms.InputTag("clonePortableObjectsHtoH"),
-            type = cms.string("portabletest::TestDeviceCollection2")
+            type = cms.string("portabletest::TestHostCollection2")
         ),
         cms.PSet(
             src = cms.InputTag("clonePortableObjectsHtoH"),
-            type = cms.string("portabletest::TestDeviceCollection3")
+            type = cms.string("portabletest::TestHostCollection3")
         ),
     ),
     verbose = cms.untracked.bool(True),
