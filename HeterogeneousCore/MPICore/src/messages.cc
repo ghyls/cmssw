@@ -4,9 +4,6 @@
 // MPI headers
 #include <mpi.h>
 
-// Boost headers
-#include <boost/preprocessor.hpp>
-
 // CMSSW headers
 #include "HeterogeneousCore/MPICore/interface/messages.h"
 
