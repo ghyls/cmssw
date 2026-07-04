@@ -76,6 +76,12 @@ private:
   std::vector<std::vector<std::unique_ptr<MPIChannel>>> channels_;
   edm::EDPutTokenT<MPIToken> token_;
   Mode mode_;
+  // Set once beginJob() has sent the initial Connect message to all followers. If the job never
+  // reaches beginJob() (e.g. because some other module throws during construction), the followers
+  // are still blocked waiting to receive that message, so this instance must not attempt the
+  // graceful, blocking/collective MPI_Comm_disconnect() in its destructor: it would deadlock
+  // forever instead of letting the original exception propagate and be reported.
+  bool connected_ = false;
 };
 
 MPIController::MPIController(edm::ParameterSet const& config)
@@ -185,6 +191,16 @@ MPIController::MPIController(edm::ParameterSet const& config)
 }
 
 MPIController::~MPIController() {
+  // If beginJob() never ran (e.g. this instance is being destroyed while unwinding from an
+  // exception thrown by some other module's constructor), the followers are still blocked waiting
+  // to receive the initial Connect message and never will send their side of a disconnect. Calling
+  // the blocking/collective MPI_Comm_disconnect() below would then hang forever, hiding the
+  // original exception. In that case, simply abandon the communicators without disconnecting: the
+  // process is about to terminate anyway once the original exception is reported.
+  if (!connected_) {
+    return;
+  }
+
   // Disconnect the per-stream communicators.
   for (auto& channels : channels_) {
     for (auto& channel : channels) {
@@ -208,6 +224,7 @@ void MPIController::beginJob() {
   for (auto& follower : followers_) {
     follower.sendConnect();
   }
+  connected_ = true;
 
   /* is there a way to access all known process histories ?
   edm::ProcessHistoryRegistry const& registry = * edm::ProcessHistoryRegistry::instance();
