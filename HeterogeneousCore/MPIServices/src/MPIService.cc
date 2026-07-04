@@ -53,6 +53,22 @@ MPIService::MPIService(edm::ParameterSet const& config) {
     setenv("OMPI_MCA_pmix_server_uri", uri.c_str(), false);
   }
 
+  // The CMSSW "openmpi" tool always sets OMPI_MCA_accelerator=null in the job environment (via
+  // scram runtime), to silence a spurious "libcuda not found" warning on the many machines with
+  // no GPU. This has to be overridden here (not merely defaulted) so that MPI can recognise and
+  // correctly transfer buffers residing in GPU memory, as needed by MPISenderPortable and
+  // MPIReceiverPortable to send/receive Alpaka device products directly (see
+  // HeterogeneousCore/MPICore/README.md). OpenMPI selects the first candidate that initialises
+  // successfully and falls back to "null" (a no-op) if none is usable, so this is also safe on
+  // machines without a GPU.
+  //
+  // NOTE: with this disabled, MPISenderPortable/MPIReceiverPortable segfault (SIGSEGV inside
+  // ofi_memcpy/ofi_copy_from_hmem_iov, called from MPIChannel::sendTrivialCopyProduct) as soon as
+  // they try to transfer a device (GPU) product, because libfabric then treats the GPU pointer as
+  // ordinary host memory and tries to memcpy it directly. It must stay enabled.
+  setenv("OMPI_MCA_accelerator", "cuda,rocm,null", true);
+  setenv("OMPI_MCA_opal_warn_on_missing_libcuda", "0", true);
+
   // initializes the MPI execution environment, requesting multi-threading support
   int provided;
   MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
