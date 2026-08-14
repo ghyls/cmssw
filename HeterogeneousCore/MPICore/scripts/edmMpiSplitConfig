@@ -33,8 +33,7 @@ import pathlib
 import os
 import sys
 
-from HeterogeneousCore.MPICore.configuration_splitter.cpp_name_getter import CPPNameGetter
-from HeterogeneousCore.MPICore.configuration_splitter.module_dependency_analyzer import ModuleDependencyAnalyzer, flatten_all_to_module_list
+from HeterogeneousCore.MPICore.configuration_splitter.helper_jobs import CPPNameGetter
 from HeterogeneousCore.MPICore.configuration_splitter.editor_functions import *
 from HeterogeneousCore.MPICore.configuration_splitter.path_state_helpers import *
 from HeterogeneousCore.MPICore.configuration_splitter.multiple_remotes_option_parser import *
@@ -60,8 +59,7 @@ def main():
         else:
             print("Trying to get C++ product names from existing file...")
 
-    cpp_names_getter = CPPNameGetter(local_process, reuse=configs[0].reuse_cpp_names)
-    cpp_names_of_the_products = cpp_names_getter.get_cpp_types_of_module_products()
+    cpp_names_of_the_products = CPPNameGetter(local_process, reuse=configs[0].reuse_cpp_names).run()
 
     if configs[0].verbose:
         print("Got C++ product names")
@@ -69,6 +67,12 @@ def main():
     num_remotes = len(configs)
     
     for i, process_args in enumerate(configs):
+        if i > 0:
+            # local_process is mutated in place by each split_remote() call (offloaded
+            # modules removed/aliased), so the dependency graph must be regenerated fresh
+            # for every remote after the first -- reusing an on-disk graph here would
+            # reflect dependencies from before earlier remotes' modules were offloaded.
+            process_args.reuse_dependency_graph = False
         if process_args.remote_process_name is None or process_args.remote_process_name == "":
             process_args.remote_process_name = f"REMOTE{i}"
         if process_args.output_remote is None:

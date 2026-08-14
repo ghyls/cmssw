@@ -1,0 +1,5 @@
+.cppnamedir/
+.depgraphdir/
+autosplit_result/
+gating_collapse_result/
+grouping_bug_result/

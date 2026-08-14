@@ -58,8 +58,23 @@
 />
 
 <test
-  name="testMPIAutosplitter"
+  name="testMPIAutosplitterMultiProcess"
   command="testAutomaticSplitterMultiProcess.sh ${CMSSW_BASE}/src/HeterogeneousCore/MPICore/test/configutration_for_automatic_splitter.py"
+/>
+
+<test
+  name="testModuleDependencyAnalyzer"
+  command="python3 ${CMSSW_BASE}/src/HeterogeneousCore/MPICore/test/test_module_dependency_analyzer.py"
+/>
+
+<test
+  name="testMPIAutosplitterGrouping"
+  command="testOffloadGroupOwnGating.sh"
+/>
+
+<test
+  name="testMPIAutosplitterGatingCollapse"
+  command="testOffloadGatingDeduplication.sh"
 />
 
 <test

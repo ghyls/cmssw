@@ -13,6 +13,7 @@ def build_global_parser():
         help="python configuration file to be split"
     )
     parser.add_argument("-c", "--reuse-cpp-names", action="store_true")
+    parser.add_argument("-g", "--reuse-dependency-graph", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
         "-l",
@@ -79,9 +80,14 @@ Optional arguments:
         (default: local.py)
    
     -c, --reuse-cpp-names
-        False by default. If this script was run before, pass this 
+        False by default. If this script was run before, pass this
         argument to reuse the generated file with C++ product names
-    
+
+    -g, --reuse-dependency-graph
+        False by default. If this script was run before on an unmodified
+        input config, pass this argument to reuse the generated module
+        dependency graph instead of rerunning cmsRun to regenerate it.
+
     -v, --verbose
         Print debug outputs
 
@@ -137,12 +143,17 @@ MULTI-REMOTE EXAMPLES:
 Notes:
 
 • To split a configuration it must be processed with 0 events.
-    This will cause creating output files and directories (by default in '.cppnamedir' directory).
+    This creates output files and directories (by default '.cppnamedir' and '.depgraphdir').
 • If the splitter was run before, --reuse-cpp-names avoids rerunning cmsRun for products' characteristics.
     Passing this option will make the script run much faster, given that needed information already exists.
+• Likewise, --reuse-dependency-graph avoids rerunning cmsRun to regenerate the module dependency graph.
+    Only reuse a graph that was generated from the same, unmodified input config -- within a single
+    multi-remote run the dependency graph is still regenerated per remote process regardless of this
+    flag, since the local process is mutated by each split_remote() call in turn.
 • For some modules it might be better to run on both processes
     instead of sending their products. Use --duplicate-modules option to specify them.
-• Only dependencies expressed via InputTag are analyzed.
+• Dependencies are the ones the framework itself resolved, so they cover consumes(),
+    mayConsumes(), EDAliases and products made by the Source.
 • Execution order inside dependency groups is preserved.
 """
     )
@@ -173,6 +184,7 @@ def parse_mpi_style_args(argv):
         cfg.config = global_args.config
         cfg.output_local = global_args.output_local
         cfg.reuse_cpp_names = global_args.reuse_cpp_names
+        cfg.reuse_dependency_graph = global_args.reuse_dependency_graph
         cfg.verbose = global_args.verbose
 
         cfg.remote_modules = proc_args.remote_modules or []
@@ -192,6 +204,7 @@ def parse_mpi_style_args(argv):
         cfg.config = global_args.config
         cfg.output_local = global_args.output_local
         cfg.reuse_cpp_names = global_args.reuse_cpp_names
+        cfg.reuse_dependency_graph = global_args.reuse_dependency_graph
         cfg.verbose = global_args.verbose
 
         # per-process overrides
