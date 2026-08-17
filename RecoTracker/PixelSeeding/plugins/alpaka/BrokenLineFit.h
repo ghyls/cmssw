@@ -308,6 +308,134 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   }
 
+  // Extended-N refit launcher. Rolling N=3..kRefitMaxN over the accepted-extended tuple population
+  // (compacted per N-bin via the fast-fit kernel's grid atomic), running the phase-split GBL fit +
+  // SoA writeback (overwrites state/cov/chi2/pt/eta/ndof of the extended tracks; hit lists / nLayers /
+  // hitOffsets are left as the rewrite wrote them). Every N up to kRefitMaxN stays under the per-thread
+  // frame ceiling, so no launch costs a local-memory reservation. Only compiled/launched for
+  // Phase2OTStubs (the sole topology the OT extension runs on); a no-op for every other traits set.
+  template <typename TrackerTraits>
+  void HelixFit<TrackerTraits>::refitExtended(const ::reco::TrackingRecHitConstView& hv,
+                                              const ::reco::CAModulesConstView& cm,
+                                              caStructures::SequentialContainer const* hitContainer,
+                                              const int32_t* acceptedByTuple,
+                                              uint32_t maxNumberOfTuples,
+                                              Queue& queue) {
+    if constexpr (std::is_same_v<pixelTopology::Phase2OTStubs, TrackerTraits>) {
+      ALPAKA_ASSERT_ACC(tuples_);
+      constexpr auto maxN = int(kRefitMaxN);
+      // Refit lane count = its own stride (kRefitStride=2048, not the 8192 global): the ~1k
+      // extended population fits with margin, and every buffer below sizes/strides off this.
+      constexpr uint32_t nt = kRefitStride;
+
+      // Own buffer set: the Eigen Map stride is kRefitStride (Kernel_BLFit / Kernel_BLFastFitRefit
+      // are instantiated at that stride below), sized to maxN=12, ~15 MB transient per call.
+      // Caching-allocator backed -> transient + recycled across events/streams.
+      auto tkidDevice = cms::alpakatools::make_device_buffer<typename caStructures::tindex_type[]>(queue, nt);
+      auto hitsDevice = cms::alpakatools::make_device_buffer<double[]>(
+          queue, nt * sizeof(riemannFit::Matrix3xNd<maxN>) / sizeof(double));
+      auto hits_geDevice = cms::alpakatools::make_device_buffer<float[]>(
+          queue, nt * sizeof(riemannFit::Matrix6xNf<maxN>) / sizeof(float));
+      auto fast_fit_resultsDevice =
+          cms::alpakatools::make_device_buffer<double[]>(queue, nt * sizeof(riemannFit::Vector4d) / sizeof(double));
+      // GBL node workspace, per-lane stride = the widest node chain a lane can build: the exact two-thin
+      // split's 2N+1 at the largest refit N (the arrival-node layout's N+2 fits inside it), so one
+      // allocation serves both node layouts.
+      constexpr int kNodesPerFit = generalBrokenLine::kGblSplitNodes<maxN>;
+      auto gnodesDevice = cms::alpakatools::make_device_buffer<generalBrokenLine::GblNodeData[]>(
+          queue, std::size_t(nt) * std::size_t(kNodesPerFit));
+      // The gFullDelta term is absent: it overlays the head of the band region.
+      constexpr int kScratchPerFit = generalBrokenLine::kGblScratchDoubles<kNodesPerFit - 1> + 3 * kNodesPerFit;
+      auto gblScratchDevice =
+          cms::alpakatools::make_device_buffer<double[]>(queue, std::size_t(nt) * std::size_t(kScratchPerFit));
+      auto slotDevice = cms::alpakatools::make_device_buffer<uint32_t>(queue);
+      // Per-lane phase buffer of the phase-split GBL fit ladder (kBLPhaseDoubles doubles/lane; see
+      // the Kernel_BLFitPhase* kernels). Caching-allocator backed like the other refit scratch.
+      auto phaseDevice =
+          cms::alpakatools::make_device_buffer<double[]>(queue, std::size_t(nt) * std::size_t(kBLPhaseDoubles));
+      // Kleinwort, arXiv:1201.4320 sec. 2.3: same 2S strip-length variance scale as the main fit, applied
+      // to the merger/extended refit's ge3 build (Kernel_BLFastFitRefit). 1.0 leaves the variance as
+      // measured.
+      static volatile float s_2sYVarScaleSrc = 1.f;  // not a compile-time constant, as in the main fit
+      static const float s_2sYVarScale = s_2sYVarScaleSrc;
+
+      constexpr uint32_t blockSize = 64;  // scan/compaction work division: UNCHANGED
+      // Fit block dimension, kFitBlock = 32. Launch DIMENSION only: the fit kernels are grid-stride loops
+      // over the SAME nt lanes and break on the invalid-tkid sentinel, so the fitted-lane set and every
+      // arithmetic operation are independent of it. Applied to the FIT work division only -- workDivScan
+      // below keeps blockSize, so Kernel_BLFastFitRefit's atomic lane claiming is untouched. 32 is the
+      // L1-pressure optimum for this solver: it is L1/LSU-pipe bound rather than FP64-latency bound, and at
+      // 32 the same resident lanes spread over twice as many SMs at one warp each instead of two.
+      const uint32_t numberOfBlocksFit = cms::alpakatools::divide_up_by(nt, kFitBlock);
+      const WorkDiv1D workDivFit = cms::alpakatools::make_workdiv<Acc1D>(numberOfBlocksFit, kFitBlock);
+      const uint32_t numberOfBlocksScan =
+          cms::alpakatools::divide_up_by(std::max<uint32_t>(1u, maxNumberOfTuples), blockSize);
+      const WorkDiv1D workDivScan = cms::alpakatools::make_workdiv<Acc1D>(numberOfBlocksScan, blockSize);
+
+      const uint32_t maxFitSel = pixelTopology::Phase2OTStubs::maxHitsOnTrack - 1;
+
+      // Every N-bin scan launches unconditionally, with no host-side knowledge of the per-bin
+      // populations: a bin with no tuple in its N-range compacts nothing and the fit kernels break on the
+      // invalid-tkid sentinel, so the launch is a device-side no-op. N=3..kRefitMaxN-1 are exact bins;
+      // the final N=kRefitMaxN bin absorbs the tail [kRefitMaxN, maxHitsOnTrack-1] (uniformly
+      // sub-sampled). The launch state travels in a context POD (see BrokenLineFitKernels.h) so the
+      // per-N launchers can be instantiated in the refit N-range TUs.
+      const BLRefitLaunchCtx<TrackerTraits> rctx{queue,
+                                                 hitContainer,
+                                                 tupleMultiplicity_,
+                                                 hv,
+                                                 cm,
+                                                 outputSoa_,
+                                                 acceptedByTuple,
+                                                 bField_,
+                                                 rhoMap_,
+                                                 bMap_,
+                                                 outlierReject_,
+                                                 maxNumberOfTuples,
+                                                 workDivScan,
+                                                 tkidDevice.data(),
+                                                 hitsDevice.data(),
+                                                 hits_geDevice.data(),
+                                                 fast_fit_resultsDevice.data(),
+                                                 gnodesDevice.data(),
+                                                 gblScratchDevice.data(),
+                                                 slotDevice.data(),
+                                                 phaseDevice.data(),
+                                                 s_2sYVarScale,
+                                                 fieldKernelWeights_,
+                                                 chargeSymmetric_,
+                                                 trajectoryCorrections_,
+                                                 scatteringLogAtTotal_,
+                                                 cumulativeEloss_};
+
+      auto launchBin = [&](auto Ntag, uint32_t nHitsL, uint32_t nHitsH) {
+        constexpr int Nv = decltype(Ntag)::value;
+        alpaka::memset(queue, slotDevice, 0);
+        alpaka::memset(queue, tkidDevice, 0xff);  // invalid sentinel tail for the fit kernels' break scan
+        runRefitBin<Nv, TrackerTraits>(rctx, nHitsL, nHitsH);
+      };
+
+      launchBin(std::integral_constant<int, 3>{}, 3u, 3u);
+      riemannFit::rolling_fits<4, int(kRefitMaxN), 1>(
+          [&](auto i) { launchBin(i, uint32_t(decltype(i)::value), uint32_t(decltype(i)::value)); });
+      launchBin(std::integral_constant<int, int(kRefitMaxN)>{}, kRefitMaxN, maxFitSel);
+
+      if (verboseDump_)
+        alpaka::exec<Acc1D>(queue,
+                            cms::alpakatools::make_workdiv<Acc1D>(1u, 1u),
+                            Kernel_BLFitDump{verboseDumpN_, bField_, 2u},
+                            outputSoa_);
+    } else {
+      // The OT extension does not run for non-Phase2OTStubs traits: nothing to refit.
+      (void)hv;
+      (void)cm;
+      (void)hitContainer;
+      (void)acceptedByTuple;
+      (void)maxNumberOfTuples;
+      (void)queue;
+    }
+  }
+
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE
 
 #endif  // RecoTracker_PixelSeeding_plugins_alpaka_BrokenLineFit_h

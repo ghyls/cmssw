@@ -58,6 +58,61 @@
   <flags CXXFLAGS="-g"/>
 </bin>
 
+<!-- GblHostOracles.cc is host-only (external gbl/CMSSW headers); .dev.cc goes to the device compiler. -->
+<bin name="testGblOracleDevice" file="alpaka/testGblOracleDevice.dev.cc GblHostOracles.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="eigen"/>
+  <use name="gbl"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <use name="DataFormats/GeometryVector"/>
+  <use name="MagneticField/Engine"/>
+  <use name="TrackingTools/TrajectoryParametrization"/>
+  <use name="TrackingTools/TrajectoryState"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
+<bin name="testGblTiltedDevice" file="alpaka/testGblTiltedDevice.dev.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
+<bin name="testGblMeasFrameDevice" file="alpaka/testGblMeasFrameDevice.dev.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
+<bin name="testGblReplayDevice" file="alpaka/testGblReplayDevice.dev.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
+<bin name="testBLBFieldMapDevice" file="alpaka/testBLBFieldMapDevice.dev.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
+<!-- Offline replay driver: needs a dump file as argv[1]; NO_TESTRUN skips the argument-less runtests. -->
+<bin file="gblReplay.cc" name="gblReplay">
+  <use name="eigen"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags CXXFLAGS="-g"/>
+  <flags NO_TESTRUN="1"/>
+</bin>
+
 <bin name="testBLStubCovDevice" file="alpaka/testBLStubCovDevice.dev.cc">
   <use name="alpaka"/>
   <use name="catch2"/>

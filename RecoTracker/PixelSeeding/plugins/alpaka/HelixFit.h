@@ -99,12 +99,45 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // the elision no-ops and the fit runs to the cap. Not owned; must stay valid
     // for the duration of the fit launch.
     void setHostTupleMultiplicityOffsets(const uint32_t *off) { hostTupleMultiplicityOffsets_ = off; }
+    // Runtime switch for the GBL fit's in-fit smoothed-residual outlier drop (the outlierReject_ member of
+    // Kernel_BLFitPhaseSolve / Kernel_BLFitPhaseOutlier). Every fit the pipeline runs has it on; with it
+    // off the fit keeps every node it was handed.
+    void setOutlierReject(bool on) { outlierReject_ = on; }
     // Fit correctness package (producer parameter useFitCorrections; see the block at the head of
     // RecoTracker/PixelTrackFitting/interface/alpaka/BrokenLine.h). Read only by the CA main fit. It also
     // gates the CA main fit's use
     // of the (Bz,Br) map set by setBFieldMap (see there): on, the fit's material AND its bending field are
     // the measured ones; off, the flat 0.06/16 material and the origin scalar field, i.e. upstream.
     void setFitCorrections(bool on) { fitCorrections_ = on; }
+    // Fit-consistent curvature->pT conversion field. On: the GBL refit's effective bending field is
+    // re-derived from the fit's own curvature-information weights (see blKernelWeightedBField in
+    // BrokenLineFitKernels.h). Off: the field is the plain hit-count average of B_bend. Either way it
+    // needs the (Bz,Br) map AND the GBL solve's influence vector, so it is inert on the CA main fit,
+    // which is a factorized band solve and has no such vector: that fit always takes the hit-count
+    // average.
+    void setFieldKernelWeights(bool on) { fieldKernelWeights_ = on; }
+    // Charge-symmetric corrections package: the arc of gblHelixAtPca's node-0 -> PCA step is signed
+    // consistently with the fit's own transverse arc, and the node prep adds the bending-field PROFILE
+    // deterministic offset. Off: an unsigned arc, and no profile offset. The first half needs no map;
+    // the second is inert wherever setBFieldMap was not called.
+    void setChargeSymmetric(bool on) { chargeSymmetric_ = on; }
+    // Reference-trajectory corrections package: the GBL node builders seed the node-0 path length from
+    // the reference helix and take the arc->azimuth sign of the measurement-less node from it, and the
+    // field term carries its B_r lambda row beside the B_z one. Off: the node-0 path length is seeded 0,
+    // the azimuth sign is taken unsigned, and only the B_z row is formed. The lambda row is inert
+    // wherever setBFieldMap was not called.
+    void setTrajectoryCorrections(bool on) { trajectoryCorrections_ = on; }
+    // Highland's log evaluated at the track's TOTAL declared material rather than gap by gap. theta0^2 is
+    // not additive over a chain of thin scatterers, so the single logarithm of the Highland form belongs at
+    // the accumulated total; the resulting variance is apportioned to the gaps in proportion to their
+    // thickness, leaving every gap's share and every endpoint partition weight untouched. Off: each gap
+    // evaluates the logarithm at its own thickness. Read by both GBL node builders; map-independent.
+    void setScatteringLogAtTotal(bool on) { scatteringLogAtTotal_ = on; }
+    // Cumulative-column typical-loss law: the Landau family is stable under convolution, so the typical
+    // loss of the charged column is the single-column law evaluated at the accumulated thickness (a median
+    // statistic), and callers charge per-node increments of it. Off: each lump is charged its own Landau
+    // MPV independently. Lump placement is the same either way. Read by both GBL node builders.
+    void setCumulativeEloss(bool on) { cumulativeEloss_ = on; }
 
     // Enable a one-shot device-side dump of the first N fitted tracks at the
     // end of each launchBrokenLineKernels call.  Prints (phi0, d0, kappa,
@@ -131,6 +164,34 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                   Tuples const *__restrict__ foundNtuplets);
     void deallocate();
 
+    // Extended-N refit cap. N <= 12 keeps every refit launch under the 2064 B per-thread frame ceiling,
+    // so the launch costs no per-thread local-memory reservation. N = 13 and above grows the frame past
+    // that ceiling and reintroduces the reservation for every resident thread: do NOT raise this without
+    // re-measuring the frame.
+    static constexpr uint32_t kRefitMaxN = 12;
+
+    // Extended-N refit concurrent-fit count = its own lane stride (see Map*S). The refit population is
+    // ~1k accepted-extended tracks/ev, compacted per N-bin, so it is sized independently of the main
+    // fit's 8192-wide stride: 2048 fits/N-bin is more than 1.6x the whole extended population, hence
+    // per-bin overflow is unreachable, and the buffers stride at 2048 instead of 8192 (~15 MB rather than
+    // ~58 MB transient per call). The hits/hits_ge Eigen maps AND the gnodes/scratch per-lane buffers all
+    // key off this.
+    static constexpr uint32_t kRefitStride = 2048;
+    static_assert(kRefitStride <= riemannFit::maxNumberOfConcurrentFits);
+
+    // Extended-N REFIT of the accepted-extended tracks (Phase2OTStubs only; a no-op otherwise). Runs
+    // AFTER the merger's OT hit-attach rewrite: a full GBL fit of each accepted-extended track's rewritten
+    // hit list (originals + attached extras, incl. tagged OT rechits) OVERWRITES its state/cov/chi2/
+    // pt/eta/ndof (same writeback path as the standard fit). The OT lever arm shrinks the longitudinal
+    // + pT covariance. hitContainer = the rewritten hit container; acceptedByTuple>=0 gates the
+    // population (~1k/ev); otSource supplies the raw OT rechit positions/errors (null => merged-only).
+    void refitExtended(const HitConstView &hv,
+                       const ::reco::CAModulesConstView &fr,
+                       caStructures::SequentialContainer const *hitContainer,
+                       const int32_t *acceptedByTuple,
+                       uint32_t maxNumberOfTuples,
+                       Queue &queue);
+
   private:
     static constexpr uint32_t maxNumberOfConcurrentFits_ = riemannFit::maxNumberOfConcurrentFits;
 
@@ -139,9 +200,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     TupleMultiplicity const *tupleMultiplicity_ = nullptr;
     OutputSoAView outputSoa_;
     float bField_;
-    const float *rhoMap_ = nullptr;  // BL material-map device grid (EventSetup condition; not owned)
-    const float *bMap_ = nullptr;    // normalized (Bz,Br) r-z field map (EventSetup condition; not owned)
-    bool fitCorrections_ = false;    // CA main fit's correctness package (useFitCorrections)
+    const float *rhoMap_ = nullptr;       // BL material-map device grid (EventSetup condition; not owned)
+    const float *bMap_ = nullptr;         // normalized (Bz,Br) r-z field map (EventSetup condition; not owned)
+    bool outlierReject_ = true;           // in-fit smoothed-residual outlier drop
+    bool fitCorrections_ = false;         // CA main fit's correctness package (useFitCorrections)
+    bool fieldKernelWeights_ = false;     // fit-consistent curvature->pT conversion field
+    bool chargeSymmetric_ = false;        // charge-symmetric corrections
+    bool trajectoryCorrections_ = false;  // reference-trajectory corrections
+    bool scatteringLogAtTotal_ = false;   // Highland log at the track total
+    bool cumulativeEloss_ = false;        // cumulative-column typical loss
     // Tuple-multiplicity per-N-bin cumulative offsets, pre-read by the caller into host memory (see
     // setHostTupleMultiplicityOffsets). Not owned; null means the fit runs to the cap.
     const uint32_t *hostTupleMultiplicityOffsets_ = nullptr;

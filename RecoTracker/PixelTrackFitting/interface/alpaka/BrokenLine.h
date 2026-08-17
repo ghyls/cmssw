@@ -16,9 +16,10 @@
 
 //#define BL_DEEPDEBUG
 
-// The factorized fast-BL circle/line fit solves its bordered-pentadiagonal normal matrix with the O(N) root-free
-// LDLt band factor + scalar Schur border elimination (Blobel NIM A566 eq.8) and selected-element unit-column
-// solves, rather than forming the dense (N+1)^2 / N^2 inverse.
+// Fast Broken Line helix fit (circle + line, Blobel NIM A566 (2006) 14) for the device. The bordered-pentadiagonal
+// normal matrices are solved with the O(N) root-free LDLt band factor of BandedSolve.h plus a scalar Schur
+// elimination of the curvature border (Blobel eq. 8); covariance elements come from unit-column band solves, so
+// the dense (N+1)^2 inverse is never formed. The O(N) state lives in a caller-provided per-lane workspace.
 //
 // `fitCorrections` (a runtime bool threaded from the producer parameter useFitCorrections through HelixFit and
 // Kernel_BLFit into prepareBrokenLineData / lineFit / circleFit) selects the fast-BL scattering/covariance
@@ -55,6 +56,12 @@
 // With it off every one of these is bypassed and the fit is upstream's exactly: flat material |Delta s|*0.06/16
 // per gap charged at its arrival node (the first gap for the innermost term), theta0 with geometry factor 0.7,
 // beta = 1 and the 20 GeV pt cap, hit 1 as the reference, and the broken-line covariance emitted unblended.
+//
+// The GBL refit (GeneralBrokenLine.h) takes its material from prepareGblFitData: every gap is represented by
+// two equivalent thin scatterers (segmentXX0GapSplit), which reproduces the angle variance, the angle-offset
+// covariance and the far-end offset variance of the gap's material; the Highland logarithm is taken once at the
+// gap's total thickness and then apportioned (Lynch & Dahl, NIM B58 (1991) 6; Blobel, NIM A566 (2006) 14).
+// The GBL's own runtime switches (chargeSymmetric, trajectoryCorrections) are documented in GeneralBrokenLine.h.
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE::brokenline {
 
@@ -199,24 +206,24 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::brokenline {
   static_assert(kLegacyFitScratchDoubles<10> == 233, "legacy-fit scratch quota != 233 at n=10");
 
   /*!
-    \brief Computes the Coulomb multiple scattering variance of the planar angle.
-    
-    \param length length of the track in the material.
-    \param bField magnetic field in Gev/cm/c.
-    \param radius radius of curvature (needed to evaluate p).
-    \param layer denotes which of the four layers of the detector is the endpoint of the 
-   *             multiple scattered track. For example, if Layer=3, then the particle has 
-   *             just gone through the material between the second and the third layer.
-    
-    \todo add another Layer variable to identify also the start point of the track, 
-   *      so if there are missing hits or multiple hits, the part of the detector that 
-   *      the particle has traversed can be exactly identified.
-    
-    \warning the formula used here assumes beta=1, and so neglects the dependence 
-   *         of theta_0 on the mass of the particle at fixed momentum.
-    
-    \return the variance of the planar angle ((theta_0)^2 /3).
+    \brief Lean prepared data for the pure-GBL fit path (the merger's refit ladder): only the members the GBL
+           solver reads.
+
+    radii / zInSZplane / varBeta are consumed only by the factorized circle+line fit (circleFit/lineFit), i.e.
+    by the CA main fit's kernel; keeping them out of the struct that lives on the BLFit kernel stack frame
+    lowers the per-thread register-spill reservation. The retained members are filled with the same
+    expressions as the PreparedBrokenLineDataMap ones (see prepareGblFitData).
   */
+  template <int n>
+  struct PreparedGblData {
+    int qCharge;                          //!< particle charge
+    riemannFit::VectorNd<n> sTransverse;  //!< arc length in the transverse plane from the pre-fitted PCA
+    riemannFit::VectorNd<n> sTotal;       //!< total distance traveled (three-dimensional)
+    riemannFit::VectorNd<n> matXX0;       //!< X/X0 of segment i->i+1 from the Geant4 material map
+    double innerXX0;                      //!< X/X0 from the beamline (IP) to the first hit (beam pipe + upstream)
+    ElossColumn innerCol;                 //!< that segment's ionization column
+  };
+
   // Exact cell walk of the material map along the straight (r,z) chord (r0,z0)->(r1,z1): the chord is cut at
   // every radial and z cell boundary and every piece is charged with its own cell's density times its exact
   // length (a fixed-step march would alias the 0.5 cm lattice). Outputs the chord length L and the moments
@@ -382,19 +389,66 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::brokenline {
     path3D = alpaka::math::abs(acc, sT0) * alpaka::math::sqrt(acc, 1. + slope * slope);
   }
 
-  // Coulomb MS planar-angle variance from a segment's X/X0 (radLen), fed in directly from the
-  // material map (no length*inv_X0). Angle handling unchanged: the 1/(1+slope^2) here and the
-  // (1+slope^2) projection applied later in circleFit; radLen already carries the path angle.
-  //
-  // `pionBeta` selects the momentum factor. false: upstream's multScatt exactly -- geometry factor 0.7,
-  // beta == 1 (so theta0 does not depend on the mass, see the \warning at the declaration above) and pt
-  // capped at 20 GeV by min(20., bField*radius). true: Highland's theta0 = 13.6 MeV/(beta c p) with geometry
-  // factor 1.0, the pion 1/beta and no cap. p^2 beta^2 = p^4/(p^2 + m_pi^2).
-  //
-  // `xLogTotal`, when positive, is the thickness the Highland logarithm is evaluated at. The logarithm is a
-  // property of the whole path the particle crosses, not of the lump one node is charged, so a track broken
-  // into many thin scatterers must keep the total in it or every kink comes out under-charged; only the
-  // leading radLen stays the node's own share. Zero keeps the node's own thickness in the logarithm.
+  // Two-equivalent-thin-scatterer moments of one gap with the trapezoid weights: the same construction as
+  // segmentXX0Moments, generalised to every gap and taken with one quadrature rule throughout. With q(l) the
+  // X/X0 density along (r0,z0)->(r1,z1) and d(l) the distance to the ARRIVAL end (r1,z1), W = int q dl,
+  // S1 = int q d dl, S2 = int q d^2 dl; the interior scatterer sits at d1 = S2/S1 upstream of the arrival end
+  // with the fraction w1 = S1^2/(S2 W) of the variance, the arrival end carries 1-w1. w1 is in (0, 1] by
+  // Cauchy-Schwarz (equality when the sampled measure is a single atom) and d1 in (0, L]; the caller handles
+  // those limits (prepareGblDataSplit). Returns W, the same value as segmentXX0(..., trapezoid=true).
+  template <alpaka::concepts::Acc TAcc>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE double segmentXX0GapSplit(
+      const TAcc& acc, const float* rho, double r0, double z0, double r1, double z1, double& d1, double& w1) {
+    const double L = alpaka::math::sqrt(acc, (r1 - r0) * (r1 - r0) + (z1 - z0) * (z1 - z0));
+    int nseg = int(2. * L);
+    if (nseg < 2)
+      nseg = 2;
+    const double dl = L / (nseg - 1);
+    double W = 0., S1overL = 0., S2overL2 = 0.;
+    for (int k = 0; k < nseg; ++k) {
+      const double f = double(k) / (nseg - 1);
+      const double w = (k == 0 || k == nseg - 1) ? 0.5 * dl : dl;
+      const double q = blMaterialMap::rhoAt(rho, float(r0 + f * (r1 - r0)), float(z0 + f * (z1 - z0))) * w;
+      W += q;
+      S1overL += q * (1. - f);              // (1-f) == d/L, so this accumulates S1/L directly
+      S2overL2 += q * (1. - f) * (1. - f);  // and this S2/L^2
+    }
+    d1 = 0.;
+    w1 = 0.;
+    if (W > 0. && S1overL > 0. && S2overL2 > 0.) {
+      d1 = L * S2overL2 / S1overL;                // = S2/S1
+      w1 = (S1overL * S1overL) / (S2overL2 * W);  // = S1^2/(S2 W)
+    }
+    return W;  // total X/X0, the same value as segmentXX0(..., /*trapezoid=*/true)
+  }
+
+  /*!
+    \brief Computes the Coulomb multiple scattering variance of the planar angle.
+
+    \param radLen X/X0 of the segment traversed, integrated along the segment through the material map (so it
+                  already carries the path angle).
+    \param bField magnetic field in Gev/cm/c.
+    \param radius radius of curvature (needed to evaluate p).
+    \param slope slope in the sz plane; the 1/(1+slope^2) here is undone by the (1+slope^2) projection applied
+                 later in circleFit.
+    \param pionBeta false: upstream's multScatt exactly -- geometry factor 0.7, beta == 1 (see \warning) and pt
+                    capped at 20 GeV by min(20., bField*radius). true: Highland's theta0 = 13.6 MeV/(beta c p)
+                    with geometry factor 1.0, the pion 1/beta and no cap, p^2 beta^2 = p^4/(p^2 + m_pi^2).
+
+    \param xLogTotal when positive, the thickness Highland's logarithm is evaluated at. The logarithm is a
+                    property of the whole path the particle crosses, not of the lump one node is charged, so a
+                    track broken into many thin scatterers must keep the total in it or every kink comes out
+                    under-charged; only the leading radLen stays the node's own share. Zero keeps the node's
+                    own thickness in the logarithm. The refit does the same (GeneralBrokenLine.h, th2Of).
+    \todo add another Layer variable to identify also the start point of the track,
+   *      so if there are missing hits or multiple hits, the part of the detector that
+   *      the particle has traversed can be exactly identified.
+
+    \warning with pionBeta == false the formula assumes beta=1, and so neglects the dependence
+   *         of theta_0 on the mass of the particle at fixed momentum.
+
+    \return the variance of the planar angle ((theta_0)^2 /3).
+  */
   template <alpaka::concepts::Acc TAcc>
   ALPAKA_FN_ACC ALPAKA_FN_INLINE double multScatt(const TAcc& acc,
                                                   const double radLen,
@@ -760,6 +814,120 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::brokenline {
                              multScatt(acc, results.matXX0(i - 1), bField, fast_fit(2), slope);
       }
     }
+  }
+
+  /*!
+    \brief Lean counterpart of prepareBrokenLineData for the pure-GBL path: fills only {qCharge, sTransverse,
+           sTotal, matXX0, innerXX0}.
+
+    radii is computed inline per hit and zInSZplane / varBeta are not computed at all, since the GBL solver
+    never reads them; every retained output uses the same expression as prepareBrokenLineData, so it carries
+    the same value with a smaller kernel stack frame.
+
+    Material model: matXX0(i) is the whole of gap i->i+1 with the trapezoid rule, and \param gapD1 / \param gapW1
+    carry that gap's two-equivalent-scatterer partition (position and variance share of the interior scatterer)
+    for prepareGblDataSplit, which places one measurement-less node per gap. The split reproduces all three
+    moments of the material distribution (angle variance, angle-offset covariance, far-end offset variance).
+    \param gapD1 / \param gapW1 per-gap outputs (n slots; slot n-1 is zero). Optional as a PAIR: both must
+    be non-null to be filled, either being null skips them.
+  */
+  template <alpaka::concepts::Acc TAcc, typename M3xN, typename V4, int n>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE void __attribute__((always_inline)) prepareGblFitData(const TAcc& acc,
+                                                                                       const M3xN& hits,
+                                                                                       const V4& fast_fit,
+                                                                                       const double bField,
+                                                                                       const float* rho,
+                                                                                       PreparedGblData<n>& results,
+                                                                                       const double* matCached = nullptr,
+                                                                                       double* gapD1 = nullptr,
+                                                                                       double* gapW1 = nullptr,
+                                                                                       ElossColumn* matCol = nullptr) {
+    riemannFit::Vector2d dVec;
+    riemannFit::Vector2d eVec;
+
+    int mId = 1;
+    if constexpr (n > 3) {
+      riemannFit::Vector2d middle = 0.5 * (hits.block(0, n - 1, 2, 1) + hits.block(0, 0, 2, 1));
+      auto d1 = (hits.block(0, n / 2, 2, 1) - middle).squaredNorm();
+      auto d2 = (hits.block(0, n / 2 - 1, 2, 1) - middle).squaredNorm();
+      mId = d1 < d2 ? n / 2 : n / 2 - 1;
+    }
+
+    dVec = hits.block(0, mId, 2, 1) - hits.block(0, 0, 2, 1);
+    eVec = hits.block(0, n - 1, 2, 1) - hits.block(0, mId, 2, 1);
+    results.qCharge = riemannFit::cross2D(acc, dVec, eVec) > 0 ? -1 : 1;
+
+    const double slope = -results.qCharge / fast_fit(3);
+    riemannFit::Matrix2d rotMat = rotationMatrix(acc, slope);
+
+    // arc length s in the transverse plane; the radii column (hit - pre-fit centre) is computed inline, not stored.
+    eVec = -fast_fit(2) * fast_fit.head(2) / fast_fit.head(2).norm();
+    for (u_int i = 0; i < n; i++) {
+      dVec = hits.block(0, i, 2, 1) - fast_fit.head(2);
+      results.sTransverse(i) =
+          results.qCharge * fast_fit(2) *
+          alpaka::math::atan2(acc, riemannFit::cross2D(acc, dVec, eVec), dVec.dot(eVec));  // calculates the arc length
+    }
+    riemannFit::VectorNd<n> zVec = hits.block(2, 0, 1, n).transpose();
+
+    // sTotal (rotate (s,z) into the sz plane); zInSZplane (row 1) is not needed by GBL, so it is not stored.
+    riemannFit::Matrix2xNd<n> pointsSZ = riemannFit::Matrix2xNd<n>::Zero();
+    for (u_int i = 0; i < n; i++) {
+      pointsSZ(0, i) = results.sTransverse(i);
+      pointsSZ(1, i) = zVec(i);
+      pointsSZ.block(0, i, 2, 1) = rotMat * pointsSZ.block(0, i, 2, 1);
+    }
+    results.sTotal = pointsSZ.block(0, 0, 1, n).transpose();
+
+    // material X/X0 per segment, from the same map march prepareBrokenLineData uses.
+    auto rOf = [&](u_int j) { return alpaka::math::sqrt(acc, hits(0, j) * hits(0, j) + hits(1, j) * hits(1, j)); };
+    // matXX0 slot g holds the WHOLE of gap g (prepareGblDataSplit places it over the gap's two scatterers;
+    // prepareGblData, the fallback node builder, charges it at hit node g+1). Every integral, gaps and
+    // beamline->hit0 alike, uses the trapezoid rule: exact segment length, each layer's bin counted once.
+    // The material rows are a pure function of the hit positions (the reference helix, charge and field enter
+    // nowhere), so across the two GBL linearizations of one fit this map march -- the hot spot of the fit --
+    // produces exactly the same doubles twice. `matCached`, when the caller supplies it (the refit's second
+    // linearization, which carries the first's output in its per-lane phase buffer), replaces the march with
+    // a load of those already-rounded doubles; a null pointer runs the march in full.
+    if (matCached != nullptr) {
+      for (u_int i = 0; i < n; i++)
+        results.matXX0(i) = matCached[i];
+      results.innerXX0 = matCached[n];
+      results.innerCol = ElossColumn{};  // restored by the caller from its own cache, as gapD1/gapW1 are
+      if (gapD1 != nullptr && gapW1 != nullptr)
+        for (u_int g = 0; g < n; g++) {
+          gapD1[g] = matCached[n + 1 + g];
+          gapW1[g] = matCached[n + 1 + int(n) + g];
+        }
+      return;
+    }
+    for (u_int i = 0; i < n; i++)
+      results.matXX0(i) = 0.;
+    for (u_int g = 0; g < n - 1; g++) {
+      double d1 = 0., w1 = 0.;
+      // the walk's own two-thin wrapper: it is the one that can also accumulate the gap's ionization column
+      const double xx0 = segmentXX0Moments(
+          acc, rho, rOf(g), hits(2, g), rOf(g + 1), hits(2, g + 1), d1, w1, 0., matCol ? matCol + g : nullptr);
+      results.matXX0(g) = xx0;  // slot g = the WHOLE of gap g; prepareGblDataSplit places it
+      if (gapD1 != nullptr && gapW1 != nullptr) {
+        gapD1[g] = d1;
+        gapW1[g] = w1;
+      }
+    }
+    results.matXX0(n - 1) = 0.;
+    if (gapD1 != nullptr && gapW1 != nullptr) {
+      gapD1[n - 1] = 0.;
+      gapW1[n - 1] = 0.;
+    }
+    if (matCol != nullptr)
+      matCol[n - 1] = ElossColumn{};
+    // Same beamline->hit0 material rule as prepareBrokenLineData (keep the two in sync): the map is always
+    // integrated from the beamline, the CKF prompt-origin assumption, so OT-only stub tracks carry the upstream
+    // material too. Same quadrature as for the gaps, so one rule integrates the whole trajectory (the rectangle
+    // rule would give both endpoint samples full weight, over-integrating this segment and double-counting the
+    // hit-0 layer bin it shares with gap 0).
+    const bool useInner = true;
+    results.innerXX0 = useInner ? segmentXX0(acc, rho, 0., 0., rOf(0), hits(2, 0), 0., &results.innerCol) : 0.;
   }
 
   /*!
