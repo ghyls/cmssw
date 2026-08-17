@@ -2045,6 +2045,22 @@ upgradeWFs['HLTTiming75e33TiclBarrel'].suffix = '_HLT75e33TimingTiclBarrel'
 upgradeWFs['HLTTiming75e33TiclBarrel'].offset = 0.758
 upgradeWFs['HLTTiming75e33TiclBarrel'].step2['--procModifiers'] = 'ticl_barrel'
 
+# Stub-based CA tracking workflow
+upgradeWFs['HLTTiming75e33CAStubs'] = deepcopy(upgradeWFs['HLTTiming75e33'])
+upgradeWFs['HLTTiming75e33CAStubs'].suffix = '_HLT75e33TimingCAStubs'
+upgradeWFs['HLTTiming75e33CAStubs'].offset = 0.7512
+upgradeWFs['HLTTiming75e33CAStubs'].step2['--procModifiers'] = 'phase2CAStubs'
+upgradeWFs['HLTTiming75e33CAStubs'].step3['--procModifiers'] = 'phase2CAStubs'
+
+# Truth-matched stubs workflow (overlay on phase2CAStubs)
+upgradeWFs['HLTTiming75e33CATrueStubs'] = deepcopy(upgradeWFs['HLTTiming75e33'])
+upgradeWFs['HLTTiming75e33CATrueStubs'].suffix = '_HLT75e33TimingCATrueStubs'
+upgradeWFs['HLTTiming75e33CATrueStubs'].offset = 0.7513
+upgradeWFs['HLTTiming75e33CATrueStubs'].step2['--procModifiers'] = 'phase2CAStubs,phase2CATrueStubs'
+upgradeWFs['HLTTiming75e33CATrueStubs'].step2['--accelerators'] = 'cpu'
+upgradeWFs['HLTTiming75e33CATrueStubs'].step3['--procModifiers'] = 'phase2CAStubs,phase2CATrueStubs'
+upgradeWFs['HLTTiming75e33CATrueStubs'].step3['--accelerators'] = 'cpu'
+
 class UpgradeWorkflow_HLTPhase2_WithNano(UpgradeWorkflow):
     def setup_(self, step, stepName, stepDict, k, properties):
         # skip RECO, ALCA and HLT
