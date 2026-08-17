@@ -30,19 +30,16 @@ namespace caStructures {
     float avgTracksPerCell_;
 
     // Algorithm Parameters
-    // NOTE: minHitsPerNtuplet_ is compared against the number of LAYERS in the ntuplet
-    // (CACell::find_ntuplets); the name is kept because it is the name of the configuration
-    // parameter set by the menus.
+    // minHitsPerNtuplet_ is compared against the number of layers in the ntuplet
+    // (CACell::find_ntuplets); the name is that of the configuration parameter set by the menus.
     uint16_t minHitsPerNtuplet_;
     uint16_t minHitsForSharingCut_;
 
     // Flags
     bool useRiemannFit_;
     // Enables the broken-line fit corrections (material partition and rigid-node guard, Karimaki Fisher
-    // basis, pion 1/beta, trapezoid quadrature, 3x3 covariance blend; see the header comment of
-    // RecoTracker/PixelTrackFitting/interface/alpaka/BrokenLine.h). Read only by the CA main fit.
-    // Positional struct: keep this slot in the same
-    // order as the makeCommonParams initializer in CAHitNtupletGenerator.cc.
+    // basis, pion 1/beta, trapezoid quadrature, 3x3 covariance blend; see BrokenLine.h). Read only by
+    // the CA main fit. Positional struct: keep this slot in the makeCommonParams initializer order.
     bool useFitCorrections_;
     bool fitNas4_;
     bool earlyFishbone_;
@@ -56,17 +53,16 @@ namespace caStructures {
     bool doFastDuplicateRemover_;
     bool doEarlyDuplicateRemover_;
 
-    // Inline per-triplet DNN gate (Phase2OTStubs only): when enabled, an MLP with compile-time
-    // weights (CATripletDNN.h) scores EVERY accepted triplet in Kernel_connect -- pixel-only
-    // (nStubs==0, sentinel stub features) and stub-containing alike -- and rejects those below
-    // tripletDNNThreshold_ (negative => the threshold compiled into the weight header).
+    // Inline per-triplet DNN gate (Phase2OTStubs only): an MLP with compile-time weights
+    // (CATripletDNN.h) scores every accepted triplet in Kernel_connect, pixel-only ones included
+    // (nStubs==0, sentinel stub features), and rejects those below tripletDNNThreshold_
+    // (negative => the threshold compiled into the weight header).
     bool useTripletDNN_;
     float tripletDNNThreshold_;
 
-    // Classify-embedded track classifier (Phase2OTStubs only): when enabled, an MLP with
-    // compile-time weights (CATrackDNN.h) scores each fitted candidate in Kernel_classifyTracks
-    // and its score REPLACES the chi2-based strict->tight promotion (trackDNNThreshold_
-    // negative => the threshold compiled into the weight header).
+    // Track classifier (Phase2OTStubs only): an MLP with compile-time weights (CATrackDNN.h) scores
+    // each fitted candidate in Kernel_classifyTracks; its score replaces the chi2-based
+    // strict->tight promotion (trackDNNThreshold_ negative => the threshold in the weight header).
     bool useTrackDNN_;
     float trackDNNThreshold_;
 
@@ -74,12 +70,14 @@ namespace caStructures {
     bool delayAllocations_;    // Defer cell-derived + hit->track buffers until their real size is known
     bool countDoubletsFirst_;  // Run a count-only doublet pass to size simpleCells/hitToCellStorage exactly
 
-    // CA fast-duplicate / shared-hit parameter-cov gate width. Two tracks are declared duplicates when
-    // every fitted param p satisfies dp^2 <= fastDupNSigma2_*(cov_i+cov_j) (Kernel_fastDuplicateRemover
-    // and Kernel_rejectDuplicate, five-parameter compatibility check). A width in units of the fitted
-    // covariance: lowering it tightens the gate (fewer merges), raising it merges more aggressively.
-    // The Phase-1 specializations of those kernels keep their own hard-wired nSigma2Phase1 constant.
+    // Duplicate gate width, in units of the fitted covariance: two tracks are duplicates when every
+    // fitted parameter p satisfies dp^2 <= fastDupNSigma2_*(cov_i+cov_j) (Kernel_fastDuplicateRemover
+    // and Kernel_rejectDuplicate). The Phase-1 specializations use their own nSigma2Phase1 constant.
     float fastDupNSigma2_;
+
+    // Tracking iteration this configuration belongs to; keeps the diagnostics separated when
+    // several CA instances run in the same job.
+    ::pixelTrack::Iteration iterationName_;
   };
 
   // Hits data formats
@@ -161,6 +159,8 @@ namespace caStructures {
   ALPAKA_FN_HOST_ACC ALPAKA_FN_INLINE int16_t clusterSizeY(CAHitsView const& hh, int32_t i) {
     return hh.pixel(i).clusterSizeY();
   }
+
+  using MapToHitConstView = ::reco::TrackingRecHitsMaskingConstView;
 
   //Tracks data formats
   using TkSoAView = ::reco::TrackSoAView;

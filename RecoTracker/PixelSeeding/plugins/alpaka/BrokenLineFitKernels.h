@@ -26,6 +26,8 @@
 #include "RecoTracker/PixelTrackFitting/interface/BLBFieldMap.h"  // (Bz,Br) r-z map for the effective bending field
 
 #include "CAFitHitSelection.h"
+#include "CAExtensionKernels.h"                           // caExtension::OTHitsSource (extended-N refit OT hit source)
+#include "RecoTracker/PixelSeeding/interface/OTHitTag.h"  // caOTHitTag::isOTId / otIdx (refit tagged-id fetch)
 #include "HelixFit.h"
 
 using OutputSoAView = reco::TrackSoAView;
@@ -33,48 +35,93 @@ using TupleMultiplicity = caStructures::GenericContainer;
 using Tuples = caStructures::SequentialContainer;
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
-  // CUDA block dimension of the fit work divisions. Launch dimension only: the fit kernels are
-  // grid-stride loops that break on the invalid-tkid sentinel, so no fitted lane and no fitted value
-  // depends on it. 32 is the L1-pressure optimum of this solver. The fused main-fit ladder below
-  // expresses its bin <-> lane partition in units of it.
+  // CUDA block dim of the fit work divisions (launch dim only: the kernels are grid-stride loops that
+  // break on the invalid-tkid sentinel). 32 is the L1-pressure optimum of this solver. Kept here so
+  // the FUSED refit ladder can express its bin <-> lane partition in units of it.
   inline constexpr uint32_t kFitBlock = 32u;
 
   // ---------------------------------------------------------------------------------------------
-  // Fused main-fit ladder: the dynamic bin <-> lane-range partition of the CA fit.
-  //
-  // The main fit's N-bins recycle ONE lane-strided buffer set (tkids / hits / hits_ge / fast_fit /
-  // fit scratch, all riemannFit::maxNumberOfConcurrentFits lanes wide), and that -- not any data
-  // dependence -- is what forces them to run one after another: bin b+1's fast fit overwrites the
-  // lanes bin b's fit is about to read. The bins are disjoint IN TUPLES (tupleMultiplicity bins every
-  // tuple by its selected multiplicity, and begin(nHitsL)..end(nHitsH) are contiguous non-overlapping
-  // slices of it), so two bins can never write the same SoA row. Here the bins partition the SAME
-  // buffer into disjoint lane RANGES instead, and all of them survive to one fused launch per phase.
-  //
-  // THE PARTITION IS COMPUTED PER EVENT, ON THE DEVICE, FROM THE ACTUAL POPULATIONS -- there is no
-  // fixed per-bin quota and nothing crosses to the host: no readback, no sync. No count kernel is
-  // needed: tupleMultiplicity is the count, bin b's demand being
-  // end(nHitsH) - begin(nHitsL), the very expression the per-bin fast fit's totTK reads. One
-  // single-thread kernel (Kernel_BLMainLaneRanges) prefix-sums those demands into contiguous ranges
-  // [base_b, base_b + n_b) and writes the block -> bin dispatch table the fused kernels read.
-  //
-  // WHY THE LAYOUTS SURVIVE UNTOUCHED (this is what makes the partition memory-neutral): every
-  // main-fit per-lane buffer is COLUMN-major with the fixed inter-element stride riemannFit::stride,
-  // so lane l occupies exactly the elements {l + e*stride} and two lanes cannot share a byte whatever
-  // N each of them carries -- hits (Map3xNdS<N, stride>), hits_ge (Map6xNfS<N, stride>), fast_fit
-  // (Map4dS<stride>) and the fit scratch (PreparedBrokenLineDataMap<N, stride> +
-  // LegacyFitWorkspaceMap<N, stride>) alike. The lane buffers therefore keep the size, the stride and
-  // the intra-lane layout they always had, so no per-lane-quota monotonicity argument is needed:
-  // disjointness here is unconditional.
-  //
-  // CAPACITY AND ROUNDS. One pass seats riemannFit::maxNumberOfConcurrentFits lanes. When the demand
-  // exceeds that, Kernel_BLMainLaneRanges hands the capacity out in bin order and the bins that did
-  // not fit keep their unseated tuples for the next round. A PER-BIN CURSOR makes that exact: the
-  // bin -> lane map is deterministic by index here (lane l of bin b is that bin's (tupleBase_b + l -
-  // base_b)-th tuple), not an atomic claim, so a per-bin seated count replaces a per-track served
-  // flag -- kMainNBins words instead of one byte per track. The round
-  // bound is the chunk loop's own bound, unchanged: ceil(chunkBound / maxNumberOfConcurrentFits),
-  // and the demand can never exceed the population chunkBound counts, so the rounds always drain it.
-  // NO TUPLE IS EVER LEFT UNFIT.
+  // FUSED REFIT LADDER -- the dynamic bin <-> lane-range partition. The ten N-bins partition one
+  // lane-strided buffer set into disjoint lane ranges, so all ten run in one fused launch per
+  // (phase, iteration). The partition is computed per event on the device from the actual populations
+  // (no fixed per-bin quota, nothing crosses to the host): Kernel_BLRefitBinCount fills the ten per-bin
+  // demands; Kernel_BLRefitLaneRanges prefix-sums them into contiguous ranges [base_b, base_b+n_b) and
+  // writes the block->bin dispatch table the fused kernels read.
+  // Disjointness: hits/hits_ge/fast_fit are column-major (stride kRefitStride), so two lanes never share
+  // a byte; pphase is lane-major at the fixed per-lane quota kBLPhaseDoubles; pgnodes/pgblScratch are
+  // lane-major with a per-lane quota that is non-decreasing in N (kRefitQuotaMonotone below pins this),
+  // so the ordered ranges stay disjoint for any partition.
+  // Capacity: one pass seats kRefitStride lanes; unseated tracks wait for the next round (exact through
+  // the per-track "served" flag), and ceil(nTracksCap/kRefitStride) rounds always drain the population.
+  inline constexpr uint32_t kRefitNBins = 10u;  // N = 3 .. kRefitMaxN, the top bin absorbing the tail
+  inline constexpr int kRefitMinN = 3;
+
+  // Device tables of one round. pRange holds {firstLane, nLanes} per bin; pBlockMap holds
+  // {bin, firstLane, endLane} per fused-grid block, with bin == kRefitNBins marking an idle block.
+  inline constexpr uint32_t kRefitRangeStride = 2u;
+  inline constexpr uint32_t kRefitBlockMapStride = 3u;
+
+  // Fused-grid width covers every partition the count can produce: a bin holding n_b lanes needs
+  // ceil(n_b/kFitBlock) blocks, and sum_b <= kRefitStride/kFitBlock + kRefitNBins (a block carries
+  // exactly one bin, so the switch over compile-time N never diverges inside a warp).
+  inline constexpr uint32_t kFusedBlocks =
+      HelixFit<::pixelTopology::Phase2OTStubs>::kRefitStride / kFitBlock + kRefitNBins;
+
+  // Per-lane pgnodes/pgblScratch quotas -- the SAME expressions the phase kernels build their per-lane
+  // pointers with, restated so the disjointness static_assert below can reference them.
+  template <int N, typename TrackerTraits>
+  inline constexpr int kRefitSlotNodes = generalBrokenLine::kGblSplitNodes<(
+      int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N) : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
+  template <int N>
+  inline constexpr int kRefitScratchStride =
+      generalBrokenLine::kGblScratchDoubles<generalBrokenLine::kGblSplitNodes<N> - 1> +
+      3 * generalBrokenLine::kGblSplitNodes<N>;
+  template <typename TrackerTraits, int N>
+  inline constexpr bool kRefitQuotaMonotone =
+      kRefitQuotaMonotone<TrackerTraits, N - 1> &&
+      (kRefitSlotNodes<N - 1, TrackerTraits> <= kRefitSlotNodes<N, TrackerTraits>) &&
+      (kRefitScratchStride<N - 1> <= kRefitScratchStride<N>);
+  template <typename TrackerTraits>
+  inline constexpr bool kRefitQuotaMonotone<TrackerTraits, kRefitMinN> = true;
+  static_assert(
+      kRefitQuotaMonotone<::pixelTopology::Phase2OTStubs, int(HelixFit<::pixelTopology::Phase2OTStubs>::kRefitMaxN)>,
+      "the ordered lane ranges only stay disjoint in pgnodes/pgblScratch while the per-lane "
+      "quotas are non-decreasing in N");
+  static_assert(kRefitNBins == HelixFit<::pixelTopology::Phase2OTStubs>::kRefitMaxN - uint32_t(kRefitMinN) + 1u,
+                "the bin ladder must cover N = kRefitMinN .. kRefitMaxN");
+
+  // Per-lane quota of the fit-hit-id / pixel-core-flag tables. Under the lane partition the scan works in
+  // bin-local slots while the fused outlier works in absolute lanes, so the quota must be the
+  // ladder-wide kRefitMaxN for every bin (same values, uniform addressing).
+  inline constexpr uint32_t kRefitFitIdQuota = HelixFit<::pixelTopology::Phase2OTStubs>::kRefitMaxN;
+
+  // Selected-hit multiplicity -> bin. THE ONE DEFINITION of the ladder's binning, so the count kernel
+  // and the per-bin scans cannot drift apart: it reproduces exactly the (nHitsL, nHitsH) pairs
+  // refitExtended launches the scans with -- the exact bins N = kRefitMinN .. kRefitMaxN-1, and the
+  // top bin absorbing the tail [kRefitMaxN, maxFitSel]. Returns kRefitNBins for a track the ladder
+  // does not fit at all.
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE uint32_t refitBinOfNSel(uint32_t nSel, uint32_t maxFitSel) {
+    constexpr uint32_t kMaxN = HelixFit<::pixelTopology::Phase2OTStubs>::kRefitMaxN;
+    if (nSel < uint32_t(kRefitMinN) || nSel > maxFitSel)
+      return kRefitNBins;
+    const uint32_t nEff = (nSel < kMaxN) ? nSel : kMaxN;
+    return nEff - uint32_t(kRefitMinN);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // FUSED MAIN-FIT LADDER -- the refit ladder's dynamic partition (above) applied to the CA fit. The
+  // bins are disjoint in tuples (tupleMultiplicity bins every tuple by its selected multiplicity, and
+  // begin(nHitsL)..end(nHitsH) are contiguous non-overlapping slices of it), so two bins never write the
+  // same SoA row; they partition the one lane-strided buffer set into disjoint lane ranges and run in
+  // one fused launch per phase. No count kernel is needed: bin b's demand is end(nHitsH) - begin(nHitsL),
+  // the expression the per-bin fast fit's totTK reads; Kernel_BLMainLaneRanges (single thread) prefix-sums
+  // the demands into ranges and writes the block -> bin dispatch table. Lane disjointness is
+  // unconditional: every per-lane buffer is column-major with the fixed inter-element stride
+  // riemannFit::stride, so lane l occupies exactly the elements {l + e*stride} whatever N it carries.
+  // One pass seats riemannFit::maxNumberOfConcurrentFits lanes, handed out in bin order; a per-bin cursor
+  // (lane l of bin b is that bin's (tupleBase_b + l - base_b)-th tuple, a deterministic map rather than
+  // an atomic claim) carries unseated tuples to the next round, and ceil(chunkBound / lanes) rounds
+  // always drain the population.
   inline constexpr int kMainMinN = 3;
   template <typename TrackerTraits>
   inline constexpr uint32_t kMainNBins = uint32_t(TrackerTraits::maxHitsOnTrackForFullFit) - uint32_t(kMainMinN) + 1u;
@@ -877,207 +924,200 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // charged its own Landau MPV. Forwarded to BOTH node builders.
     bool elossCumulative_ = false;
 
-    ALPAKA_FN_ACC void operator()(Acc1D const& acc,
-                                  double bField,
-                                  typename caStructures::tindex_type const* __restrict__ ptkids,
-                                  double* __restrict__ phits,
-                                  float* __restrict__ phits_ge,
-                                  double* __restrict__ pfast_fit,
-                                  generalBrokenLine::GblNodeData* __restrict__ pgnodes,
-                                  double* __restrict__ pphase) const {
-      constexpr auto invalidTkId = std::numeric_limits<typename caStructures::tindex_type>::max();
-      const auto nt = Stride;
-      for (auto local_idx : cms::alpakatools::uniform_elements(acc, nt)) {
-        if (invalidTkId == ptkids[local_idx])
-          break;
-        riemannFit::Map3xNdS<N, Stride> hits(phits + local_idx);
-        riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
-        riemannFit::Map6xNfS<N, Stride> hits_ge(phits_ge + local_idx);
-        double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
-        // Reference override BEFORE any reference-dependent preparation.
-        if (iterFromPhase_) {
-          fast_fit(0) = phase[kBLPhaseNextRef + 0];
-          fast_fit(1) = phase[kBLPhaseNextRef + 1];
-          fast_fit(2) = phase[kBLPhaseNextRef + 2];
-          fast_fit(3) = phase[kBLPhaseNextRef + 3];
-        }
-        // Ionization-loss enable for the node builders (kApplyELossCorrection, defined once above with
-        // its provenance).
-        // Per-track effective field; with bMap_ null this is the scalar bField.
-        const double bFieldEff =
-            fieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
-        // Publish this linearization's effective field so the out and outlier phases read it instead of
-        // re-running the same O(N) two-bilinears-per-hit map loop on the same fast_fit. Written on every
-        // prep, so each phase always sees its own iteration's value. When the value CAME from the slot it
-        // is already there, and rewriting it would only cost a store.
-        if (!fieldFromPhase_)
-          phase[kBLPhaseBFieldEff] = bFieldEff;
-        static_assert(int(N) <= kBLPhaseMatMax, "the phase buffer's matXX0 window must cover N");
-        brokenline::PreparedGblData<N> data;
-        // Per-gap two-thin partition of the exact-split material model, written by prepareGblFitData
-        // (uninitialized here: it writes every slot before anything reads one).
-        double gapD1[N], gapW1[N];
-        // The ionization columns of the same gaps, from the same walk.
-        blMaterialMap::ElossColumn matCol[N];
-        // On a re-linearization the material rows are loaded from the phase buffer (see
-        // prepareGblFitData's matCached contract); otherwise they are marched from the map and stored.
-        brokenline::prepareGblFitData(acc,
-                                      hits,
-                                      fast_fit,
-                                      bFieldEff,
-                                      rhoMap_,
-                                      data,
-                                      matFromPhase_ ? (phase + kBLPhaseMatOff) : nullptr,
-                                      gapD1,
-                                      gapW1,
-                                      matCol);
-        constexpr int kSlotNodes = generalBrokenLine::kGblSplitNodes<(
-            int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N)
-                                                                  : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
-        generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
-        double innerD1 = 0., innerW1 = 0.;
-        if (matFromPhase_) {
-          // The upstream two-thin split is a function of hit 0 alone, so it rides the same cache.
-          // Loaded unconditionally: the iteration-0 prep left 0/0 here whenever innerXX0 was not
-          // positive, which is exactly what the else branch would produce.
-          innerD1 = phase[kBLPhaseInnerD1];
-          innerW1 = phase[kBLPhaseInnerW1];
-        } else {
-          // one rule for the whole trajectory: the beamline->hit0 moments come from the same cell walk
-          // as the gaps (its W is the innerXX0 already stored).
-          const double rHit0 = alpaka::math::sqrt(acc, hits(0, 0) * hits(0, 0) + hits(1, 0) * hits(1, 0));
-          brokenline::segmentXX0Moments(acc, rhoMap_, 0., 0., rHit0, hits(2, 0), innerD1, innerW1);
-        }
-        if (matFromPhase_) {
-          for (int i = 0; i < int(N); ++i) {
-            gapD1[i] = phase[kBLPhaseGapD1 + i];
-            gapW1[i] = phase[kBLPhaseGapW1 + i];
-            matCol[i] = {
-                phase[kBLPhaseMatCol + 3 * i], phase[kBLPhaseMatCol + 3 * i + 1], phase[kBLPhaseMatCol + 3 * i + 2]};
-          }
-          data.innerCol = {phase[kBLPhaseInnerCol], phase[kBLPhaseInnerCol + 1], phase[kBLPhaseInnerCol + 2]};
-        }
-        if (!matFromPhase_) {  // publish the invariant rows for the next linearization
-          for (int i = 0; i < int(N); ++i)
-            phase[kBLPhaseMatOff + i] = data.matXX0(i);
-          phase[kBLPhaseMatOff + int(N)] = data.innerXX0;  // matCached[n], see the layout comment
-          phase[kBLPhaseInnerD1] = innerD1;
-          phase[kBLPhaseInnerW1] = innerW1;
-          for (int i = 0; i < int(N); ++i) {
-            phase[kBLPhaseGapD1 + i] = gapD1[i];
-            phase[kBLPhaseGapW1 + i] = gapW1[i];
-            phase[kBLPhaseMatCol + 3 * i] = matCol[i].e;
-            phase[kBLPhaseMatCol + 3 * i + 1] = matCol[i].eLnI;
-            phase[kBLPhaseMatCol + 3 * i + 2] = matCol[i].eLnRho;
-          }
-          phase[kBLPhaseInnerCol] = data.innerCol.e;
-          phase[kBLPhaseInnerCol + 1] = data.innerCol.eLnI;
-          phase[kBLPhaseInnerCol + 2] = data.innerCol.eLnRho;
-        }
-        // hit0->PCA backward transport: only the hits-only node layout uses it, so it is set by
-        // prepareGblData; identity here keeps the phase buffer defined when a layout that extracts at
-        // node 0 (the inner-node layout, and the split) is built instead.
-        generalBrokenLine::Matrix5d jacBack = generalBrokenLine::Matrix5d::Identity();
-        bool usedInner = false;
-        bool usedSplit = false;
-        if constexpr (int(N) >= 3) {
-          // the 2N+1 layout. It refuses a track whose gaps cannot carry an interior scatterer at all;
-          // that track then takes the arrival-node layout below, which is well posed for any gap.
-          usedSplit = generalBrokenLine::prepareGblDataSplit<Acc1D, N>(acc,
-                                                                       hits,
-                                                                       hits_ge,
-                                                                       fast_fit,
-                                                                       bFieldEff,
-                                                                       data.qCharge,
-                                                                       data.sTransverse,
-                                                                       data.sTotal,
-                                                                       data.matXX0,
-                                                                       gapD1,
-                                                                       gapW1,
-                                                                       data.innerXX0,
-                                                                       innerD1,
-                                                                       innerW1,
-                                                                       gnodes,
-                                                                       /*msScale=*/1.0,
-                                                                       kApplyELossCorrection,
-                                                                       chargeSymmetric_ ? bMap_ : nullptr,
-                                                                       bField,
-                                                                       trajectoryCorrections_,
-                                                                       scatteringLogAtTotal_,
-                                                                       elossCumulative_,
-                                                                       matCol,
-                                                                       data.innerCol);
-        }
-        if (!usedSplit)
-          generalBrokenLine::prepareGblData<Acc1D, N>(acc,
-                                                      hits,
-                                                      hits_ge,
-                                                      fast_fit,
-                                                      bFieldEff,
-                                                      data.qCharge,
-                                                      data.sTransverse,
-                                                      data.sTotal,
-                                                      data.matXX0,
-                                                      data.innerXX0,
-                                                      gnodes,
-                                                      /*msScale=*/1.0,
-                                                      kApplyELossCorrection,
-                                                      &jacBack,
-                                                      innerD1,
-                                                      innerW1,
-                                                      &usedInner,
-                                                      chargeSymmetric_ ? bMap_ : nullptr,
-                                                      bField,
-                                                      trajectoryCorrections_,
-                                                      scatteringLogAtTotal_,
-                                                      elossCumulative_,
-                                                      matCol,
-                                                      data.innerCol);
-#ifdef BL_LAYER_DUMP
-        // BL_LAYER_DUMP -- the fit-input trace the host replay tool (development branch) replays. One block per
-        // track per LINEARIZATION: the reference fast fit, the field, the charge and the material this
-        // pass was built on, plus every hit and its 3-element ge error row. A single host solve fed with
-        // one block reproduces the device fit of that pass exactly, which is what makes the oracle a
-        // check on the device arithmetic rather than a second implementation of it.
-        // The offline consumer takes the LAST block emitted for a tkid: that is the final
-        // linearization, the one whose solve produces the published state (the ladder runs prep once per
-        // pass). Run single-threaded on the serial backend so a track's TRK/HIT lines stay contiguous in
-        // stdout.
-        const auto tkid = ptkids[local_idx];  // the dump is this phase's only consumer of the tuple id
-        printf("BLDUMP_TRK %u N %d bfield %.17g ff %.17g %.17g %.17g %.17g q %d innerXX0 %.17g\n",
-               (unsigned)tkid,
-               int(N),
-               bField,
-               fast_fit(0),
-               fast_fit(1),
-               fast_fit(2),
-               fast_fit(3),
-               data.qCharge,
-               double(data.innerXX0));
-        for (int i = 0; i < int(N); ++i)
-          printf("BLDUMP_HIT %u %d %.17g %.17g %.17g %.9g %.9g %.9g %.9g %.9g %.9g %.17g\n",
-                 (unsigned)tkid,
-                 i,
-                 hits(0, i),
-                 hits(1, i),
-                 hits(2, i),
-                 hits_ge(0, i),
-                 hits_ge(1, i),
-                 hits_ge(2, i),
-                 hits_ge(3, i),
-                 hits_ge(4, i),
-                 hits_ge(5, i),
-                 i < int(N) - 1 ? double(data.matXX0(i)) : 0.0);
-#endif
-        phase[kBLPhaseSplit] = usedSplit ? 1. : 0.;
-        for (int r = 0; r < 5; ++r)
-          for (int c = 0; c < 5; ++c)
-            phase[kBLPhaseJacBack + 5 * r + c] = jacBack(r, c);
-        phase[kBLPhaseUsedInner] = usedInner ? 1. : 0.;
-        phase[kBLPhaseQCharge] = double(data.qCharge);
-        phase[kBLPhaseSTrans0] = double(data.sTransverse(0));
-        phase[kBLPhaseInnerXX0] = double(data.innerXX0);
+    // One lane of this phase, pinned out of line (BL_REFIT_NOINLINE): the fused kernel's trampoline
+    // calls this one compiled function. The invalid-tkid sentinel is not tested here: the caller tests
+    // it before dispatching.
+    ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
+                                              uint32_t local_idx,
+                                              double bField,
+                                              [[maybe_unused]]
+                                              typename caStructures::tindex_type const* __restrict__ ptkids,
+                                              double* __restrict__ phits,
+                                              float* __restrict__ phits_ge,
+                                              double* __restrict__ pfast_fit,
+                                              generalBrokenLine::GblNodeData* __restrict__ pgnodes,
+                                              double* __restrict__ pphase) const {
+      riemannFit::Map3xNdS<N, Stride> hits(phits + local_idx);
+      riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
+      riemannFit::Map6xNfS<N, Stride> hits_ge(phits_ge + local_idx);
+      double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
+      // Reference override BEFORE any reference-dependent preparation.
+      if (iterFromPhase_) {
+        fast_fit(0) = phase[kBLPhaseNextRef + 0];
+        fast_fit(1) = phase[kBLPhaseNextRef + 1];
+        fast_fit(2) = phase[kBLPhaseNextRef + 2];
+        fast_fit(3) = phase[kBLPhaseNextRef + 3];
       }
+      // Per-track effective field; with bMap_ null this is the scalar bField.
+      const double bFieldEff =
+          fieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
+      // Publish this linearization's effective field so the out and outlier phases read it instead of
+      // re-running the same O(N) two-bilinears-per-hit map loop on the same fast_fit. Written on every
+      // prep, so each phase always sees its own iteration's value. When the value CAME from the slot it
+      // is already there, and rewriting it would only cost a store.
+      if (!fieldFromPhase_)
+        phase[kBLPhaseBFieldEff] = bFieldEff;
+      static_assert(int(N) <= kBLPhaseMatMax, "the phase buffer's matXX0 window must cover N");
+      brokenline::PreparedGblData<N> data;
+      // Per-gap two-thin partition of the exact-split material model, written by prepareGblFitData
+      // (uninitialized here: it writes every slot before anything reads one).
+      double gapD1[N], gapW1[N];
+      // The ionization columns of the same gaps, from the same walk.
+      blMaterialMap::ElossColumn matCol[N];
+      // On a re-linearization the material rows are loaded from the phase buffer (see
+      // prepareGblFitData's matCached contract); otherwise they are marched from the map and stored.
+      brokenline::prepareGblFitData(acc,
+                                    hits,
+                                    fast_fit,
+                                    bFieldEff,
+                                    rhoMap_,
+                                    data,
+                                    matFromPhase_ ? (phase + kBLPhaseMatOff) : nullptr,
+                                    gapD1,
+                                    gapW1,
+                                    matCol);
+      constexpr int kSlotNodes = generalBrokenLine::kGblSplitNodes<(
+          int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N)
+                                                                : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
+      generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
+      double innerD1 = 0., innerW1 = 0.;
+      if (matFromPhase_) {
+        // The upstream two-thin split is a function of hit 0 alone, so it rides the same cache.
+        // Loaded unconditionally: the iteration-0 prep left 0/0 here whenever innerXX0 was not
+        // positive, which is exactly what the else branch would produce.
+        innerD1 = phase[kBLPhaseInnerD1];
+        innerW1 = phase[kBLPhaseInnerW1];
+      } else {
+        // one rule for the whole trajectory: the beamline->hit0 moments come from the same cell walk
+        // as the gaps (its W is the innerXX0 already stored).
+        const double rHit0 = alpaka::math::sqrt(acc, hits(0, 0) * hits(0, 0) + hits(1, 0) * hits(1, 0));
+        brokenline::segmentXX0Moments(acc, rhoMap_, 0., 0., rHit0, hits(2, 0), innerD1, innerW1);
+      }
+      if (matFromPhase_) {
+        for (int i = 0; i < int(N); ++i) {
+          gapD1[i] = phase[kBLPhaseGapD1 + i];
+          gapW1[i] = phase[kBLPhaseGapW1 + i];
+          matCol[i] = {
+              phase[kBLPhaseMatCol + 3 * i], phase[kBLPhaseMatCol + 3 * i + 1], phase[kBLPhaseMatCol + 3 * i + 2]};
+        }
+        data.innerCol = {phase[kBLPhaseInnerCol], phase[kBLPhaseInnerCol + 1], phase[kBLPhaseInnerCol + 2]};
+      }
+      if (!matFromPhase_) {  // publish the invariant rows for the next linearization
+        for (int i = 0; i < int(N); ++i)
+          phase[kBLPhaseMatOff + i] = data.matXX0(i);
+        phase[kBLPhaseMatOff + int(N)] = data.innerXX0;  // matCached[n], see the layout comment
+        phase[kBLPhaseInnerD1] = innerD1;
+        phase[kBLPhaseInnerW1] = innerW1;
+        for (int i = 0; i < int(N); ++i) {
+          phase[kBLPhaseGapD1 + i] = gapD1[i];
+          phase[kBLPhaseGapW1 + i] = gapW1[i];
+          phase[kBLPhaseMatCol + 3 * i] = matCol[i].e;
+          phase[kBLPhaseMatCol + 3 * i + 1] = matCol[i].eLnI;
+          phase[kBLPhaseMatCol + 3 * i + 2] = matCol[i].eLnRho;
+        }
+        phase[kBLPhaseInnerCol] = data.innerCol.e;
+        phase[kBLPhaseInnerCol + 1] = data.innerCol.eLnI;
+        phase[kBLPhaseInnerCol + 2] = data.innerCol.eLnRho;
+      }
+      // hit0->PCA backward transport: only the hits-only node layout uses it, so it is set by
+      // prepareGblData; identity here keeps the phase buffer defined when a layout that extracts at
+      // node 0 (the inner-node layout, and the split) is built instead.
+      generalBrokenLine::Matrix5d jacBack = generalBrokenLine::Matrix5d::Identity();
+      bool usedInner = false;
+      bool usedSplit = false;
+      if constexpr (int(N) >= 3) {
+        // the 2N+1 layout. It refuses a track whose gaps cannot carry an interior scatterer at all;
+        // that track then takes the arrival-node layout below, which is well posed for any gap.
+        usedSplit = generalBrokenLine::prepareGblDataSplit<Acc1D, N>(acc,
+                                                                     hits,
+                                                                     hits_ge,
+                                                                     fast_fit,
+                                                                     bFieldEff,
+                                                                     data.qCharge,
+                                                                     data.sTransverse,
+                                                                     data.sTotal,
+                                                                     data.matXX0,
+                                                                     gapD1,
+                                                                     gapW1,
+                                                                     data.innerXX0,
+                                                                     innerD1,
+                                                                     innerW1,
+                                                                     gnodes,
+                                                                     /*msScale=*/1.0,
+                                                                     kApplyELossCorrection,
+                                                                     chargeSymmetric_ ? bMap_ : nullptr,
+                                                                     bField,
+                                                                     trajectoryCorrections_,
+                                                                     scatteringLogAtTotal_,
+                                                                     elossCumulative_,
+                                                                     matCol,
+                                                                     data.innerCol);
+      }
+      if (!usedSplit)
+        generalBrokenLine::prepareGblData<Acc1D, N>(acc,
+                                                    hits,
+                                                    hits_ge,
+                                                    fast_fit,
+                                                    bFieldEff,
+                                                    data.qCharge,
+                                                    data.sTransverse,
+                                                    data.sTotal,
+                                                    data.matXX0,
+                                                    data.innerXX0,
+                                                    gnodes,
+                                                    /*msScale=*/1.0,
+                                                    kApplyELossCorrection,
+                                                    &jacBack,
+                                                    innerD1,
+                                                    innerW1,
+                                                    &usedInner,
+                                                    chargeSymmetric_ ? bMap_ : nullptr,
+                                                    bField,
+                                                    trajectoryCorrections_,
+                                                    scatteringLogAtTotal_,
+                                                    elossCumulative_,
+                                                    matCol,
+                                                    data.innerCol);
+#ifdef BL_LAYER_DUMP
+      // BL_LAYER_DUMP: fit-input trace, one block per track per linearization -- the reference fast fit,
+      // the field, the charge and the material this pass was built on, plus every hit and its ge error
+      // row. The last block emitted for a tkid is the final linearization, whose solve produces the
+      // published state. Run single-threaded on the serial backend so a track's TRK/HIT lines stay
+      // contiguous in stdout.
+      const auto tkid = ptkids[local_idx];  // the dump is this phase's only consumer of the tuple id
+      printf("BLDUMP_TRK %u N %d bfield %.17g ff %.17g %.17g %.17g %.17g q %d innerXX0 %.17g\n",
+             (unsigned)tkid,
+             int(N),
+             bField,
+             fast_fit(0),
+             fast_fit(1),
+             fast_fit(2),
+             fast_fit(3),
+             data.qCharge,
+             double(data.innerXX0));
+      for (int i = 0; i < int(N); ++i)
+        printf("BLDUMP_HIT %u %d %.17g %.17g %.17g %.9g %.9g %.9g %.9g %.9g %.9g %.17g\n",
+               (unsigned)tkid,
+               i,
+               hits(0, i),
+               hits(1, i),
+               hits(2, i),
+               hits_ge(0, i),
+               hits_ge(1, i),
+               hits_ge(2, i),
+               hits_ge(3, i),
+               hits_ge(4, i),
+               hits_ge(5, i),
+               i < int(N) - 1 ? double(data.matXX0(i)) : 0.0);
+#endif
+      phase[kBLPhaseSplit] = usedSplit ? 1. : 0.;
+      for (int r = 0; r < 5; ++r)
+        for (int c = 0; c < 5; ++c)
+          phase[kBLPhaseJacBack + 5 * r + c] = jacBack(r, c);
+      phase[kBLPhaseUsedInner] = usedInner ? 1. : 0.;
+      phase[kBLPhaseQCharge] = double(data.qCharge);
+      phase[kBLPhaseSTrans0] = double(data.sTransverse(0));
+      phase[kBLPhaseInnerXX0] = double(data.innerXX0);
     }
   };
 
@@ -1098,60 +1138,48 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // one this solve's own influence vector defines (see blKernelWeightedBField); off, this phase writes
     // no field and the hit-count average stands.
     bool fieldKernelWeights_ = false;
-    ALPAKA_FN_ACC void operator()(Acc1D const& acc,
-                                  double bField,
-                                  typename caStructures::tindex_type const* __restrict__ ptkids,
-                                  double* __restrict__ phits,
-                                  double* __restrict__ pfast_fit,
-                                  generalBrokenLine::GblNodeData* __restrict__ pgnodes,
-                                  double* __restrict__ pscratch,
-                                  double* __restrict__ pphase) const {
-      constexpr auto invalidTkId = std::numeric_limits<typename caStructures::tindex_type>::max();
-      const auto nt = Stride;
-      for (auto local_idx : cms::alpakatools::uniform_elements(acc, nt)) {
-        if (invalidTkId == ptkids[local_idx])
-          break;
-        riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
-        constexpr int kSlotNodes = generalBrokenLine::kGblSplitNodes<(
-            int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N)
-                                                                  : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
-        generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
-        // sized for the widest node chain this lane can build: the exact split's 2N+1 nodes when the
-        // material model is on, the arrival-node layout's N+2 otherwise. One stride for both, so the
-        // solve's band region and the outlier phase's pull region never overlap in either layout.
-        constexpr int kSplitN = generalBrokenLine::kGblSplitNodes<N> - 1;
-        constexpr int kBandDoubles = generalBrokenLine::kGblScratchDoubles<kSplitN>;
-        // Scratch overlay: gFullDelta lives in the head of the band region (= Mb); gNodeVar stays
-        // outside it. See GeneralBrokenLine.h for the lifetime proof.
-        constexpr int kNodeVarDoubles = 3 * (kSplitN + 1);
-        constexpr int kPullsDoubles = kNodeVarDoubles;
-        constexpr int kScratchStride = kBandDoubles + kPullsDoubles;
-        // structural guard: the N-1 branch has the smallest Mb of the three layouts.
-        static_assert((2 * kSplitN + 3) <= 2 * int(N) * (generalBrokenLine::kGblBand + 1),
-                      "scratch overlay: fullDelta does not fit inside Mb");
-        double* gblScratch = pscratch + std::size_t(local_idx) * std::size_t(kScratchStride);
-        double* gFullDelta = gblScratch;
-        double* gNodeVar = gblScratch + kBandDoubles;
-        double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
-        const bool usedInner = phase[kBLPhaseUsedInner] != 0.;
-        const bool usedSplit = phase[kBLPhaseSplit] != 0.;
-        const int qCharge = int(phase[kBLPhaseQCharge]);
-        const bool wantPulls = outlierReject_ && finalIter_ && N >= 5;
-        generalBrokenLine::Vector5d corrPca, gcorr;
-        generalBrokenLine::Matrix5d covPca, gcov;
-        double gchi2 = 0.;
-        if (usedSplit) {
-          // 2N+1 nodes; like the inner-node layout, node 0 IS the PCA, so the extraction is exact.
-          covPca = generalBrokenLine::gblFitPca<Acc1D, kSplitN>(acc,
-                                                                gnodes,
-                                                                gblScratch,
-                                                                &corrPca,
-                                                                wantPulls ? gFullDelta : nullptr,
-                                                                &gchi2,
-                                                                wantPulls ? gNodeVar : nullptr,
-                                                                /*fullDeltaInScratch=*/true);
-        } else if (usedInner) {
-          covPca = generalBrokenLine::gblFitPca<Acc1D, N + 1>(acc,
+    // ONE LANE of this phase, pinned OUT OF LINE (BL_REFIT_NOINLINE): the fused kernel's trampoline calls
+    // THIS function.
+    ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
+                                              uint32_t local_idx,
+                                              double bField,
+                                              double* __restrict__ phits,
+                                              double* __restrict__ pfast_fit,
+                                              generalBrokenLine::GblNodeData* __restrict__ pgnodes,
+                                              double* __restrict__ pscratch,
+                                              double* __restrict__ pphase) const {
+      riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
+      constexpr int kSlotNodes = generalBrokenLine::kGblSplitNodes<(
+          int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N)
+                                                                : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
+      generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
+      // sized for the widest node chain this lane can build: the exact split's 2N+1 nodes when the
+      // material model is on, the arrival-node layout's N+2 otherwise. One stride for both, so the
+      // solve's band region and the outlier phase's pull region never overlap in either layout.
+      constexpr int kSplitN = generalBrokenLine::kGblSplitNodes<N> - 1;
+      constexpr int kBandDoubles = generalBrokenLine::kGblScratchDoubles<kSplitN>;
+      // Scratch overlay: gFullDelta lives in the head of the band region (= Mb); gNodeVar stays
+      // outside it. See GeneralBrokenLine.h for the lifetime proof.
+      constexpr int kNodeVarDoubles = 3 * (kSplitN + 1);
+      constexpr int kPullsDoubles = kNodeVarDoubles;
+      constexpr int kScratchStride = kBandDoubles + kPullsDoubles;
+      // structural guard: the N-1 branch has the smallest Mb of the three layouts.
+      static_assert((2 * kSplitN + 3) <= 2 * int(N) * (generalBrokenLine::kGblBand + 1),
+                    "scratch overlay: fullDelta does not fit inside Mb");
+      double* gblScratch = pscratch + std::size_t(local_idx) * std::size_t(kScratchStride);
+      double* gFullDelta = gblScratch;
+      double* gNodeVar = gblScratch + kBandDoubles;
+      double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
+      const bool usedInner = phase[kBLPhaseUsedInner] != 0.;
+      const bool usedSplit = phase[kBLPhaseSplit] != 0.;
+      const int qCharge = int(phase[kBLPhaseQCharge]);
+      const bool wantPulls = outlierReject_ && finalIter_ && N >= 5;
+      generalBrokenLine::Vector5d corrPca, gcorr;
+      generalBrokenLine::Matrix5d covPca, gcov;
+      double gchi2 = 0.;
+      if (usedSplit) {
+        // 2N+1 nodes; like the inner-node layout, node 0 IS the PCA, so the extraction is exact.
+        covPca = generalBrokenLine::gblFitPca<Acc1D, kSplitN>(acc,
                                                               gnodes,
                                                               gblScratch,
                                                               &corrPca,
@@ -1159,49 +1187,57 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                               &gchi2,
                                                               wantPulls ? gNodeVar : nullptr,
                                                               /*fullDeltaInScratch=*/true);
-        } else {
-          const double th2Inner = gnodes[1].hasScat ? 1.0 / gnodes[1].scatPrec(0, 0) : 0.0;
-          gnodes[1].hasScat = false;
-          gcov = generalBrokenLine::gblFitPca<Acc1D, N - 1>(acc,
-                                                            gnodes + 1,
+      } else if (usedInner) {
+        covPca = generalBrokenLine::gblFitPca<Acc1D, N + 1>(acc,
+                                                            gnodes,
                                                             gblScratch,
-                                                            &gcorr,
+                                                            &corrPca,
                                                             wantPulls ? gFullDelta : nullptr,
                                                             &gchi2,
                                                             wantPulls ? gNodeVar : nullptr,
                                                             /*fullDeltaInScratch=*/true);
-          generalBrokenLine::Matrix5d jacBack;
-          for (int r = 0; r < 5; ++r)
-            for (int c = 0; c < 5; ++c)
-              jacBack(r, c) = phase[kBLPhaseJacBack + 5 * r + c];
-          const double slopeQ = -double(qCharge) / fast_fit(3);
-          gcov(1, 1) += th2Inner;
-          gcov(2, 2) += th2Inner * (1.0 + slopeQ * slopeQ);
-          corrPca = jacBack * gcorr;
-          covPca = jacBack * gcov * jacBack.transpose();
-        }
-        phase[kBLPhaseGChi2] = gchi2;
-        for (int a = 0; a < 5; ++a)
-          phase[kBLPhaseCorrPca + a] = corrPca(a);
+      } else {
+        const double th2Inner = gnodes[1].hasScat ? 1.0 / gnodes[1].scatPrec(0, 0) : 0.0;
+        gnodes[1].hasScat = false;
+        gcov = generalBrokenLine::gblFitPca<Acc1D, N - 1>(acc,
+                                                          gnodes + 1,
+                                                          gblScratch,
+                                                          &gcorr,
+                                                          wantPulls ? gFullDelta : nullptr,
+                                                          &gchi2,
+                                                          wantPulls ? gNodeVar : nullptr,
+                                                          /*fullDeltaInScratch=*/true);
+        generalBrokenLine::Matrix5d jacBack;
         for (int r = 0; r < 5; ++r)
           for (int c = 0; c < 5; ++c)
-            phase[kBLPhaseCovPca + 5 * r + c] = covPca(r, c);
-        // Fit-consistent conversion field. The influence vector this solve just built is the only place the
-        // fit's own curvature weights exist, so the effective field is re-derived here and republished into
-        // the slot the extraction and outlier phases read; the prep of the NEXT linearization picks it up
-        // from the same slot. The solve's own arithmetic is untouched -- this reads w and the node
-        // precisions after the fact and writes one double.
-        if (fieldKernelWeights_ && bMap_ != nullptr && generalBrokenLine::kGblHasInfluence) {
-          constexpr int kInflInner = generalBrokenLine::kGblInfluenceOffset<N + 1>;
-          constexpr int kInflOuter = generalBrokenLine::kGblInfluenceOffset<N - 1>;
-          constexpr int kInflSplit = generalBrokenLine::kGblInfluenceOffset<kSplitN>;
-          const double* infl = gblScratch + (usedSplit ? kInflSplit : (usedInner ? kInflInner : kInflOuter));
-          const generalBrokenLine::GblNodeData* fitNodes = (usedSplit || usedInner) ? gnodes : gnodes + 1;
-          const int nFitNodes = usedSplit ? (kSplitN + 1) : (usedInner ? (int(N) + 2) : int(N));
-          riemannFit::Map3xNdS<N, Stride> hits(phits + local_idx);
-          phase[kBLPhaseBFieldEff] = blKernelWeightedBField(
-              acc, hits, int(N), fast_fit, qCharge, bField, bMap_, fitNodes, nFitNodes, infl, phase[kBLPhaseBFieldEff]);
-        }
+            jacBack(r, c) = phase[kBLPhaseJacBack + 5 * r + c];
+        const double slopeQ = -double(qCharge) / fast_fit(3);
+        gcov(1, 1) += th2Inner;
+        gcov(2, 2) += th2Inner * (1.0 + slopeQ * slopeQ);
+        corrPca = jacBack * gcorr;
+        covPca = jacBack * gcov * jacBack.transpose();
+      }
+      phase[kBLPhaseGChi2] = gchi2;
+      for (int a = 0; a < 5; ++a)
+        phase[kBLPhaseCorrPca + a] = corrPca(a);
+      for (int r = 0; r < 5; ++r)
+        for (int c = 0; c < 5; ++c)
+          phase[kBLPhaseCovPca + 5 * r + c] = covPca(r, c);
+      // Fit-consistent conversion field. The influence vector this solve just built is the only place the
+      // fit's own curvature weights exist, so the effective field is re-derived here and republished into
+      // the slot the extraction and outlier phases read; the prep of the NEXT linearization picks it up
+      // from the same slot. The solve's own arithmetic is untouched -- this reads w and the node
+      // precisions after the fact and writes one double.
+      if (fieldKernelWeights_ && bMap_ != nullptr) {
+        constexpr int kInflInner = generalBrokenLine::kGblInfluenceOffset<N + 1>;
+        constexpr int kInflOuter = generalBrokenLine::kGblInfluenceOffset<N - 1>;
+        constexpr int kInflSplit = generalBrokenLine::kGblInfluenceOffset<kSplitN>;
+        const double* infl = gblScratch + (usedSplit ? kInflSplit : (usedInner ? kInflInner : kInflOuter));
+        const generalBrokenLine::GblNodeData* fitNodes = (usedSplit || usedInner) ? gnodes : gnodes + 1;
+        const int nFitNodes = usedSplit ? (kSplitN + 1) : (usedInner ? (int(N) + 2) : int(N));
+        riemannFit::Map3xNdS<N, Stride> hits(phits + local_idx);
+        phase[kBLPhaseBFieldEff] = blKernelWeightedBField(
+            acc, hits, int(N), fast_fit, qCharge, bField, bMap_, fitNodes, nFitNodes, infl, phase[kBLPhaseBFieldEff]);
       }
     }
   };
@@ -1219,80 +1255,72 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // of the SAME iteration wrote it there). Only set where the prep is structurally guaranteed to have
     // run on this lane in this iteration: the refit ladder.
     bool bFieldFromPhase_ = false;
-    // Charge-symmetric corrections package (see the block at the head of BrokenLine.h). Two terms, both
-    // charge-odd by construction: on, the node-0 -> PCA step in gblHelixAtPca uses a SIGNED arc and the
-    // node prep adds the bending-field PROFILE deterministic offset; off, the arc is unsigned and no
-    // profile offset is applied. The second term additionally needs bMap_, so it is inert where the map
-    // is null.
+    // Charge-symmetric corrections package (see Kernel_BLFitPhasePrep::chargeSymmetric_).
     bool chargeSymmetric_ = false;
 
-    ALPAKA_FN_ACC void operator()(Acc1D const& acc,
-                                  double bField,
-                                  OutputSoAView results_view,
-                                  typename caStructures::tindex_type const* __restrict__ ptkids,
-                                  double* __restrict__ phits,
-                                  double* __restrict__ pfast_fit,
-                                  double* __restrict__ pphase) const {
-      constexpr auto invalidTkId = std::numeric_limits<typename caStructures::tindex_type>::max();
-      const auto nt = Stride;
-      for (auto local_idx : cms::alpakatools::uniform_elements(acc, nt)) {
-        if (invalidTkId == ptkids[local_idx])
-          break;
-        auto tkid = ptkids[local_idx];
-        riemannFit::Map3xNdS<N, Stride> hits(phits + local_idx);
-        riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
-        double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
-        const int qCharge = int(phase[kBLPhaseQCharge]);
-        const double sTrans0 = phase[kBLPhaseSTrans0];
-        const double gchi2 = phase[kBLPhaseGChi2];
-        // When bFieldFromPhase_ is set, THIS linearization's prep already evaluated blEffectiveBField on
-        // exactly this fast_fit and these hits (neither has been touched since) and published the double
-        // into the phase buffer, so re-running the O(N) two-bilinears-per-hit map loop here can only
-        // reproduce it. When it is false the field is recomputed here; with bMap_ null that call is a
-        // single early return anyway.
-        const double bFieldEff =
-            bFieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
-        generalBrokenLine::Vector5d corrPca;
-        generalBrokenLine::Matrix5d covPca;
-        for (int a = 0; a < 5; ++a)
-          corrPca(a) = phase[kBLPhaseCorrPca + a];
-        for (int r = 0; r < 5; ++r)
-          for (int c = 0; c < 5; ++c)
-            covPca(r, c) = phase[kBLPhaseCovPca + 5 * r + c];
-        generalBrokenLine::Vector5d hp;
-        generalBrokenLine::Matrix5d hc;
-        Eigen::Vector4d nextRef;
-        generalBrokenLine::gblHelixAtPca(
-            acc, fast_fit, qCharge, bFieldEff, sTrans0, hits(2, 0), corrPca, covPca, hp, hc, &nextRef, chargeSymmetric_);
-        phase[kBLPhaseNextRef + 0] = nextRef(0);
-        phase[kBLPhaseNextRef + 1] = nextRef(1);
-        phase[kBLPhaseNextRef + 2] = nextRef(2);
-        phase[kBLPhaseNextRef + 3] = nextRef(3);
-        const float ptVal = float(bFieldEff / alpaka::math::abs(acc, hp(2)));
-        hp(2) /= bFieldEff;
-        for (int a = 0; a < 5; ++a) {
-          hc(2, a) /= bFieldEff;
-          hc(a, 2) /= bFieldEff;
-        }
-        reco::copyFromDense(results_view, hp, hc, tkid);
-        results_view[tkid].pt() = ptVal;
-        results_view[tkid].eta() = alpaka::math::asinh(acc, hp(3));
-        const int ndof = 2 * N - 5;  // no outlier drop yet (the outlier phase overwrites on a drop)
-        results_view[tkid].chi2() = float(gchi2 / (ndof > 0 ? ndof : 1));
-        results_view[tkid].ndof() = int8_t(ndof > 0 ? ndof : 1);
-#ifdef BL_LAYER_DUMP
-        // BL_LAYER_DUMP -- the fitted state the host replay is checked against (SoA convention:
-        // hp(2) = 1/pt) plus the native chi2, in the same stdout stream as the input blocks above.
-        printf("BLDUMP_FIT %u hp %.17g %.17g %.17g %.17g %.17g chi2 %.17g\n",
-               (unsigned)tkid,
-               hp(0),
-               hp(1),
-               hp(2),
-               hp(3),
-               hp(4),
-               gchi2);
-#endif
+    // One lane of this phase, pinned out of line (BL_REFIT_NOINLINE): the fused kernel's trampoline calls it.
+    ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
+                                              uint32_t local_idx,
+                                              double bField,
+                                              OutputSoAView results_view,
+                                              typename caStructures::tindex_type const* __restrict__ ptkids,
+                                              double* __restrict__ phits,
+                                              double* __restrict__ pfast_fit,
+                                              double* __restrict__ pphase) const {
+      auto tkid = ptkids[local_idx];
+      riemannFit::Map3xNdS<N, Stride> hits(phits + local_idx);
+      riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
+      double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
+      const int qCharge = int(phase[kBLPhaseQCharge]);
+      const double sTrans0 = phase[kBLPhaseSTrans0];
+      const double gchi2 = phase[kBLPhaseGChi2];
+      // When bFieldFromPhase_ is set, THIS linearization's prep already evaluated blEffectiveBField on
+      // exactly this fast_fit and these hits (neither has been touched since) and published the double
+      // into the phase buffer, so re-running the O(N) two-bilinears-per-hit map loop here can only
+      // reproduce it. When it is false the field is recomputed here; with bMap_ null that call is a
+      // single early return anyway.
+      const double bFieldEff =
+          bFieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
+      generalBrokenLine::Vector5d corrPca;
+      generalBrokenLine::Matrix5d covPca;
+      for (int a = 0; a < 5; ++a)
+        corrPca(a) = phase[kBLPhaseCorrPca + a];
+      for (int r = 0; r < 5; ++r)
+        for (int c = 0; c < 5; ++c)
+          covPca(r, c) = phase[kBLPhaseCovPca + 5 * r + c];
+      generalBrokenLine::Vector5d hp;
+      generalBrokenLine::Matrix5d hc;
+      Eigen::Vector4d nextRef;
+      generalBrokenLine::gblHelixAtPca(
+          acc, fast_fit, qCharge, bFieldEff, sTrans0, hits(2, 0), corrPca, covPca, hp, hc, &nextRef, chargeSymmetric_);
+      phase[kBLPhaseNextRef + 0] = nextRef(0);
+      phase[kBLPhaseNextRef + 1] = nextRef(1);
+      phase[kBLPhaseNextRef + 2] = nextRef(2);
+      phase[kBLPhaseNextRef + 3] = nextRef(3);
+      const float ptVal = float(bFieldEff / alpaka::math::abs(acc, hp(2)));
+      hp(2) /= bFieldEff;
+      for (int a = 0; a < 5; ++a) {
+        hc(2, a) /= bFieldEff;
+        hc(a, 2) /= bFieldEff;
       }
+      reco::copyFromDense(results_view, hp, hc, tkid);
+      results_view[tkid].pt() = ptVal;
+      results_view[tkid].eta() = alpaka::math::asinh(acc, hp(3));
+      const int ndof = 2 * N - 5;  // no outlier drop yet (the outlier phase overwrites on a drop)
+      results_view[tkid].chi2() = float(gchi2 / (ndof > 0 ? ndof : 1));
+      results_view[tkid].ndof() = int8_t(ndof > 0 ? ndof : 1);
+#ifdef BL_LAYER_DUMP
+      // BL_LAYER_DUMP: the fitted state (SoA convention: hp(2) = 1/pt) plus the native chi2, in the same
+      // stdout stream as the input blocks above.
+      printf("BLDUMP_FIT %u hp %.17g %.17g %.17g %.17g %.17g chi2 %.17g\n",
+             (unsigned)tkid,
+             hp(0),
+             hp(1),
+             hp(2),
+             hp(3),
+             hp(4),
+             gchi2);
+#endif
     }
   };
 
@@ -1303,6 +1331,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   struct Kernel_BLFitPhaseOutlier {
   public:
     const bool outlierReject_ = true;
+    // When BOTH pointers are non-null (the merger refit, when the fit-rejected hit is to be removed from
+    // the emitted list) and a hit is dropped, name the dropped hit into dropHitId_[tkid] using the
+    // per-lane fitHitId_ table. Both null wherever the caller left that compaction off, and nothing is written.
+    const uint32_t* __restrict__ fitHitId_ = nullptr;
+    uint32_t* __restrict__ dropHitId_ = nullptr;
+    // Core-protected outlier: when coreProtect_ and fitHitIsCore_ are set, the worst-pull scan skips
+    // ORIGINAL PIXEL-CORE nodes (fitHitIsCore_[lane*kRefitFitIdQuota + i] != 0), so the drop can only ever land on an
+    // appended extra. With coreProtect_ false / fitHitIsCore_ null the scan considers every node.
+    const uint8_t* __restrict__ fitHitIsCore_ = nullptr;
+    bool coreProtect_ = false;
     // Normalized (Bz,Br) r-z field map. When set, the re-solve's curvature->pT conversion + PCA perigee
     // use a per-track hit-averaged effective field; when null (as on the CA path) they use the scalar
     // bField.
@@ -1311,12 +1349,433 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // the value in the buffer is the final linearization's -- exactly what its own recompute would yield
     // (fast_fit is not touched after the final prep).
     bool bFieldFromPhase_ = false;
-    // Charge-symmetric corrections package (see the block at the head of BrokenLine.h). Two terms, both
-    // charge-odd by construction: on, the node-0 -> PCA step in gblHelixAtPca uses a SIGNED arc and the
-    // node prep adds the bending-field PROFILE deterministic offset; off, the arc is unsigned and no
-    // profile offset is applied. The second term additionally needs bMap_, so it is inert where the map
-    // is null.
+    // Charge-symmetric corrections package (see Kernel_BLFitPhasePrep::chargeSymmetric_).
     bool chargeSymmetric_ = false;
+    // One lane of this phase, pinned out of line (BL_REFIT_NOINLINE): the fused kernel's trampoline
+    // calls this one compiled function. The invalid-tkid sentinel is not tested here: the caller tests
+    // it before dispatching.
+    ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
+                                              uint32_t local_idx,
+                                              double bField,
+                                              OutputSoAView results_view,
+                                              typename caStructures::tindex_type const* __restrict__ ptkids,
+                                              double* __restrict__ phits,
+                                              double* __restrict__ pfast_fit,
+                                              generalBrokenLine::GblNodeData* __restrict__ pgnodes,
+                                              double* __restrict__ pscratch,
+                                              double* __restrict__ pphase) const {
+      auto tkid = ptkids[local_idx];
+      riemannFit::Map3xNdS<N, Stride> hits(phits + local_idx);
+      riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
+      constexpr int kSlotNodes = generalBrokenLine::kGblSplitNodes<(
+          int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N)
+                                                                : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
+      generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
+      // sized for the widest node chain this lane can build: the exact split's 2N+1 nodes when the
+      // material model is on, the arrival-node layout's N+2 otherwise. One stride for both, so the
+      // solve's band region and the outlier phase's pull region never overlap in either layout.
+      constexpr int kSplitN = generalBrokenLine::kGblSplitNodes<N> - 1;
+      constexpr int kBandDoubles = generalBrokenLine::kGblScratchDoubles<kSplitN>;
+      // Scratch overlay: gFullDelta lives in the head of the band region (= Mb); gNodeVar stays
+      // outside it. See GeneralBrokenLine.h for the lifetime proof.
+      constexpr int kNodeVarDoubles = 3 * (kSplitN + 1);
+      constexpr int kPullsDoubles = kNodeVarDoubles;
+      constexpr int kScratchStride = kBandDoubles + kPullsDoubles;
+      // structural guard: the N-1 branch has the smallest Mb of the three layouts.
+      static_assert((2 * kSplitN + 3) <= 2 * int(N) * (generalBrokenLine::kGblBand + 1),
+                    "scratch overlay: fullDelta does not fit inside Mb");
+      double* gblScratch = pscratch + std::size_t(local_idx) * std::size_t(kScratchStride);
+      double* gFullDelta = gblScratch;
+      double* gNodeVar = gblScratch + kBandDoubles;
+      double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
+      const bool usedInner = phase[kBLPhaseUsedInner] != 0.;
+      const int qCharge = int(phase[kBLPhaseQCharge]);
+      const double sTrans0 = phase[kBLPhaseSTrans0];
+      const double innerXX0 = phase[kBLPhaseInnerXX0];
+      // This linearization's effective field (see Kernel_BLFitPhaseOut::lane for the phase-buffer read).
+      const double bFieldEff =
+          bFieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
+      // The hits-only layout carrying upstream inner material cannot be re-solved faithfully, so it is
+      // excluded here; the launcher only runs this phase after the fit's final linearization.
+      const bool canResolve = outlierReject_ && (phase[kBLPhaseSplit] != 0. || usedInner || !(innerXX0 > 0.));
+      if (!canResolve)
+        return;
+      const bool usedSplit = phase[kBLPhaseSplit] != 0.;
+      generalBrokenLine::GblNodeData* fitNodes = (usedSplit || usedInner) ? gnodes : gnodes + 1;
+      const int nFitNodes = usedSplit ? (kSplitN + 1) : (usedInner ? (N + 2) : N);
+      auto uIdxOf = [](int k) { return 1 + 2 * k; };
+      double worst = 0.;
+      int worstNode = -1;
+      // Fit-hit index of the current measurement node (# measured nodes before k), used to look up
+      // its core flag. Advances only on measured nodes -- same mapping the drop-id emit below uses.
+      int diScan = 0;
+      const bool coreProtectOn = coreProtect_ && fitHitIsCore_ != nullptr;
+      // Worst pull among PROTECTED (core) nodes; it drives the abstain rule below.
+      double worstCore = 0.;
+      for (int k = 0; k < nFitNodes; ++k) {
+        if (!fitNodes[k].hasMeas)
+          continue;
+        const int diThis = diScan++;
+        const bool isCoreNode =
+            coreProtectOn &&
+            fitHitIsCore_[std::size_t(local_idx) * std::size_t(kRefitFitIdQuota) + std::size_t(diThis)] != 0;
+        // A core node is scanned but never becomes a drop CANDIDATE: it only feeds the worstCore
+        // shadow, which decides whether the stage abstains this round (see the decision below).
+        const double ru = fitNodes[k].measResidual(0) - gFullDelta[uIdxOf(k)];
+        const double rv = fitNodes[k].measResidual(1) - gFullDelta[uIdxOf(k) + 1];
+        const generalBrokenLine::Matrix2d V = generalBrokenLine::inv2(fitNodes[k].measPrec);
+        const double s00 = V(0, 0) - gNodeVar[3 * k];
+        const double s01 = V(0, 1) - gNodeVar[3 * k + 1];
+        const double s11 = V(1, 1) - gNodeVar[3 * k + 2];
+        const double det = s00 * s11 - s01 * s01;
+        if (s00 <= 0. || s11 <= 0. || det <= 0.)
+          continue;  // numerically non-PD residual covariance: no reliable pull
+        const double pull2 = (ru * (s11 * ru - s01 * rv) + rv * (s00 * rv - s01 * ru)) / det;
+        if (isCoreNode) {
+          if (pull2 > worstCore)  // shadow only; a core node is still never a real drop candidate
+            worstCore = pull2;
+          continue;
+        }
+        if (pull2 > worst) {
+          worst = pull2;
+          worstNode = k;
+        }
+      }
+      constexpr double kOutlierChi2Cut = 13.8;  // ~99.9% of the chi2 distribution for 2 dof
+      // Abstain when the largest-pull measured node is a protected core node: the evidence points at a
+      // hit the stage may not delete, and deleting the next-worst instead would be a different hypothesis
+      // that degrades the curvature resolution. The cut is not consulted: when worstCore <= worst the rule
+      // is inactive anyway, and when worstCore > worst the non-core candidate is the one being declined.
+      const bool abstain = coreProtectOn && worstCore > worst;
+      if (!abstain && worstNode >= 0 && worst > kOutlierChi2Cut) {
+        fitNodes[worstNode].hasMeas = false;
+        // The dropped measurement node maps to fit hit i = (# of measured nodes before it),
+        // and fitHitId_[lane*kRefitFitIdQuota + i] is that hit's raw id. Publish it so the merger drops it from the
+        // emitted hit list (nHits -> nMeasFit). Guarded on both pointers, so a caller that left them null
+        // gets no write.
+        if (fitHitId_ != nullptr && dropHitId_ != nullptr) {
+          int di = 0;
+          for (int k2 = 0; k2 < worstNode; ++k2)
+            if (fitNodes[k2].hasMeas)
+              ++di;
+          dropHitId_[tkid] = fitHitId_[std::size_t(local_idx) * std::size_t(kRefitFitIdQuota) + std::size_t(di)];
+        }
+        double gchi2 = 0.;
+        generalBrokenLine::Vector5d corrPca2;
+        generalBrokenLine::Matrix5d covPca2;
+        if (usedSplit) {
+          covPca2 = generalBrokenLine::gblFitPca<Acc1D, kSplitN>(acc, gnodes, gblScratch, &corrPca2, nullptr, &gchi2);
+        } else if (usedInner) {
+          covPca2 = generalBrokenLine::gblFitPca<Acc1D, N + 1>(acc, gnodes, gblScratch, &corrPca2, nullptr, &gchi2);
+        } else {  // canResolve guarantees no upstream re-add is needed here
+          covPca2 = generalBrokenLine::gblFitPca<Acc1D, N - 1>(acc, gnodes + 1, gblScratch, &corrPca2, nullptr, &gchi2);
+          generalBrokenLine::Matrix5d jacBack;
+          for (int r = 0; r < 5; ++r)
+            for (int c = 0; c < 5; ++c)
+              jacBack(r, c) = phase[kBLPhaseJacBack + 5 * r + c];
+          corrPca2 = jacBack * corrPca2;
+          covPca2 = jacBack * covPca2 * jacBack.transpose();
+        }
+        generalBrokenLine::Vector5d hp;
+        generalBrokenLine::Matrix5d hc;
+        generalBrokenLine::gblHelixAtPca(
+            acc, fast_fit, qCharge, bFieldEff, sTrans0, hits(2, 0), corrPca2, covPca2, hp, hc, nullptr, chargeSymmetric_);
+        const float ptVal = float(bFieldEff / alpaka::math::abs(acc, hp(2)));
+        hp(2) /= bFieldEff;
+        for (int a = 0; a < 5; ++a) {
+          hc(2, a) /= bFieldEff;
+          hc(a, 2) /= bFieldEff;
+        }
+        reco::copyFromDense(results_view, hp, hc, tkid);
+        results_view[tkid].pt() = ptVal;
+        results_view[tkid].eta() = alpaka::math::asinh(acc, hp(3));
+        const int ndof = 2 * (N - 1) - 5;  // one measurement dropped
+        results_view[tkid].chi2() = float(gchi2 / (ndof > 0 ? ndof : 1));
+        results_view[tkid].ndof() = int8_t(ndof > 0 ? ndof : 1);
+      }
+    }
+  };
+
+  // ---------------------------------------------------------------------------------------------
+  // THE FUSED PHASE LADDER. Run per bin, one (phase, iteration) of the refit ladder would be ten
+  // serialised launches, each with only a few hundred live lanes while the rest of the device idles; the
+  // solver is latency-bound (one thread marching a bordered-band double solve), so the per-bin
+  // serialisation starves occupancy. With the lane partition at the head of this file all ten bins are
+  // resident in one launch per (phase, iteration), and wall time becomes the slowest bin, not their sum.
+  // Bin b runs the out-of-line Kernel_BLFitPhase*<b+kRefitMinN>::lane (the trampolines below rebuild the
+  // bin's kernel object from the shared config); no lane body reads its lane index beyond its own
+  // addresses, so the arithmetic does not depend on where in the lane space a track lands.
+  //
+  // N-independent config of one fused launch: the members the per-N phase kernels carry, so one object
+  // serves all ten cases; the trampoline rebuilds the bin's kernel from it inside the callee's frame.
+  struct BLRefitFusedCfg {
+    const float* __restrict__ rhoMap = nullptr;
+    const float* __restrict__ bMap = nullptr;
+    const uint32_t* __restrict__ fitHitId = nullptr;
+    uint32_t* __restrict__ dropHitId = nullptr;
+    const uint8_t* __restrict__ fitHitIsCore = nullptr;
+    bool iterFromPhase = false;
+    bool matFromPhase = false;
+    bool fieldFromPhase = false;
+    bool bFieldFromPhase = false;
+    bool chargeSymmetric = false;
+    bool trajectoryCorrections = false;
+    bool scatteringLogAtTotal = false;
+    bool elossCumulative = false;
+    bool outlierReject = true;
+    bool finalIter = true;
+    bool fieldKernelWeights = false;
+    bool coreProtect = false;
+  };
+
+  template <int N, typename TrackerTraits, uint32_t Stride>
+  ALPAKA_FN_ACC BL_REFIT_NOINLINE void blFitPhasePrepLaneOutOfLine(
+      Acc1D const& acc,
+      BLRefitFusedCfg const& cfg,
+      uint32_t lane,
+      double bField,
+      typename caStructures::tindex_type const* __restrict__ ptkids,
+      double* __restrict__ phits,
+      float* __restrict__ phits_ge,
+      double* __restrict__ pfast_fit,
+      generalBrokenLine::GblNodeData* __restrict__ pgnodes,
+      double* __restrict__ pphase) {
+    const Kernel_BLFitPhasePrep<N, TrackerTraits, Stride> k{cfg.rhoMap,
+                                                            cfg.iterFromPhase,
+                                                            cfg.bMap,
+                                                            cfg.matFromPhase,
+                                                            cfg.fieldFromPhase,
+                                                            cfg.chargeSymmetric,
+                                                            cfg.trajectoryCorrections,
+                                                            cfg.scatteringLogAtTotal,
+                                                            cfg.elossCumulative};
+    k.lane(acc, lane, bField, ptkids, phits, phits_ge, pfast_fit, pgnodes, pphase);
+  }
+
+  template <int N, typename TrackerTraits, uint32_t Stride>
+  ALPAKA_FN_ACC BL_REFIT_NOINLINE void blFitPhaseSolveLaneOutOfLine(Acc1D const& acc,
+                                                                    BLRefitFusedCfg const& cfg,
+                                                                    uint32_t lane,
+                                                                    double bField,
+                                                                    double* __restrict__ phits,
+                                                                    double* __restrict__ pfast_fit,
+                                                                    generalBrokenLine::GblNodeData* __restrict__ pgnodes,
+                                                                    double* __restrict__ pscratch,
+                                                                    double* __restrict__ pphase) {
+    const Kernel_BLFitPhaseSolve<N, TrackerTraits, Stride> k{
+        cfg.outlierReject, cfg.finalIter, cfg.bMap, cfg.fieldKernelWeights};
+    k.lane(acc, lane, bField, phits, pfast_fit, pgnodes, pscratch, pphase);
+  }
+
+  template <int N, typename TrackerTraits, uint32_t Stride>
+  ALPAKA_FN_ACC BL_REFIT_NOINLINE void blFitPhaseOutLaneOutOfLine(
+      Acc1D const& acc,
+      BLRefitFusedCfg const& cfg,
+      uint32_t lane,
+      double bField,
+      OutputSoAView results_view,
+      typename caStructures::tindex_type const* __restrict__ ptkids,
+      double* __restrict__ phits,
+      double* __restrict__ pfast_fit,
+      double* __restrict__ pphase) {
+    const Kernel_BLFitPhaseOut<N, TrackerTraits, Stride> k{cfg.bMap, cfg.bFieldFromPhase, cfg.chargeSymmetric};
+    k.lane(acc, lane, bField, results_view, ptkids, phits, pfast_fit, pphase);
+  }
+
+  template <int N, typename TrackerTraits, uint32_t Stride>
+  ALPAKA_FN_ACC BL_REFIT_NOINLINE void blFitPhaseOutlierLaneOutOfLine(
+      Acc1D const& acc,
+      BLRefitFusedCfg const& cfg,
+      uint32_t lane,
+      double bField,
+      OutputSoAView results_view,
+      typename caStructures::tindex_type const* __restrict__ ptkids,
+      double* __restrict__ phits,
+      double* __restrict__ pfast_fit,
+      generalBrokenLine::GblNodeData* __restrict__ pgnodes,
+      double* __restrict__ pscratch,
+      double* __restrict__ pphase) {
+    const Kernel_BLFitPhaseOutlier<N, TrackerTraits, Stride> k{cfg.outlierReject,
+                                                               cfg.fitHitId,
+                                                               cfg.dropHitId,
+                                                               cfg.fitHitIsCore,
+                                                               cfg.coreProtect,
+                                                               cfg.bMap,
+                                                               cfg.bFieldFromPhase,
+                                                               cfg.chargeSymmetric};
+    k.lane(acc, lane, bField, results_view, ptkids, phits, pfast_fit, pgnodes, pscratch, pphase);
+  }
+
+  // THE FUSED KERNELS. The block index picks the bin (and its compile-time N) out of the device table
+  // Kernel_BLRefitLaneRanges wrote; the block's elements are the bin's lanes. One bin per block, so the
+  // switch over N cannot diverge inside a warp; an unused block returns at once.
+  template <typename TrackerTraits, uint32_t Stride>
+  struct Kernel_BLFitPhasePrepFused {
+    static_assert(Stride == HelixFit<TrackerTraits>::kRefitStride, "the fused ladder spans the refit lane buffer");
+    BLRefitFusedCfg cfg_;
+
+    ALPAKA_FN_ACC void operator()(Acc1D const& acc,
+                                  double bField,
+                                  typename caStructures::tindex_type const* __restrict__ ptkids,
+                                  double* __restrict__ phits,
+                                  float* __restrict__ phits_ge,
+                                  double* __restrict__ pfast_fit,
+                                  generalBrokenLine::GblNodeData* __restrict__ pgnodes,
+                                  double* __restrict__ pphase,
+                                  const uint32_t* __restrict__ pBlockMap) const {
+      constexpr auto invalidTkId = std::numeric_limits<typename caStructures::tindex_type>::max();
+      constexpr uint32_t kTotal = kFusedBlocks * kFitBlock;
+      for (uint32_t blk : cms::alpakatools::uniform_groups(acc, kTotal)) {
+        const uint32_t bin = pBlockMap[kRefitBlockMapStride * blk];
+        if (bin >= kRefitNBins)
+          continue;  // idle block: this round's partition did not need it
+        const uint32_t laneLo = pBlockMap[kRefitBlockMapStride * blk + 1];
+        const uint32_t laneHi = pBlockMap[kRefitBlockMapStride * blk + 2];
+        for (auto el : cms::alpakatools::uniform_group_elements(acc, blk, kTotal)) {
+          const uint32_t local_idx = laneLo + uint32_t(el.local);
+          if (local_idx >= laneHi)
+            break;
+          // Safety net only: a bin's range IS its exact count, so the scan fills every lane of it and
+          // the sentinel cannot be reached unless the count and the fill ever disagree.
+          if (invalidTkId == ptkids[local_idx])
+            continue;
+#define BL_REFIT_FUSED_PREP_CASE(BIN)                                                       \
+  case (BIN):                                                                               \
+    blFitPhasePrepLaneOutOfLine<(BIN) + kRefitMinN, TrackerTraits, Stride>(                 \
+        acc, cfg_, local_idx, bField, ptkids, phits, phits_ge, pfast_fit, pgnodes, pphase); \
+    break
+          switch (bin) {
+            BL_REFIT_FUSED_PREP_CASE(0);
+            BL_REFIT_FUSED_PREP_CASE(1);
+            BL_REFIT_FUSED_PREP_CASE(2);
+            BL_REFIT_FUSED_PREP_CASE(3);
+            BL_REFIT_FUSED_PREP_CASE(4);
+            BL_REFIT_FUSED_PREP_CASE(5);
+            BL_REFIT_FUSED_PREP_CASE(6);
+            BL_REFIT_FUSED_PREP_CASE(7);
+            BL_REFIT_FUSED_PREP_CASE(8);
+            BL_REFIT_FUSED_PREP_CASE(9);
+            default:
+              break;
+          }
+#undef BL_REFIT_FUSED_PREP_CASE
+        }
+      }
+    }
+  };
+
+  template <typename TrackerTraits, uint32_t Stride>
+  struct Kernel_BLFitPhaseSolveFused {
+    static_assert(Stride == HelixFit<TrackerTraits>::kRefitStride, "the fused ladder spans the refit lane buffer");
+    BLRefitFusedCfg cfg_;
+
+    ALPAKA_FN_ACC void operator()(Acc1D const& acc,
+                                  double bField,
+                                  typename caStructures::tindex_type const* __restrict__ ptkids,
+                                  double* __restrict__ phits,
+                                  double* __restrict__ pfast_fit,
+                                  generalBrokenLine::GblNodeData* __restrict__ pgnodes,
+                                  double* __restrict__ pscratch,
+                                  double* __restrict__ pphase,
+                                  const uint32_t* __restrict__ pBlockMap) const {
+      constexpr auto invalidTkId = std::numeric_limits<typename caStructures::tindex_type>::max();
+      constexpr uint32_t kTotal = kFusedBlocks * kFitBlock;
+      for (uint32_t blk : cms::alpakatools::uniform_groups(acc, kTotal)) {
+        const uint32_t bin = pBlockMap[kRefitBlockMapStride * blk];
+        if (bin >= kRefitNBins)
+          continue;
+        const uint32_t laneLo = pBlockMap[kRefitBlockMapStride * blk + 1];
+        const uint32_t laneHi = pBlockMap[kRefitBlockMapStride * blk + 2];
+        for (auto el : cms::alpakatools::uniform_group_elements(acc, blk, kTotal)) {
+          const uint32_t local_idx = laneLo + uint32_t(el.local);
+          if (local_idx >= laneHi)
+            break;
+          if (invalidTkId == ptkids[local_idx])
+            continue;
+#define BL_REFIT_FUSED_SOLVE_CASE(BIN)                                              \
+  case (BIN):                                                                       \
+    blFitPhaseSolveLaneOutOfLine<(BIN) + kRefitMinN, TrackerTraits, Stride>(        \
+        acc, cfg_, local_idx, bField, phits, pfast_fit, pgnodes, pscratch, pphase); \
+    break
+          switch (bin) {
+            BL_REFIT_FUSED_SOLVE_CASE(0);
+            BL_REFIT_FUSED_SOLVE_CASE(1);
+            BL_REFIT_FUSED_SOLVE_CASE(2);
+            BL_REFIT_FUSED_SOLVE_CASE(3);
+            BL_REFIT_FUSED_SOLVE_CASE(4);
+            BL_REFIT_FUSED_SOLVE_CASE(5);
+            BL_REFIT_FUSED_SOLVE_CASE(6);
+            BL_REFIT_FUSED_SOLVE_CASE(7);
+            BL_REFIT_FUSED_SOLVE_CASE(8);
+            BL_REFIT_FUSED_SOLVE_CASE(9);
+            default:
+              break;
+          }
+#undef BL_REFIT_FUSED_SOLVE_CASE
+        }
+      }
+    }
+  };
+
+  template <typename TrackerTraits, uint32_t Stride>
+  struct Kernel_BLFitPhaseOutFused {
+    static_assert(Stride == HelixFit<TrackerTraits>::kRefitStride, "the fused ladder spans the refit lane buffer");
+    BLRefitFusedCfg cfg_;
+
+    ALPAKA_FN_ACC void operator()(Acc1D const& acc,
+                                  double bField,
+                                  OutputSoAView results_view,
+                                  typename caStructures::tindex_type const* __restrict__ ptkids,
+                                  double* __restrict__ phits,
+                                  double* __restrict__ pfast_fit,
+                                  double* __restrict__ pphase,
+                                  const uint32_t* __restrict__ pBlockMap) const {
+      constexpr auto invalidTkId = std::numeric_limits<typename caStructures::tindex_type>::max();
+      constexpr uint32_t kTotal = kFusedBlocks * kFitBlock;
+      for (uint32_t blk : cms::alpakatools::uniform_groups(acc, kTotal)) {
+        const uint32_t bin = pBlockMap[kRefitBlockMapStride * blk];
+        if (bin >= kRefitNBins)
+          continue;
+        const uint32_t laneLo = pBlockMap[kRefitBlockMapStride * blk + 1];
+        const uint32_t laneHi = pBlockMap[kRefitBlockMapStride * blk + 2];
+        for (auto el : cms::alpakatools::uniform_group_elements(acc, blk, kTotal)) {
+          const uint32_t local_idx = laneLo + uint32_t(el.local);
+          if (local_idx >= laneHi)
+            break;
+          if (invalidTkId == ptkids[local_idx])
+            continue;
+#define BL_REFIT_FUSED_OUT_CASE(BIN)                                                   \
+  case (BIN):                                                                          \
+    blFitPhaseOutLaneOutOfLine<(BIN) + kRefitMinN, TrackerTraits, Stride>(             \
+        acc, cfg_, local_idx, bField, results_view, ptkids, phits, pfast_fit, pphase); \
+    break
+          switch (bin) {
+            BL_REFIT_FUSED_OUT_CASE(0);
+            BL_REFIT_FUSED_OUT_CASE(1);
+            BL_REFIT_FUSED_OUT_CASE(2);
+            BL_REFIT_FUSED_OUT_CASE(3);
+            BL_REFIT_FUSED_OUT_CASE(4);
+            BL_REFIT_FUSED_OUT_CASE(5);
+            BL_REFIT_FUSED_OUT_CASE(6);
+            BL_REFIT_FUSED_OUT_CASE(7);
+            BL_REFIT_FUSED_OUT_CASE(8);
+            BL_REFIT_FUSED_OUT_CASE(9);
+            default:
+              break;
+          }
+#undef BL_REFIT_FUSED_OUT_CASE
+        }
+      }
+    }
+  };
+
+  // The outlier phase runs for N >= 5 only, so bins 0 and 1 fall through to `default` and are left
+  // untouched: their solve never filled the pulls the phase would read.
+  template <typename TrackerTraits, uint32_t Stride>
+  struct Kernel_BLFitPhaseOutlierFused {
+    static_assert(Stride == HelixFit<TrackerTraits>::kRefitStride, "the fused ladder spans the refit lane buffer");
+    BLRefitFusedCfg cfg_;
+
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   double bField,
                                   OutputSoAView results_view,
@@ -1325,136 +1784,197 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                   double* __restrict__ pfast_fit,
                                   generalBrokenLine::GblNodeData* __restrict__ pgnodes,
                                   double* __restrict__ pscratch,
-                                  double* __restrict__ pphase) const {
+                                  double* __restrict__ pphase,
+                                  const uint32_t* __restrict__ pBlockMap) const {
       constexpr auto invalidTkId = std::numeric_limits<typename caStructures::tindex_type>::max();
-      const auto nt = Stride;
-      for (auto local_idx : cms::alpakatools::uniform_elements(acc, nt)) {
-        if (invalidTkId == ptkids[local_idx])
-          break;
-        auto tkid = ptkids[local_idx];
-        riemannFit::Map3xNdS<N, Stride> hits(phits + local_idx);
-        riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
-        constexpr int kSlotNodes = generalBrokenLine::kGblSplitNodes<(
-            int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N)
-                                                                  : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
-        generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
-        // sized for the widest node chain this lane can build: the exact split's 2N+1 nodes when the
-        // material model is on, the arrival-node layout's N+2 otherwise. One stride for both, so the
-        // solve's band region and the outlier phase's pull region never overlap in either layout.
-        constexpr int kSplitN = generalBrokenLine::kGblSplitNodes<N> - 1;
-        constexpr int kBandDoubles = generalBrokenLine::kGblScratchDoubles<kSplitN>;
-        // Scratch overlay: gFullDelta lives in the head of the band region (= Mb); gNodeVar stays
-        // outside it. See GeneralBrokenLine.h for the lifetime proof.
-        constexpr int kNodeVarDoubles = 3 * (kSplitN + 1);
-        constexpr int kPullsDoubles = kNodeVarDoubles;
-        constexpr int kScratchStride = kBandDoubles + kPullsDoubles;
-        // structural guard: the N-1 branch has the smallest Mb of the three layouts.
-        static_assert((2 * kSplitN + 3) <= 2 * int(N) * (generalBrokenLine::kGblBand + 1),
-                      "scratch overlay: fullDelta does not fit inside Mb");
-        double* gblScratch = pscratch + std::size_t(local_idx) * std::size_t(kScratchStride);
-        double* gFullDelta = gblScratch;
-        double* gNodeVar = gblScratch + kBandDoubles;
-        double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
-        const bool usedInner = phase[kBLPhaseUsedInner] != 0.;
-        const int qCharge = int(phase[kBLPhaseQCharge]);
-        const double sTrans0 = phase[kBLPhaseSTrans0];
-        const double innerXX0 = phase[kBLPhaseInnerXX0];
-        // When bFieldFromPhase_ is set, THIS linearization's prep already evaluated blEffectiveBField on
-        // exactly this fast_fit and these hits (neither has been touched since) and published the double
-        // into the phase buffer, so re-running the O(N) two-bilinears-per-hit map loop here can only
-        // reproduce it. When it is false the field is recomputed here; with bMap_ null that call is a
-        // single early return anyway.
-        const double bFieldEff =
-            bFieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
-        // The hits-only layout carrying upstream inner material cannot be re-solved faithfully, so it is
-        // excluded here; the launcher only runs this phase after the fit's final linearization.
-        const bool canResolve = outlierReject_ && (phase[kBLPhaseSplit] != 0. || usedInner || !(innerXX0 > 0.));
-        if (!canResolve)
+      constexpr uint32_t kTotal = kFusedBlocks * kFitBlock;
+      for (uint32_t blk : cms::alpakatools::uniform_groups(acc, kTotal)) {
+        const uint32_t bin = pBlockMap[kRefitBlockMapStride * blk];
+        if (bin >= kRefitNBins)
           continue;
-        const bool usedSplit = phase[kBLPhaseSplit] != 0.;
-        generalBrokenLine::GblNodeData* fitNodes = (usedSplit || usedInner) ? gnodes : gnodes + 1;
-        const int nFitNodes = usedSplit ? (kSplitN + 1) : (usedInner ? (N + 2) : N);
-        auto uIdxOf = [](int k) { return 1 + 2 * k; };
-        double worst = 0.;
-        int worstNode = -1;
-        for (int k = 0; k < nFitNodes; ++k) {
-          if (!fitNodes[k].hasMeas)
+        const uint32_t laneLo = pBlockMap[kRefitBlockMapStride * blk + 1];
+        const uint32_t laneHi = pBlockMap[kRefitBlockMapStride * blk + 2];
+        for (auto el : cms::alpakatools::uniform_group_elements(acc, blk, kTotal)) {
+          const uint32_t local_idx = laneLo + uint32_t(el.local);
+          if (local_idx >= laneHi)
+            break;
+          if (invalidTkId == ptkids[local_idx])
             continue;
-          const double ru = fitNodes[k].measResidual(0) - gFullDelta[uIdxOf(k)];
-          const double rv = fitNodes[k].measResidual(1) - gFullDelta[uIdxOf(k) + 1];
-          const generalBrokenLine::Matrix2d V = generalBrokenLine::inv2(fitNodes[k].measPrec);
-          const double s00 = V(0, 0) - gNodeVar[3 * k];
-          const double s01 = V(0, 1) - gNodeVar[3 * k + 1];
-          const double s11 = V(1, 1) - gNodeVar[3 * k + 2];
-          const double det = s00 * s11 - s01 * s01;
-          if (s00 <= 0. || s11 <= 0. || det <= 0.)
-            continue;  // numerically non-PD residual covariance: no reliable pull
-          const double pull2 = (ru * (s11 * ru - s01 * rv) + rv * (s00 * rv - s01 * ru)) / det;
-          if (pull2 > worst) {
-            worst = pull2;
-            worstNode = k;
+#define BL_REFIT_FUSED_OUTLIER_CASE(BIN)                                                                  \
+  case (BIN):                                                                                             \
+    blFitPhaseOutlierLaneOutOfLine<(BIN) + kRefitMinN, TrackerTraits, Stride>(                            \
+        acc, cfg_, local_idx, bField, results_view, ptkids, phits, pfast_fit, pgnodes, pscratch, pphase); \
+    break
+          switch (bin) {
+            BL_REFIT_FUSED_OUTLIER_CASE(2);
+            BL_REFIT_FUSED_OUTLIER_CASE(3);
+            BL_REFIT_FUSED_OUTLIER_CASE(4);
+            BL_REFIT_FUSED_OUTLIER_CASE(5);
+            BL_REFIT_FUSED_OUTLIER_CASE(6);
+            BL_REFIT_FUSED_OUTLIER_CASE(7);
+            BL_REFIT_FUSED_OUTLIER_CASE(8);
+            BL_REFIT_FUSED_OUTLIER_CASE(9);
+            default:
+              break;  // bins 0 and 1 are N = 3, 4: no outlier phase
           }
-        }
-        constexpr double kOutlierChi2Cut = 13.8;  // ~99.9% of the chi2 distribution for 2 dof
-        if (worstNode >= 0 && worst > kOutlierChi2Cut) {
-          fitNodes[worstNode].hasMeas = false;
-          double gchi2 = 0.;
-          generalBrokenLine::Vector5d corrPca2;
-          generalBrokenLine::Matrix5d covPca2;
-          if (usedSplit) {
-            covPca2 = generalBrokenLine::gblFitPca<Acc1D, kSplitN>(acc, gnodes, gblScratch, &corrPca2, nullptr, &gchi2);
-          } else if (usedInner) {
-            covPca2 = generalBrokenLine::gblFitPca<Acc1D, N + 1>(acc, gnodes, gblScratch, &corrPca2, nullptr, &gchi2);
-          } else {  // canResolve guarantees no upstream re-add is needed here
-            covPca2 =
-                generalBrokenLine::gblFitPca<Acc1D, N - 1>(acc, gnodes + 1, gblScratch, &corrPca2, nullptr, &gchi2);
-            generalBrokenLine::Matrix5d jacBack;
-            for (int r = 0; r < 5; ++r)
-              for (int c = 0; c < 5; ++c)
-                jacBack(r, c) = phase[kBLPhaseJacBack + 5 * r + c];
-            corrPca2 = jacBack * corrPca2;
-            covPca2 = jacBack * covPca2 * jacBack.transpose();
-          }
-          generalBrokenLine::Vector5d hp;
-          generalBrokenLine::Matrix5d hc;
-          generalBrokenLine::gblHelixAtPca(acc,
-                                           fast_fit,
-                                           qCharge,
-                                           bFieldEff,
-                                           sTrans0,
-                                           hits(2, 0),
-                                           corrPca2,
-                                           covPca2,
-                                           hp,
-                                           hc,
-                                           nullptr,
-                                           chargeSymmetric_);
-          const float ptVal = float(bFieldEff / alpaka::math::abs(acc, hp(2)));
-          hp(2) /= bFieldEff;
-          for (int a = 0; a < 5; ++a) {
-            hc(2, a) /= bFieldEff;
-            hc(a, 2) /= bFieldEff;
-          }
-          reco::copyFromDense(results_view, hp, hc, tkid);
-          results_view[tkid].pt() = ptVal;
-          results_view[tkid].eta() = alpaka::math::asinh(acc, hp(3));
-          const int ndof = 2 * (N - 1) - 5;  // one measurement dropped
-          results_view[tkid].chi2() = float(gchi2 / (ndof > 0 ? ndof : 1));
-          results_view[tkid].ndof() = int8_t(ndof > 0 ? ndof : 1);
+#undef BL_REFIT_FUSED_OUTLIER_CASE
         }
       }
     }
   };
 
-  // Prepares the BLFit input buffers for the extended-N refit. Scans the tuple population, keeps
-  // only accepted-extended tuples (acceptedByTuple>=0) whose selected multiplicity falls in the
-  // current [nHitsL,nHitsH] N-bin, and dense-compacts them into ptkids/buffers via a grid atomic
-  // (ptkids pre-set to the invalid sentinel by the launcher, so the fit kernels' break-on-invalid
-  // tail scan is preserved). Per-hit position/error load: the merged SoA + innerSensorFrame, the same
-  // recipes Kernel_BLFastFit uses.
+#undef BL_REFIT_NOINLINE
+
+  // ---------------------------------------------------------------------------------------------
+  // Extended-N REFIT. After the merger's OT hit-attach rewrite, each accepted-extended track's REWRITTEN
+  // hit container holds its originals + attached extras (tagged OT-rechit ids carry bit30). A full GBL
+  // refit -- the OT lever arm shrinks the longitudinal/pT covariance -- overwrites the pre-refit state/cov/chi2.
+  // The fit kernels are hit-source agnostic (reused as-is); only the hit LOAD needs merged-vs-OT dispatch.
+  // Runs wherever refitExtended is called: refitMergedTwins and refitDedupUnions.
+  // ---------------------------------------------------------------------------------------------
+
+  // Fit-hit selection over the rewritten container (caFitHitSel::dedupWalk), but INCLUDING tagged
+  // OT-rechit ids (bit30): they index the raw OT source and must be counted as fit hits (unlike the
+  // verify guard, which SKIPS them). Same kMode filter + pixel-overlap dedup. k<0 -> count; k>=0 -> k-th.
+  template <typename TupleCont, typename HitsView>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE uint32_t
+  refitDedupWalk(TupleCont const* __restrict__ hitContainer, uint32_t it, HitsView hh, bool hasStubs, int k) {
+    auto const* hitId = hitContainer->begin(it);
+    auto const nhits = hitContainer->size(it);
+    auto const nTot = hh.metadata().size();
+    uint32_t nkept = 0;
+    int lastKeptJ = -1;
+    for (uint32_t j = 0; j < uint32_t(nhits); ++j) {
+      auto const h = hitId[j];
+      const bool ot = caOTHitTag::isOTId(h);
+      if (!ot && h >= static_cast<uint32_t>(nTot))
+        break;  // genuine content-overflow guard (untagged out-of-range id)
+      // OT extras count as stubs for the kMode filter; merged ids consult the SoA stub flag.
+      const bool hitIsStub = ot ? true : reco::isStub(hh, int32_t(h));
+      if (!caFitHitSel::useHit(hitIsStub, hasStubs))
+        continue;
+      // Merge only two consecutive kept MERGED-PIXEL hits (never an OT extra or a stub).
+      if (hasStubs && lastKeptJ >= 0 && !ot && !reco::isStub(hh, int32_t(h))) {
+        auto const hp = hitId[lastKeptJ];
+        if (!caOTHitTag::isOTId(hp) && !reco::isStub(hh, int32_t(hp))) {
+          float const dx = float(hh[h].xGlobal()) - float(hh[hp].xGlobal());
+          float const dy = float(hh[h].yGlobal()) - float(hh[hp].yGlobal());
+          if (dx * dx + dy * dy < caFitHitSel::kDedupDsMin2)
+            continue;
+        }
+      }
+      if (int(nkept) == k)
+        return j;
+      ++nkept;
+      lastKeptJ = int(j);
+    }
+    return nkept;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // THE DYNAMIC PARTITION, part 1: count. One launch for the WHOLE ladder -- nSel does not depend
+  // on N, so this kernel is not templated and one sweep produces all ten demands. It walks the same
+  // population/gates/refitDedupWalk as the per-bin scans, binned with refitBinOfNSel, so count and
+  // claim cannot disagree. The counters are the DEMAND of this round (exclude earlier-round seated).
+  // ---------------------------------------------------------------------------------------------
+  class Kernel_BLRefitBinCount {
+  public:
+    ALPAKA_FN_ACC void operator()(Acc1D const& acc,
+                                  Tuples const* __restrict__ hitContainer,
+                                  ::reco::TrackingRecHitConstView hh,
+                                  const int32_t* __restrict__ acceptedByTuple,
+                                  const uint8_t* __restrict__ pServed,
+                                  uint32_t* __restrict__ pCounts,
+                                  uint32_t maxFitSel,
+                                  uint32_t nTracksCap,
+                                  bool hasStubs) const {
+      const bool hasStubsRt = hasStubs && (static_cast<int32_t>(hh.offsetStubs()) >= 0);
+      for (auto tkid : cms::alpakatools::uniform_elements(acc, nTracksCap)) {
+        if (acceptedByTuple[tkid] < 0)
+          continue;
+        if (pServed != nullptr && pServed[tkid] != 0u)
+          continue;  // seated in an earlier round
+        const uint32_t nSel = refitDedupWalk(hitContainer, tkid, hh, hasStubsRt, /*k=*/-1);
+        const uint32_t bin = refitBinOfNSel(nSel, maxFitSel);
+        if (bin >= kRefitNBins)
+          continue;  // outside the ladder: no bin fits this track, exactly as in the per-bin scans
+        alpaka::atomicAdd(acc, pCounts + bin, 1u, alpaka::hierarchy::Grids{});
+      }
+    }
+  };
+
+  // ---------------------------------------------------------------------------------------------
+  // THE DYNAMIC PARTITION, part 2: ranges. Single-threaded, device-only (no host crossing): hands
+  // kRefitStride lanes out in bin order, writes the block->bin dispatch table (one bin per block,
+  // idle tail at kRefitNBins). The per-track served flag makes the round-bound exact.
+  // ---------------------------------------------------------------------------------------------
+  class Kernel_BLRefitLaneRanges {
+  public:
+    ALPAKA_FN_ACC void operator()(Acc1D const& acc,
+                                  const uint32_t* __restrict__ pCounts,
+                                  uint32_t* __restrict__ pRange,
+                                  uint32_t* __restrict__ pBlockMap,
+                                  uint32_t laneTotal) const {
+      if (alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0] != 0)
+        return;
+      uint32_t base = 0u;
+      for (uint32_t b = 0; b < kRefitNBins; ++b) {
+        const uint32_t want = pCounts[b];
+        const uint32_t room = (base < laneTotal) ? (laneTotal - base) : 0u;
+        const uint32_t got = (want < room) ? want : room;
+        pRange[kRefitRangeStride * b + 0] = base;
+        pRange[kRefitRangeStride * b + 1] = got;
+        base += got;
+      }
+      uint32_t blk = 0u;
+      for (uint32_t b = 0; b < kRefitNBins; ++b) {
+        const uint32_t lo = pRange[kRefitRangeStride * b + 0];
+        const uint32_t hi = lo + pRange[kRefitRangeStride * b + 1];
+        for (uint32_t l = lo; l < hi; l += kFitBlock) {
+          ALPAKA_ASSERT_ACC(blk < kFusedBlocks);  // sum_b ceil(n_b/kFitBlock) <= kFusedBlocks
+          const uint32_t e = (l + kFitBlock < hi) ? (l + kFitBlock) : hi;
+          pBlockMap[kRefitBlockMapStride * blk + 0] = b;
+          pBlockMap[kRefitBlockMapStride * blk + 1] = l;
+          pBlockMap[kRefitBlockMapStride * blk + 2] = e;
+          ++blk;
+        }
+      }
+      for (; blk < kFusedBlocks; ++blk) {
+        pBlockMap[kRefitBlockMapStride * blk + 0] = kRefitNBins;  // idle
+        pBlockMap[kRefitBlockMapStride * blk + 1] = 0u;
+        pBlockMap[kRefitBlockMapStride * blk + 2] = 0u;
+      }
+    }
+  };
+
+  // Prepares the BLFit input buffers for the extended-N refit. Keeps accepted-extended tuples whose
+  // selected multiplicity falls in [nHitsL,nHitsH], dense-compacts into ptkids/buffers via a grid atomic
+  // (ptkids pre-set to the invalid sentinel, preserving the fit kernels' break-on-invalid tail).
+  // Per-hit dispatch: raw OT SoA for tagged ids, merged SoA + innerSensorFrame otherwise (same as Kernel_BLFastFit).
   template <int N, uint32_t Stride = riemannFit::stride>
   class Kernel_BLFastFitRefit {
   public:
+    // OT source by value (as the extension kernels take it): default (nOTHits==0) => no tagged ids.
+    caExtension::OTHitsSource otSource_{};
+    // Per-lane record of the RAW hit id loaded into each fit slot (fitHitId_[lane*kRefitFitIdQuota + i] = id of fit
+    // hit i). The outlier phase maps its dropped measurement node back to this id so the merger can
+    // remove the fit-rejected hit from the emitted TrackHitSoA list. Null means no such record is kept.
+    uint32_t* __restrict__ fitHitId_ = nullptr;
+    // Core-protected outlier: per-lane record of whether each fit slot is an ORIGINAL PIXEL-CORE hit
+    // (id below offsetStubs, not a bit30 OT tag). The outlier phase reads it to restrict the drop to
+    // non-core (appended) nodes. Null (core protection off) means no such record is kept.
+    uint8_t* __restrict__ fitHitIsCore_ = nullptr;
+    // Device-resident lane range of this bin for this round, {firstLane, nLanes} at
+    // pLaneRange_[kRefitRangeStride*(N-kRefitMinN)], written by Kernel_BLRefitLaneRanges. Null means
+    // base 0 and the whole buffer stride (the extension's prediction scans, ExtPredCoeff.dev.cc).
+    // Launch-only: decides where, never a value.
+    const uint32_t* __restrict__ pLaneRange_ = nullptr;
+    // Per-track "already seated in an earlier round" flag, nTracksCap bytes. A track is skipped while
+    // it is set and it is set the moment the track claims a lane, so consecutive rounds partition the
+    // population exactly: each round seats min(remaining, capacity) tracks and none is seated twice.
+    // Null means single-round behaviour with no gate and no marking (the extension's prediction scans).
+    uint8_t* __restrict__ pServed_ = nullptr;
+
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   Tuples const* __restrict__ hitContainer,
                                   ::reco::TrackingRecHitConstView hh,
@@ -1468,23 +1988,30 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                   uint32_t nHitsL,
                                   uint32_t nHitsH,
                                   uint32_t nTracksCap,
-                                  bool hasStubs,
-                                  float yVarScale) const {  // 2S strip-length variance scale (1.f = as measured)
+                                  bool hasStubs) const {
       constexpr uint32_t hitsInFit = N;
-      const uint32_t nt = Stride;  // slot cap = this launch's buffer stride (refit: kRefitStride)
+      constexpr uint32_t kBin = uint32_t(N) - uint32_t(kRefitMinN);
+      // Where this bin's lanes are, and how many of them there are, in the shared stride-wide buffer.
+      // Without a range table this is the whole buffer from lane 0 (the extension's prediction scans).
+      const uint32_t laneBase = (pLaneRange_ != nullptr) ? pLaneRange_[kRefitRangeStride * kBin] : 0u;
+      const uint32_t nt = (pLaneRange_ != nullptr) ? pLaneRange_[kRefitRangeStride * kBin + 1] : Stride;
       const bool hasStubsRt = hasStubs && (static_cast<int32_t>(hh.offsetStubs()) >= 0);
       for (auto tkid : cms::alpakatools::uniform_elements(acc, nTracksCap)) {
         if (acceptedByTuple[tkid] < 0)
           continue;  // only accepted-extended tuples get refit
-        const uint32_t nSel = caFitHitSel::dedupWalk(hitContainer, tkid, hh, hasStubsRt, /*k=*/-1);
+        if (pServed_ != nullptr && pServed_[tkid] != 0u)
+          continue;  // already refit in an earlier round
+        const uint32_t nSel = refitDedupWalk(hitContainer, tkid, hh, hasStubsRt, /*k=*/-1);
         if (nSel < nHitsL || nSel > nHitsH)
           continue;  // not this N-bin
         const uint32_t slot = alpaka::atomicAdd(acc, pSlot, 1u, alpaka::hierarchy::Grids{});
         if (slot >= nt) {
-          // Slot-cap bind: this track keeps its unrefit CA state. Exactly one thread per launch
-          // observes slot == nt (the slot comes from a grid-scope atomicAdd), so the report below is
-          // one line per binding launch and the non-binding path costs a comparison.
-          if (slot == nt)
+          // Under the round loop (pServed_ set) this is the expected round overflow: the bin's lane
+          // range was cut by the round capacity and the track is simply left for the next round, so
+          // nothing is reported. Without a range table the slot cap binds and the
+          // track keeps its unrefit CA state: exactly one thread per launch observes slot == nt (the
+          // slot comes from a grid-scope atomicAdd), so the report is one line per binding launch.
+          if (pServed_ == nullptr && slot == nt)
             printf(
                 "[refit slot cap] BOUND: N-bin %u..%u demanded > kRefitStride %u; tracks beyond the cap keep "
                 "their unrefit CA state.\n",
@@ -1493,12 +2020,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                 nt);
           continue;
         }
-        ptkids[slot] = caStructures::tindex_type(tkid);
+        // The lane this claim owns in the shared buffer (laneBase is 0 without a range table).
+        const uint32_t lane = laneBase + slot;
+        if (pServed_ != nullptr)
+          pServed_[tkid] = 1u;  // seated: no later round may claim it again
+        ptkids[lane] = caStructures::tindex_type(tkid);
 
         auto const* hitId = hitContainer->begin(tkid);
-        riemannFit::Map3xNdS<N, Stride> hits(phits + slot);
-        riemannFit::Map4dS<Stride> fast_fit(pfast_fit + slot);
-        riemannFit::Map6xNfS<N, Stride> hits_ge(phits_ge + slot);
+        riemannFit::Map3xNdS<N, Stride> hits(phits + lane);
+        riemannFit::Map4dS<Stride> fast_fit(pfast_fit + lane);
+        riemannFit::Map6xNfS<N, Stride> hits_ge(phits_ge + lane);
 
         // Uniform sampling of hitsInFit hits from the deduped selected set (force the last kept
         // hit for maximum lever arm -- the outermost OT extra), identical to Kernel_BLFastFit.
@@ -1510,33 +2041,59 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
             int kk = int(fn + 0.5f);
             if (hitsInFit - 1 == i)
               kk = int(nSel) - 1;
-            selectedHits[i] = caFitHitSel::dedupWalk(hitContainer, tkid, hh, hasStubsRt, kk);
+            selectedHits[i] = refitDedupWalk(hitContainer, tkid, hh, hasStubsRt, kk);
             fn += incr;
           }
         }
 
         for (uint32_t i = 0; i < hitsInFit; ++i) {
           const uint32_t hid = hitId[selectedHits[i]];
+          // Record this fit slot's raw hit id (bit30 OT tag preserved) so the outlier phase can
+          // name the hit it drops. lane == the lane the fit/outlier kernels iterate (ptkids[lane]).
+          if (fitHitId_ != nullptr)
+            fitHitId_[std::size_t(lane) * std::size_t(kRefitFitIdQuota) + i] = hid;
+          // Mark ORIGINAL PIXEL-CORE fit hits (id < offsetStubs and not a bit30 OT tag). Appended
+          // extras -- bit30 raw-OT (isOTId) and merged OT stubs (id >= offsetStubs) -- are non-core and
+          // remain droppable; only the pixel core is protected. Same lane*kRefitFitIdQuota + i indexing as fitHitId_.
+          if (fitHitIsCore_ != nullptr) {
+            const bool isCore = !caOTHitTag::isOTId(hid) && (!hasStubsRt || int32_t(hid) < int32_t(hh.offsetStubs()));
+            fitHitIsCore_[std::size_t(lane) * std::size_t(kRefitFitIdQuota) + i] = isCore ? uint8_t(1) : uint8_t(0);
+          }
           float ge[6];
           float px, py, pz;
-          // Merged SoA hit: verbatim Kernel_BLFastFit load (innerSensorFrame + stub xerr scale).
-          auto const& frame = cm.innerSensorFrame(hh.detectorIndex(hid));
-          float xerrFit = hh[hid].xerrLocal();
-          if (reco::isStub(hh, int32_t(hid))) {
-            const bool is2S = hh[hid].yerrLocal() > 0.1f;
-            const bool isBarrelHit = alpaka::math::abs(acc, hh[hid].zGlobal()) < 118.f;
+          if (caOTHitTag::isOTId(hid)) {
+            // Raw OT rechit: lower/upper sensor frame per position in the stack (verify/WriteFinal recipe).
+            const uint32_t o = caOTHitTag::otIdx(hid);
+            const uint32_t geom = uint32_t(otSource_.otHits[o].detectorIndex()) - ::phase2PixelTopology::nModulesPix;
+            const bool isUpper = (o >= otSource_.otHitModules.upperSensorStart()[geom]);
+            const auto& frame = isUpper ? otSource_.stackedGeometry.upperSensorFrame()[geom]
+                                        : otSource_.stackedGeometry.lowerSensorFrame()[geom];
+            float xerrFit = otSource_.otHits[o].xerrLocal();
+            const bool is2S = otSource_.otHits[o].yerrLocal() > 0.1f;
+            const bool isBarrelHit = alpaka::math::abs(acc, otSource_.otHits[o].zGlobal()) < 118.f;
             const float f = is2S ? (isBarrelHit ? 0.4624f : 0.8464f) : (isBarrelHit ? 0.64f : 0.9025f);
             xerrFit *= f;
+            float yerrFit = otSource_.otHits[o].yerrLocal();
+            frame.toGlobal(xerrFit, 0.f, yerrFit, ge);
+            px = otSource_.otHits[o].xGlobal();
+            py = otSource_.otHits[o].yGlobal();
+            pz = otSource_.otHits[o].zGlobal();
+          } else {
+            // Merged SoA hit: the same load as Kernel_BLFastFit (innerSensorFrame + stub xerr scale).
+            auto frame = cm.innerSensorFrame(hh.detectorIndex(hid));
+            float xerrFit = hh[hid].xerrLocal();
+            if (reco::isStub(hh, int32_t(hid))) {
+              const bool is2S = hh[hid].yerrLocal() > 0.1f;
+              const bool isBarrelHit = alpaka::math::abs(acc, hh[hid].zGlobal()) < 118.f;
+              const float f = is2S ? (isBarrelHit ? 0.4624f : 0.8464f) : (isBarrelHit ? 0.64f : 0.9025f);
+              xerrFit *= f;
+            }
+            float yerrFit = hh[hid].yerrLocal();
+            frame.toGlobal(xerrFit, 0.f, yerrFit, ge);
+            px = hh[hid].xGlobal();
+            py = hh[hid].yGlobal();
+            pz = hh[hid].zGlobal();
           }
-          // Kleinwort sec. 2.3: scale the 2S strip-length variance seen by the refit ONLY
-          // (merged-SoA path, same 2S tag as the main fit: stub && strip-box var > 0.1 cm^2).
-          float yerrFit = hh[hid].yerrLocal();
-          if (yVarScale != 1.f && reco::isStub(hh, int32_t(hid)) && yerrFit > 0.1f)
-            yerrFit *= yVarScale;
-          frame.toGlobal(xerrFit, 0.f, yerrFit, ge);
-          px = hh[hid].xGlobal();
-          py = hh[hid].yGlobal();
-          pz = hh[hid].zGlobal();
           hits.col(i) << px, py, pz;
           hits_ge.col(i) << ge[0], ge[1], ge[2], ge[3], ge[4], ge[5];
         }
@@ -1665,6 +2222,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     ::reco::CAModulesConstView cm;
     OutputSoAView outputSoa;
     const int32_t* acceptedByTuple;
+    caExtension::OTHitsSource otSrc;
     double bField;
     const float* rhoMap;
     const float* bMap;  // normalized (Bz,Br) r-z field map; null => the scalar bField everywhere
@@ -1677,9 +2235,17 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     double* pfast_fit;
     generalBrokenLine::GblNodeData* pgnodes;
     double* pgblScratch;
-    uint32_t* pslot;
     double* pphase;
-    float yVarScale;  // 2S strip-length variance scale forwarded to Kernel_BLFastFitRefit (1.f = as measured)
+    // Per-lane fit-hit-id table (written by Kernel_BLFastFitRefit) + the per-merged-track
+    // dropped-hit-id output (consumed by the merger's post-refit hit-list compaction). Both null when
+    // the fit-rejected hit is left in the emitted list, in which case neither is written.
+    uint32_t* pFitHitId;
+    uint32_t* pDropHitId;
+    // Core-protected outlier: per-lane pixel-core flag table (written by
+    // Kernel_BLFastFitRefit) + the enable. With pFitHitIsCore null / coreProtect false the outlier scan
+    // considers every node.
+    uint8_t* pFitHitIsCore;
+    bool coreProtect;
     // Fit-consistent curvature->pT conversion field (see Kernel_BLFitPhaseSolve::fieldKernelWeights_).
     // Needs the field map, so it is inert wherever bMap is null.
     bool fieldKernelWeights = false;
@@ -1694,18 +2260,42 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // Cumulative-column typical-loss law rather than the per-lump Landau MPV (see
     // Kernel_BLFitPhasePrep::elossCumulative_). Map-independent.
     bool cumulativeEloss = false;
+    // Dynamic-partition state of the fused ladder.
+    // Per-bin demand of the current round (kRefitNBins uint32), filled by Kernel_BLRefitBinCount.
+    uint32_t* pCounts = nullptr;
+    // Per-bin {firstLane, nLanes} of the current round (kRefitRangeStride * kRefitNBins uint32).
+    uint32_t* pRange = nullptr;
+    // Per-block {bin, firstLane, endLane} dispatch table (kRefitBlockMapStride * kFusedBlocks uint32).
+    uint32_t* pBlockMap = nullptr;
+    // Per-track "already seated in an earlier round" flag (nTracksCap bytes).
+    uint8_t* pServed = nullptr;
+    // Work division of the fused phase launches: kFusedBlocks x kFitBlock, fixed and host-known.
+    WorkDiv1D workDivFused;
   };
 
-  // One refit bin of multiplicity N. The per-bin slot/tkid memsets stay in refitExtended (they need
-  // the buffer objects); this helper runs the fast-fit compaction + the phase-split fit. Only
-  // instantiated for Phase2OTStubs (hasStubs == true).
+  // ---------------------------------------------------------------------------------------------
+  // FUSED-LADDER LAUNCHERS. One (phase, iteration) per call, all ten N-bins in one launch (sum_b W_b ==
+  // kRefitStride). Declared `extern template` and instantiated ONE PHASE PER TU: a fused kernel pulls all
+  // ten compile-time N of its phase into whichever TU instantiates it (per-phase build-time split).
+  // PHASE-BUFFER CACHES: the material march + segmentXX0Moments rows and the bFieldEff slot are carried
+  // across the two linearizations instead of being recomputed. The material rows are carried between two
+  // launches of the SAME kernel object (same machine code, so the cached doubles cannot differ from the
+  // recompute); bFieldEff is carried from PREP to OUT/OUTLIER (different inlining contexts of
+  // blEffectiveBField, may contract FMAs differently, so it can legitimately move a result at 1 ULP).
+  // ---------------------------------------------------------------------------------------------
+
+  // One bin's fast-fit compaction scan for the FUSED ladder. It keeps its own launch for the grid-scope
+  // atomic slot claim that must complete before any phase reads ptkids; it claims against the bin's OWN
+  // counter and seats tracks in the bin's OWN lane range.
   template <int N, typename TrackerTraits>
-  void runRefitBin(BLRefitLaunchCtx<TrackerTraits> const& c, uint32_t nHitsL, uint32_t nHitsH) {
+  void runRefitScanBin(BLRefitLaunchCtx<TrackerTraits> const& c, uint32_t nHitsL, uint32_t nHitsH) {
     constexpr uint32_t kRefitStride = HelixFit<TrackerTraits>::kRefitStride;
+    constexpr uint32_t kBin = uint32_t(N) - uint32_t(kRefitMinN);
     constexpr bool hasStubs = true;  // Phase2OTStubs
+    Kernel_BLFastFitRefit<N, kRefitStride> scan{c.otSrc, c.pFitHitId, c.pFitHitIsCore, c.pRange, c.pServed};
     alpaka::exec<Acc1D>(c.queue,
                         c.workDivScan,
-                        Kernel_BLFastFitRefit<N, kRefitStride>{},
+                        scan,
                         c.hitContainer,
                         c.hv,
                         c.cm,
@@ -1714,102 +2304,114 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         c.phits,
                         c.phits_ge,
                         c.pfast_fit,
-                        c.pslot,
+                        c.pCounts + kRefitNBins + kBin,  // the claim counters live past the demands
                         nHitsL,
                         nHitsH,
                         c.maxNumberOfTuples,
-                        hasStubs,
-                        c.yVarScale);
-    // PHASE-BUFFER CACHES. The material march + segmentXX0Moments rows and the bFieldEff slot are
-    // carried across the two linearizations instead of being recomputed. The two halves carry different
-    // risk: the material rows are carried between two launches of the SAME kernel object, i.e. literally
-    // the same machine code, so the cached doubles cannot differ from the recompute; bFieldEff is instead
-    // carried from the PREP kernel to the OUT/OUTLIER kernels -- different inlining contexts of
-    // blEffectiveBField, which may contract FMAs differently, so it is the one cached item that can
-    // legitimately move a result at 1 ULP. The two predicates are held in volatile sources so that
-    // neither is a compile-time constant and the launch predicates below stay runtime branches.
-    static volatile bool s_noFitPhaseCache = false;
-    static const bool kNoPhaseCache = s_noFitPhaseCache;
-    static volatile bool s_noFitBFieldCache = false;
-    static const bool kNoBFieldCache = s_noFitBFieldCache;
-    const bool phaseCacheOn = !kNoPhaseCache;
-    // With the fit-consistent conversion field on, the phase slot is the ONLY place that field exists --
-    // the out and outlier phases hold no influence vector and could only re-derive the hit-count average --
-    // so the slot must be read there whatever the compute-side caches say.
-    const bool fieldKernelOn = c.fieldKernelWeights && (c.bMap != nullptr);
-    const bool bFieldCacheOn = (phaseCacheOn && !kNoBFieldCache) || fieldKernelOn;
-    for (int iter = 0; iter < 2; ++iter) {
-      const bool finalIter = (iter == 1);
-      alpaka::exec<Acc1D>(c.queue,
-                          c.workDivFit,
-                          // matFromPhase_ == finalIter. The bin's ONE
-                          // Kernel_BLFastFitRefit above fixed the lane->track map for BOTH
-                          // iterations and the hits never move, so iteration 1 finds its own
-                          // iteration-0 material rows in its own lane of c.pphase. (The
-                          // iterFromPhase_ argument that precedes it is the same predicate for
-                          // the reference hand-off -- they are true together by construction.)
-                          // fieldFromPhase_ is the same predicate again: iteration 1 linearizes on the
-                          // fit-consistent field iteration 0's solve published.
-                          Kernel_BLFitPhasePrep<N, TrackerTraits, kRefitStride>{c.rhoMap,
-                                                                                finalIter,
-                                                                                c.bMap,
-                                                                                finalIter && phaseCacheOn,
-                                                                                finalIter && fieldKernelOn,
-                                                                                c.chargeSymmetric,
-                                                                                c.trajectoryCorrections,
-                                                                                c.scatteringLogAtTotal,
-                                                                                c.cumulativeEloss},
-                          c.bField,
-                          c.tkids,
-                          c.phits,
-                          c.phits_ge,
-                          c.pfast_fit,
-                          c.pgnodes,
-                          c.pphase);
-      alpaka::exec<Acc1D>(c.queue,
-                          c.workDivFit,
-                          Kernel_BLFitPhaseSolve<N, TrackerTraits, kRefitStride>{
-                              c.outlierReject, finalIter, c.bMap, c.fieldKernelWeights},
-                          c.bField,
-                          c.tkids,
-                          c.phits,
-                          c.pfast_fit,
-                          c.pgnodes,
-                          c.pgblScratch,
-                          c.pphase);
-      alpaka::exec<Acc1D>(
-          c.queue,
-          c.workDivFit,
-          Kernel_BLFitPhaseOut<N, TrackerTraits, kRefitStride>{c.bMap, bFieldCacheOn, c.chargeSymmetric},
-          c.bField,
-          c.outputSoa,
-          c.tkids,
-          c.phits,
-          c.pfast_fit,
-          c.pphase);
-    }
-    if constexpr (N >= 5) {
-      if (c.outlierReject)
-        alpaka::exec<Acc1D>(c.queue,
-                            c.workDivFit,
-                            Kernel_BLFitPhaseOutlier<N, TrackerTraits, kRefitStride>{
-                                c.outlierReject, c.bMap, bFieldCacheOn, c.chargeSymmetric},
-                            c.bField,
-                            c.outputSoa,
-                            c.tkids,
-                            c.phits,
-                            c.pfast_fit,
-                            c.pgnodes,
-                            c.pgblScratch,
-                            c.pphase);
-    }
+                        hasStubs);
   }
 
-  // Explicit-instantiation signatures (expanded with `extern` below to suppress instantiation in the
-  // orchestration TU, and bare in each BrokenLineFit_*.dev.cc to instantiate its disjoint N-subset).
-  // The factorized fast BrokenLine main fit, the only fit the CA runs. The stubs N-range (3..10) is
-  // compiled in BrokenLineFit_stubsMainBL.dev.cc; the four other traits (3..6) share
-  // BrokenLineFit_main.dev.cc.
+  template <typename TrackerTraits>
+  void runRefitFusedPrep(BLRefitLaunchCtx<TrackerTraits> const& c, bool finalIter, bool fieldKernelOn) {
+    constexpr uint32_t kRefitStride = HelixFit<TrackerTraits>::kRefitStride;
+    BLRefitFusedCfg cfg{};
+    cfg.rhoMap = c.rhoMap;
+    cfg.bMap = c.bMap;
+    // iterFromPhase / matFromPhase / fieldFromPhase are all finalIter: the bin's one scan fixed the
+    // lane->track map for both iterations and the hits never move, so iteration 1 finds its own
+    // iteration-0 reference hand-off, material rows and fit-consistent field in its own lane of c.pphase.
+    // fieldFromPhase additionally needs the fit-consistent conversion field to be on (fieldKernelOn:
+    // fieldKernelWeights with a map); otherwise the prep recomputes the hit-count average itself.
+    cfg.iterFromPhase = finalIter;
+    cfg.matFromPhase = finalIter;
+    cfg.fieldFromPhase = finalIter && fieldKernelOn;
+    cfg.chargeSymmetric = c.chargeSymmetric;
+    cfg.trajectoryCorrections = c.trajectoryCorrections;
+    cfg.scatteringLogAtTotal = c.scatteringLogAtTotal;
+    cfg.elossCumulative = c.cumulativeEloss;
+    alpaka::exec<Acc1D>(c.queue,
+                        c.workDivFused,
+                        Kernel_BLFitPhasePrepFused<TrackerTraits, kRefitStride>{cfg},
+                        c.bField,
+                        c.tkids,
+                        c.phits,
+                        c.phits_ge,
+                        c.pfast_fit,
+                        c.pgnodes,
+                        c.pphase,
+                        c.pBlockMap);
+  }
+
+  template <typename TrackerTraits>
+  void runRefitFusedSolve(BLRefitLaunchCtx<TrackerTraits> const& c, bool finalIter) {
+    constexpr uint32_t kRefitStride = HelixFit<TrackerTraits>::kRefitStride;
+    BLRefitFusedCfg cfg{};
+    cfg.bMap = c.bMap;
+    cfg.outlierReject = c.outlierReject;
+    cfg.finalIter = finalIter;
+    cfg.fieldKernelWeights = c.fieldKernelWeights;
+    alpaka::exec<Acc1D>(c.queue,
+                        c.workDivFused,
+                        Kernel_BLFitPhaseSolveFused<TrackerTraits, kRefitStride>{cfg},
+                        c.bField,
+                        c.tkids,
+                        c.phits,
+                        c.pfast_fit,
+                        c.pgnodes,
+                        c.pgblScratch,
+                        c.pphase,
+                        c.pBlockMap);
+  }
+
+  template <typename TrackerTraits>
+  void runRefitFusedOut(BLRefitLaunchCtx<TrackerTraits> const& c) {
+    constexpr uint32_t kRefitStride = HelixFit<TrackerTraits>::kRefitStride;
+    BLRefitFusedCfg cfg{};
+    cfg.bMap = c.bMap;
+    // This iteration's prep ran on this lane and published the effective field (see PHASE-BUFFER CACHES).
+    cfg.bFieldFromPhase = true;
+    cfg.chargeSymmetric = c.chargeSymmetric;
+    alpaka::exec<Acc1D>(c.queue,
+                        c.workDivFused,
+                        Kernel_BLFitPhaseOutFused<TrackerTraits, kRefitStride>{cfg},
+                        c.bField,
+                        c.outputSoa,
+                        c.tkids,
+                        c.phits,
+                        c.pfast_fit,
+                        c.pphase,
+                        c.pBlockMap);
+  }
+
+  template <typename TrackerTraits>
+  void runRefitFusedOutlier(BLRefitLaunchCtx<TrackerTraits> const& c) {
+    constexpr uint32_t kRefitStride = HelixFit<TrackerTraits>::kRefitStride;
+    BLRefitFusedCfg cfg{};
+    cfg.bMap = c.bMap;
+    cfg.fitHitId = c.pFitHitId;
+    cfg.dropHitId = c.pDropHitId;
+    cfg.fitHitIsCore = c.pFitHitIsCore;
+    cfg.outlierReject = c.outlierReject;
+    cfg.coreProtect = c.coreProtect;
+    cfg.bFieldFromPhase = true;  // the final prep ran on this lane (see PHASE-BUFFER CACHES)
+    cfg.chargeSymmetric = c.chargeSymmetric;
+    alpaka::exec<Acc1D>(c.queue,
+                        c.workDivFused,
+                        Kernel_BLFitPhaseOutlierFused<TrackerTraits, kRefitStride>{cfg},
+                        c.bField,
+                        c.outputSoa,
+                        c.tkids,
+                        c.phits,
+                        c.pfast_fit,
+                        c.pgnodes,
+                        c.pgblScratch,
+                        c.pphase,
+                        c.pBlockMap);
+  }
+
+  // Explicit-instantiation signatures (`extern` in the orchestration TU, bare in each
+  // BrokenLineFit_*.dev.cc to instantiate its disjoint N-subset). Factorized fast BrokenLine main fit:
+  // stubs N=3..10 in BrokenLineFit_stubsMainBL.dev.cc, four other traits N=3..6 in BrokenLineFit_main.dev.cc.
 #define BLFIT_MAIN_SIG_BL(N, T)                    \
   template void runMainBin<N, ::pixelTopology::T>( \
       BLMainLaunchCtx<::pixelTopology::T> const&, WorkDiv1D const&, uint32_t, uint32_t, int32_t)
@@ -1819,9 +2421,23 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   template void runMainFusedFast<::pixelTopology::T>(BLMainLaunchCtx<::pixelTopology::T> const&)
 #define BLFIT_MAIN_FUSED_FIT_SIG(T) \
   template void runMainFusedFit<::pixelTopology::T>(BLMainLaunchCtx<::pixelTopology::T> const&)
-#define BLFIT_REFIT_SIG(N)                                      \
-  template void runRefitBin<N, ::pixelTopology::Phase2OTStubs>( \
+#define BLFIT_REFIT_SCAN_SIG(N)                                     \
+  template void runRefitScanBin<N, ::pixelTopology::Phase2OTStubs>( \
       BLRefitLaunchCtx<::pixelTopology::Phase2OTStubs> const&, uint32_t, uint32_t)
+// The FUSED ladder: one signature per PHASE (each pulls all ten compile-time N of that phase into
+// the TU that instantiates it), one TU per phase.
+#define BLFIT_REFIT_FUSED_PREP_SIG()                               \
+  template void runRefitFusedPrep<::pixelTopology::Phase2OTStubs>( \
+      BLRefitLaunchCtx<::pixelTopology::Phase2OTStubs> const&, bool, bool)
+#define BLFIT_REFIT_FUSED_SOLVE_SIG()                               \
+  template void runRefitFusedSolve<::pixelTopology::Phase2OTStubs>( \
+      BLRefitLaunchCtx<::pixelTopology::Phase2OTStubs> const&, bool)
+#define BLFIT_REFIT_FUSED_OUT_SIG()                               \
+  template void runRefitFusedOut<::pixelTopology::Phase2OTStubs>( \
+      BLRefitLaunchCtx<::pixelTopology::Phase2OTStubs> const&)
+#define BLFIT_REFIT_FUSED_OUTLIER_SIG()                               \
+  template void runRefitFusedOutlier<::pixelTopology::Phase2OTStubs>( \
+      BLRefitLaunchCtx<::pixelTopology::Phase2OTStubs> const&)
 
   // Main fit: N = 3 .. maxHitsOnTrackForFullFit(traits). Non-stubs traits fit up to 6, Phase2OTStubs up to 10.
   extern BLFIT_MAIN_SIG_BL(3, Phase1);
@@ -1864,17 +2480,23 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   extern BLFIT_MAIN_FUSED_FIT_SIG(HIonPhase1);
   extern BLFIT_MAIN_FUSED_FIT_SIG(Phase2OTStubs);
 
-  // Extended-N refit: N = 3 .. kRefitMaxN (12), Phase2OTStubs only.
-  extern BLFIT_REFIT_SIG(3);
-  extern BLFIT_REFIT_SIG(4);
-  extern BLFIT_REFIT_SIG(5);
-  extern BLFIT_REFIT_SIG(6);
-  extern BLFIT_REFIT_SIG(7);
-  extern BLFIT_REFIT_SIG(8);
-  extern BLFIT_REFIT_SIG(9);
-  extern BLFIT_REFIT_SIG(10);
-  extern BLFIT_REFIT_SIG(11);
-  extern BLFIT_REFIT_SIG(12);
+  // Extended-N refit, FUSED ladder: N = 3 .. kRefitMaxN (12), Phase2OTStubs only. The per-bin fast-fit
+  // scans keep their own launch and are instantiated in the N-range TUs BrokenLineFit_refitLo/Hi.
+  extern BLFIT_REFIT_SCAN_SIG(3);
+  extern BLFIT_REFIT_SCAN_SIG(4);
+  extern BLFIT_REFIT_SCAN_SIG(5);
+  extern BLFIT_REFIT_SCAN_SIG(6);
+  extern BLFIT_REFIT_SCAN_SIG(7);
+  extern BLFIT_REFIT_SCAN_SIG(8);
+  extern BLFIT_REFIT_SCAN_SIG(9);
+  extern BLFIT_REFIT_SCAN_SIG(10);
+  extern BLFIT_REFIT_SCAN_SIG(11);
+  extern BLFIT_REFIT_SCAN_SIG(12);
+  // One fused phase per TU: BrokenLineFit_refitFusedPrep/Solve/Out/Outlier.dev.cc.
+  extern BLFIT_REFIT_FUSED_PREP_SIG();
+  extern BLFIT_REFIT_FUSED_SOLVE_SIG();
+  extern BLFIT_REFIT_FUSED_OUT_SIG();
+  extern BLFIT_REFIT_FUSED_OUTLIER_SIG();
 
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE
 

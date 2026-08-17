@@ -187,11 +187,13 @@ namespace cms::alpakatools {
       auto c = apc.inc_add(acc, n);
       if (c.first >= this->nOnes())  // overflow!
         return kOverflow;
-      if (c.second + n > this->capacity()) {  // content buffer overflow!
+      if (c.second + n > this->capacity()) {  // content buffer overflow: truncate instead of writing past the buffer
+#ifdef GPU_DEBUG
         printf("Warning!!!! bulkFill content overflow (offset %d + n %d > capacity %d)!\n",
                static_cast<int>(c.second),
                static_cast<int>(n),
                static_cast<int>(this->capacity()));
+#endif
         this->off[c.first] = c.second;  // plug hole: off[k] set so size(k-1) is correct
         return kOverflow;
       }

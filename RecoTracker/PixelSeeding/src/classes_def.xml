@@ -12,4 +12,19 @@
   <class name="caStructures::TripletDumpLayout<128, false>::View"/>
   <class name="edm::Wrapper<caStructures::TripletDumpHost>" splitLevel="0"/>
 
+  <!-- CA-ordered module geometry host collection (EventSetup product of CAGeometryESProducer, same
+       multi-block pattern as reco::TracksHost). Needed for the serial backend product and the
+       device-product host transcription; not an event product, so no edm::Wrapper. Type-info only.
+       Keep these comments free of apostrophes (the classes_def preprocessor tracks quote state). -->
+  <class name="reco::CAGeometryHost" rntupleStreamerMode="true"/>
+  <!-- reco::CAGeometryHost::Layout must be listed before the aliased-to type, see #48824 -->
+  <class name="reco::CAGeometryHost::Layout"/>
+  <class name="reco::CALayout"/>
+  <class name="reco::CALayout::View"/>
+  <class name="reco::CALayersLayout<128, false>"/>
+  <class name="reco::CAGraphLayout<128, false>"/>
+  <class name="reco::CADoubletCutsLayout<128, false>"/>
+  <class name="reco::CATripletCutsLayout<128, false>"/>
+  <class name="reco::CANtupletCutsLayout<128, false>"/>
+  <class name="reco::CAModulesLayout<128, false>"/>
 </lcgdict>

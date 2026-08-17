@@ -1,13 +1,9 @@
 #ifndef RecoTracker_PixelSeeding_interface_TripletDumpSoA_h
 #define RecoTracker_PixelSeeding_interface_TripletDumpSoA_h
 
-// Per-built-triplet training-dataset row, captured on device by Kernel_connect ONLY in
-// CA_TRIPLET_DUMP builds (the buffer is allocated, written, and emitted under #ifdef
-// CA_TRIPLET_DUMP, so production builds carry nothing). It is the multithread-safe, ROOT-robust
-// nanoAOD capture path. Columns 0..17 are the 18 BASE features fed to the triplet DNN (exact order +
-// formulas == BASE_FEATURES in RecoTracker/PixelSeeding/test/train_triplet_dnn_v2.py; the 11
-// DERIVED features are recomputed offline from these + lay1/2/3). h1/h2/h3 are the three global
-// MERGED-hit indices (truth join key).
+// Per-built-triplet training-dataset row, filled by Kernel_connect in CA_TRIPLET_DUMP builds only.
+// The first 18 columns are the base triplet-DNN features in input order; the derived features are
+// recomputed offline from these and lay1/2/3.
 
 #include <alpaka/alpaka.hpp>
 
@@ -16,7 +12,7 @@
 namespace caStructures {
 
   GENERATE_SOA_LAYOUT(TripletDumpLayout,
-                      // --- 18 base features (DNN input order) ---
+                      // 18 base features, in DNN input order.
                       SOA_COLUMN(float, absCurvature),
                       SOA_COLUMN(float, tipTimesCurvature),
                       SOA_COLUMN(float, dca),
@@ -35,23 +31,20 @@ namespace caStructures {
                       SOA_COLUMN(float, z2),
                       SOA_COLUMN(float, z3),
                       SOA_COLUMN(float, nStubs),
-                      // Signed curvature (not a base feature, but the offline derived features
-                      // stubCirclePull/stubCircleRatio/curv13Resid need the sign, as accept() does;
-                      // absCurvature loses it).
+                      // Signed curvature: the offline derived features need the sign that
+                      // absCurvature loses.
                       SOA_COLUMN(float, curvature),
-                      // --- layers (for the layGap12/23 derived features) ---
                       SOA_COLUMN(int32_t, lay1),
                       SOA_COLUMN(int32_t, lay2),
                       SOA_COLUMN(int32_t, lay3),
-                      // --- merged-hit indices (truth join key) ---
+                      // Merged-hit indices, the join key against the truth.
                       SOA_COLUMN(uint32_t, h1),
                       SOA_COLUMN(uint32_t, h2),
                       SOA_COLUMN(uint32_t, h3),
-                      // The in-kernel DNN score score(feat) for this triplet (-1 if not evaluated),
-                      // for the in-kernel-vs-offline consistency check.
+                      SOA_COLUMN(int32_t, iter),
+                      // In-kernel DNN score for this triplet, -1 if not evaluated.
                       SOA_COLUMN(float, inKernelScore),
-                      // Number of valid rows (== device_nTriplets). The collection is allocated at the
-                      // full capacity (tripletsN_); only rows [0, nValid) are written by Kernel_connect.
+                      // The collection is allocated at full capacity; only rows [0, nValid) are written.
                       SOA_SCALAR(uint32_t, nValid))
 
   using TripletDumpSoA = TripletDumpLayout<>;

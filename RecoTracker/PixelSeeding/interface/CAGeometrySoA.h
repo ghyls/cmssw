@@ -28,6 +28,13 @@ namespace reco {
   using GraphNode = std::array<uint32_t, 2>;
   using DetFrame = SOAFrame<float>;
 
+  // Hard upper bound on the number of CA layers a layers block may describe.
+  // It is a real bound, not a hint: the OT-extension walk keeps its per-layer state in
+  // compile-time-sized block shared memory (shReachable/shReachDist/shVisited) and encodes the set of
+  // covered layers in a uint64_t bitmask, so a layers block with more rows than this would overrun
+  // both. Producers of the layers block check it and throw; the walk sizes its arrays from it.
+  inline constexpr int kMaxCALayers = 64;
+
   // CAModulesLayout: one row per CA module (pixel + OT stack).
   //   detFrame:           the module's existing surface frame
   //                       (pixel sensor for pixel modules; the stack det's

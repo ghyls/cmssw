@@ -10,11 +10,11 @@
 #include "RecoTracker/PixelSeeding/interface/CAStubMS.h"
 #include "CACell.h"
 #include "CAPipelineCounters.h"
+#include "CADnnBank.h"     // DnnBank (per-iteration weight-bank selector)
 #include "CATripletDNN.h"  // inline per-triplet DNN gate (compile-time weights)
 
-// CA_TRIPLET_DUMP (built-triplet dataset dump, the truth-labeled DNN training input) is toggled in
-// this minimal header so the producer side can see it without pulling in this device header. It
-// must stay commented out in production.
+// CA_TRIPLET_DUMP (built-triplet dataset dump) is toggled in a minimal header so the producer side
+// can see it without pulling in this device header. It must stay commented out in production.
 #include "CATripletDumpMacro.h"
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
@@ -24,7 +24,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
     // ----------------------------------
     // RZ alignment cut aka CAThetaCut
-    // ----------------------------------
     // This cut checks the alignment of the three hits in the RZ plane by applying a cut on the angle between the middle
     // and outer hit with respect to the inner hit.
     ALPAKA_FN_ACC ALPAKA_FN_INLINE static bool alignedRZ(const float r1,
@@ -66,9 +65,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       return aligned;
     }
 
-    // ---------------------------------
     // XY alignment cut aka hardCurvCut
-    // ---------------------------------
     // This is a simple cut on the curvature computed from the three hits in the transverse plane.
     // It is indirectly setting a minimum pT cut for triplets and checks their alignment in the transverse plane.
     ALPAKA_FN_ACC ALPAKA_FN_INLINE static bool alignedXY(const float absCurvature, const float maxCurvature) {
@@ -84,9 +81,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       return aligned;
     }
 
-    // ---------------------------------
     // check on compatibility with the beamspot in XY via Transverse Impact Parameter aka caDCACut
-    // ---------------------------------
     // This cut checks the compatibility of the triplet with the beamspot in the transverse plane by applying
     // a cut on the transverse impact parameter (DCA) computed from the three hits.
     ALPAKA_FN_ACC ALPAKA_FN_INLINE static bool beamspotCompatibleXY(const float absCurvature,
@@ -114,9 +109,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       return compatible;
     }
 
-    // ---------------------------------
     // dPhi same sign cut
-    // ---------------------------------
     // Requires dPhi12 and dPhi23 to have the same sign. A track that bends in one direction and
     // originates near the beam line steps in phi monotonically from layer to layer; tracks with a
     // large impact parameter or strong multiple scattering can violate this, so the cut is optional
@@ -134,9 +127,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       return sameSign;
     }
 
-    // ---------------------------------
     // curvature compatibility with inner doublet aka caPhiMiddleCut
-    // ---------------------------------
     // This cut checks the compatibility of the inner doublet's dPhi/dr with the stubs' average of the triplet.
     ALPAKA_FN_ACC ALPAKA_FN_INLINE static bool stubsCompatibleWithInnerDoublet(const float dPhi12,
                                                                                const float dr12,
@@ -206,9 +197,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       return compatible;
     }
 
-    // ---------------------------------
     // phi compatibility
-    // ---------------------------------
     // This cut checks the phi compatibility of the three hits by comparing the phi of the middle hit with the phi
     // predicted from the inner and outer hit.
     ALPAKA_FN_ACC ALPAKA_FN_INLINE static bool phiCompatible(
@@ -235,10 +224,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       return compatible;
     }
 
-    // -------------------------------------------------------------------------------------------------------------
-    // MAIN FUNCTION: ACCEPT function applying the cuts in sequence
-    // -------------------------------------------------------------------------------------------------------------
-    // This function checks the compatibility of a triplet with the above CA cuts by applying them in sequence.
+    // Checks the compatibility of a triplet with the CA cuts above, applying them in sequence.
     template <typename TAcc>
     ALPAKA_FN_ACC ALPAKA_FN_INLINE static bool accept(
         [[maybe_unused]] const TAcc& acc,
@@ -248,19 +234,24 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         HitsMultiView hh,
         reco::CATripletCutsSoAConstView tripletCuts,
         reco::CATripletCutsSoAConstView::const_element tripletVectorCutsCol,
-        // Row of the INNER cell's layer pair (L1,L2). Used by the beam-spot (DCA) cut on every
-        // topology: its threshold is anchored at the triplet's innermost layer -- see the cut itself.
+        // Row of the inner cell's layer pair (L1,L2), used by the beam-spot (DCA) cut on every
+        // topology: its threshold is anchored at the triplet's innermost layer.
         reco::CATripletCutsSoAConstView::const_element tripletInnerPairCutsCol,
         [[maybe_unused]] reco::CAGraphSoAConstView cc,
         [[maybe_unused]] bool useTripletDNN,
         [[maybe_unused]] float tripletDNNThreshold,
+        [[maybe_unused]] DnnBank tripletBank,
 #ifdef CA_TRIPLET_DUMP
-        // out: the 18 BASE DNN features, filled (in DNN-block formulas, so training==deployment)
-        // when the triplet is accepted; written into the TripletDump SoA at t_ind by Kernel_connect.
+        // out: the 18 base DNN features, in the DNN-block formulas so that training matches
+        // deployment; written into the TripletDump SoA at t_ind by Kernel_connect.
         float* __restrict__ dumpFeat,
-        // out: the IN-KERNEL DNN score score(feat) for this triplet (in-kernel-vs-offline
-        // consistency check); computed regardless of the gate in dump builds, -1 if not computed.
+        // out: the in-kernel DNN score score<BANK>(feat) for this triplet, for the offline
+        // consistency check; computed regardless of the gate in dump builds, -1 if not computed.
         float* __restrict__ dumpScore,
+        // Dump-only: the iteration label stamped on each dump row, or -1 if this iteration is
+        // deselected at dump time (the tripletDumpIteration parameter, resolved host-side at the
+        // launch site).
+        [[maybe_unused]] int dumpIteration,
 #endif
         uint32_t* __restrict__ pipelineCounters) {
 #ifdef CA_PIPELINE_COUNTERS
@@ -308,9 +299,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         return false;
       }
 
-      // apply beamspot compatibility cut. The threshold is anchored at the triplet's innermost layer
-      // L1, i.e. read from the INNER cell's layer-pair row (L1,L2), on every topology (see the
-      // parameter note above); floorDCA comes from the same row.
+      // Beam-spot compatibility cut: the threshold is anchored at the triplet's innermost layer L1,
+      // i.e. read from the inner cell's layer-pair row (L1,L2); floorDCA comes from the same row.
       float tipTimesCurvature = std::abs(eq.dca0());
       if (!beamspotCompatibleXY(
               absCurvature, tipTimesCurvature, tripletInnerPairCutsCol.maxDCA(), tripletInnerPairCutsCol.floorDCA())) {
@@ -344,23 +334,18 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         int nStubs =
             int(innerCell.inner_isStub(hh)) + int(outerCell.inner_isStub(hh)) + int(outerCell.outer_isStub(hh));
 
-        // Stub-curvature quantities, needed by BOTH the stub-curvature cuts AND the dump/DNN feature
-        // vector below, so they are hoisted to this scope. For nStubs>0 they hold the weighted-mean
-        // stub curvature and its variance. For pixel-only triplets (nStubs==0) the weighted mean would
-        // be 0/0=NaN, so SENTINELS are assigned instead:
-        //   curvatureStubs            = 0.f
-        //   curvatureStubsErrSquared  = 1e6f  (large variance)
-        // With these the derived stub pulls collapse to ~0, logErrSq becomes a fixed distinctive
-        // constant and the nStubs==0 feature alone flags the regime to the DNN. The EXACT sentinel
-        // values are mirrored in test/models/train_triplet_dnn.py add_derived(), so a pixel-only
-        // training row is bit-consistent with what CATripletDNN.h evaluates in the kernel.
+        // Stub-curvature quantities, hoisted here because both the stub-curvature cuts and the
+        // dump/DNN feature vector below need them. For nStubs>0 they hold the weighted-mean stub
+        // curvature and its variance; for pixel-only triplets that mean would be 0/0, so the
+        // sentinels curvatureStubs = 0 and curvatureStubsErrSquared = 1e6 are used instead, which
+        // collapse the derived stub pulls to ~0. The same values are used by
+        // test/models/train_triplet_dnn.py, so a pixel-only training row matches the kernel.
         float curvatureStubs;
         float curvatureStubsErrSquared;
 
-        // The stub-specific cuts (same-sign dPhi + the two stub-curvature compatibility cuts) require at
-        // least one stub. Pixel-only triplets SKIP those cuts and instead fall through with the two
-        // sentinel values assigned below, so that they still reach the DNN gate and the dump block with a
-        // well-defined feature vector instead of returning early.
+        // The stub-specific cuts (same-sign dPhi and the two stub-curvature compatibility cuts) need
+        // at least one stub. Pixel-only triplets skip them and fall through with the two sentinel
+        // values below, so they reach the DNN gate and the dump block with a defined feature vector.
         if (nStubs == 0) {
           curvatureStubs = 0.f;
           curvatureStubsErrSquared = 1e6f;  // large-variance sentinel; see the note above
@@ -432,13 +417,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         }
 
 #ifdef CA_TRIPLET_DUMP
-        // Per-BUILT-triplet dataset row (truth-labeled DNN training input), filled once per triplet
-        // that passed ALL TripletCuts, from inside the Phase2OTStubs branch where the full stub
-        // feature vector is in scope. The 18 BASE DNN features go into the out-param in the EXACT
-        // DNN-block formulas, so the training set matches what CATripletDNN evaluates at deployment;
-        // their order is BASE_FEATURES in test/models/train_triplet_dnn.py and the DERIVED features
-        // are recomputed offline from these + lay1/2/3. Kernel_connect writes the row (+ the three
-        // merged-hit indices h1/h2/h3, the truth join key, + layers + iter) into the TripletDump SoA.
+        // Per-built-triplet dataset row, filled once per triplet that passed every cut, from inside
+        // the Phase2OTStubs branch where the full stub feature vector is in scope. The 18 base DNN
+        // features use the DNN-block formulas, in the BASE_FEATURES order of
+        // test/models/train_triplet_dnn.py; the derived features are recomputed offline from these
+        // and lay1/2/3. Kernel_connect writes the row into the TripletDump SoA.
         {
           const float dcaDump = (absCurvature > 0.f) ? tipTimesCurvature / absCurvature : 0.f;
           const float dPhiDr13Dump = dPhi13 / dr13;
@@ -466,23 +449,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         }
 #endif
 
-        // ----------------------------------------------------------------------------
-        // Inline per-triplet DNN gate (optional; compile-time weights in CATripletDNNWeights.h,
-        // evaluated by CATripletDNN.h). Rejects accepted triplets whose DNN score < threshold; with
-        // useTripletDNN off the block is a no-op and the cut ladder alone decides.
-        // In a CA_TRIPLET_DUMP build the reject below is compiled out, so accept() returns true for every
-        // cut-accepted triplet whatever useTripletDNN and whichever model is compiled in. That keeps the
-        // training set unbiased: gating the dump on the compiled-in model would only ever show the next
-        // DNN that model's own accepted subset. The score is still captured (dumpScore) so the in-kernel
-        // evaluation can be cross-checked against the offline one.
-        // Feature vector = 18 raw quantities + 11 derived (pulls/residuals/log
-        // compressions/layer gaps): order AND formulas (incl. the 1e-12 eps
-        // conventions) MUST match add_derived() + BASE_FEATURES/DERIVED in
-        // RecoTracker/PixelSeeding/test/train_triplet_dnn_v2.py.
-        // Gate regime: when the in-kernel DNN is on it gates EVERY triplet, pixel-only (nStubs==0, via
-        // the sentinel features above) and stub-containing alike. One model covers both
-        // regimes (nStubs is a feature); a retrained bank inherits this contract because the dump path
-        // that produced its training rows is the same one.
+        // Inline per-triplet DNN gate (weights in CATripletDNNWeights.h, evaluated by CATripletDNN.h): rejects
+        // cut-accepted triplets whose score is below threshold; a no-op with useTripletDNN off. It gates pixel-only
+        // triplets too (nStubs is a feature). The feature vector is 18 raw + 11 derived quantities whose order and
+        // formulas must match test/models/train_triplet_dnn.py. In a CA_TRIPLET_DUMP build the reject is compiled
+        // out for the dumped iteration.
         bool runDnnBlock = useTripletDNN;
 #ifdef CA_TRIPLET_DUMP
         runDnnBlock = true;  // dump build: always evaluate the score to capture it (consistency check)
@@ -495,7 +466,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           const float rmidDnn = 0.5f * (r1 + r3);
           const float conv2Dnn = 1.f + rmidDnn * rmidDnn * dPhiDr13Dnn * dPhiDr13Dnn;
           const float curvature13Dnn = dPhiDr13Dnn / std::sqrt(conv2Dnn);
-          // derived features (each a handful of FLOPs vs the ~6k-MAC MLP evaluation)
+          // derived features
           const float stubCirclePull =
               (curvatureStubs - curvature) / std::sqrt(std::max(curvatureStubsErrSquared, kEps));
           const float stubCircleRatio = curvatureStubs / (std::abs(curvature) + kEps);
@@ -537,38 +508,39 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                     logDca,
                                                     layGap12,
                                                     layGap23};
-          // NaN discipline, triplet half -- the same rule the track-level gate in
-          // Kernel_classifyTracks follows: a non-finite quantity must never DECIDE anything. The
-          // finiteness of the network INPUTS is established here, BEFORE the score is used, rather
-          // than trusting a NaN to survive the MLP and the sigmoid and then to lose a comparison.
-          // edm::isNotFinite is a bit-pattern test on the exponent field, so it stays valid under
-          // -Ofast / -ffinite-math-only. 29 exponent tests against a ~6k-MAC evaluation: free.
+          // A non-finite quantity must never decide anything, so the finiteness of the network
+          // inputs is established here rather than by trusting a NaN to survive the MLP and the
+          // sigmoid. edm::isNotFinite is a bit-pattern test on the exponent field, so it stays
+          // valid under -Ofast / -ffinite-math-only.
           bool featFinite = true;
           for (int k = 0; featFinite && k < int(caTripletDNN::kNFeat); ++k)
             featFinite = !edm::isNotFinite(feat[k]);
-          const float dnnScore = caTripletDNN_eval::score(feat);
+          const float dnnScore = (tripletBank == DnnBank::kPrompt)
+                                     ? caTripletDNN_eval::score<DnnBank::kPrompt>(feat)
+                                     : caTripletDNN_eval::score<DnnBank::kDisplaced>(feat);
+          const float defThr = (tripletBank == DnnBank::kPrompt) ? caTripletDNN_prompt::kDefaultThreshold
+                                                                 : caTripletDNN_displaced::kDefaultThreshold;
+          const float thr = (tripletDNNThreshold >= 0.f) ? tripletDNNThreshold : defThr;
 #ifdef CA_TRIPLET_DUMP
           if (dumpScore)
             *dumpScore = dnnScore;  // capture the in-kernel score for the offline-vs-in-kernel check
-          // dump build: reject compiled out so every cut-accepted triplet is dumped (see the note above).
-#else
-          const float defThr = caTripletDNN::kDefaultThreshold;
-          const float thr = (tripletDNNThreshold >= 0.f) ? tripletDNNThreshold : defThr;
-          // PROMOTING form on purpose: `score >= threshold` on finite inputs is the decision to
-          // ACCEPT the triplet, and the reject is its negation -- never `if (score < thr) return
-          // false`. Under -Ofast (-ffinite-math-only) the compiler may assume no NaN operand and
-          // rewrite a rejecting predicate into its finite-arithmetic complement, which would let a
-          // NaN score walk through the gate; in this form the default is "do not accept", so
-          // anything the comparison cannot decide stays rejected. The CA_TRIPLET_DUMP early return
-          // above is untouched, so the training dump keeps seeing every cut-accepted triplet.
+          // Dump build: the reject is compiled out only for the iteration being dumped, so every
+          // cut-accepted triplet of that iteration is dumped while any other iteration in the same
+          // job keeps the production reject.
+          if (dumpIteration >= 0)
+            return true;
+#endif
+          // Promoting form on purpose: `score >= threshold` on finite inputs is the decision to
+          // accept, and the reject is its negation, never `if (score < thr) return false`. Under
+          // -Ofast the compiler may assume no NaN operand and rewrite a rejecting predicate into its
+          // finite-arithmetic complement, letting a NaN score through the gate; here the default is
+          // not to accept, so anything the comparison cannot decide stays rejected.
           const bool dnnAccept = featFinite && (dnnScore >= thr);
           if (useTripletDNN && !dnnAccept)
             return false;
-#endif
         }
       }
 
-      // if we arrive at the end, the triplet passed all cuts
       return true;
     }
   };

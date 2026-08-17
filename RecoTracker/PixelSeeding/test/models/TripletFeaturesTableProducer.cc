@@ -1,16 +1,9 @@
-// TripletFeaturesTableProducer - nano flat table with the per-BUILT-TRIPLET feature rows captured
-// on device by the CA_TRIPLET_DUMP path (Kernel_connect) and surfaced as the 'Triplet' product by
-// CAHitNtuplet. The robust ntuple route for the in-kernel triplet-DNN training dataset: one row per
-// built triplet, joined offline to the per-merged-hit truth (HitTruthTableProducer) by the three
-// merged-hit indices h1/h2/h3.
-//
-// Row space: rows = view().nValid() (the valid-row-count scalar stamped device-side == the number
-// of triplets Kernel_connect actually wrote). Only the first nValid rows carry valid data, so we
-// emit exactly nValid rows.
-//
-// Columns mirror caStructures::TripletDumpSoA EXACTLY (18 BASE DNN features in train_triplet_dnn.py
-// order, the three CA layer ids, and the three merged-hit join keys).
-
+// Nano flat table with the per-built-triplet feature rows the CA_TRIPLET_DUMP path captures on
+// device in Kernel_connect. One row per built triplet, joined offline to the per-merged-hit truth
+// by the three merged-hit indices h1/h2/h3.
+// Only the first view().nValid() rows carry valid data, so exactly that many rows are emitted.
+// Columns mirror caStructures::TripletDumpSoA: 18 base DNN features in training order, the three CA
+// layer ids, the three merged-hit join keys and the iteration label.
 #include <vector>
 
 #include "DataFormats/NanoAOD/interface/FlatTable.h"
@@ -34,8 +27,8 @@ public:
   static void fillDescriptions(edm::ConfigurationDescriptions& descriptions) {
     edm::ParameterSetDescription desc;
     desc.add<std::string>("tableName", "Triplet");
-    // The CA producer emits the dump with produces() (no instance label); the device->host
-    // transcription keeps the same module label + empty instance, so just the module name here.
+    // The CA producer emits the dump with no instance label and the device-to-host transcription
+    // keeps it, so the module name alone is enough.
     desc.add<edm::InputTag>("tripletDumpSrc", edm::InputTag("hltPhase2PixelTracksSoALowPt"));
     descriptions.addWithDefaultLabel(desc);
   }
@@ -45,18 +38,17 @@ private:
     const auto& dumpHost = iEvent.get(dumpToken_);
     const auto view = dumpHost.const_view();
 
-    // Valid rows = the count Kernel_connect wrote (full-capacity buffer; rows >= nValid are garbage).
-    // Clamp to the allocated capacity for safety.
+    // The buffer is allocated at full capacity, so rows at or beyond nValid hold garbage.
     const uint32_t cap = static_cast<uint32_t>(view.metadata().size());
     const uint32_t nValid = std::min<uint32_t>(view.nValid(), cap);
 
-    // 18 BASE features (== train_triplet_dnn.py BASE_FEATURES order).
+    // The 18 base features, in training order.
     std::vector<float> absCurvature(nValid), tipTimesCurvature(nValid), dca(nValid), curvatureStubs(nValid),
         curvatureStubsErrSquared(nValid), curvature13(nValid), dPhi12(nValid), dPhi13(nValid), dPhi23(nValid),
         dr12(nValid), dr13(nValid), r1(nValid), r2(nValid), r3(nValid), z1(nValid), z2(nValid), z3(nValid),
         nStubs(nValid), curvature(nValid), inKernelScore(nValid);
-    // CA layer ids (int) and the three merged-hit join keys (uint32).
-    std::vector<int> lay1(nValid), lay2(nValid), lay3(nValid);
+    // CA layer ids and iteration label as int, the three merged-hit join keys as uint32.
+    std::vector<int> lay1(nValid), lay2(nValid), lay3(nValid), iter(nValid);
     std::vector<uint32_t> h1(nValid), h2(nValid), h3(nValid);
 
     for (uint32_t i = 0; i < nValid; ++i) {
@@ -84,6 +76,7 @@ private:
       lay1[i] = row.lay1();
       lay2[i] = row.lay2();
       lay3[i] = row.lay3();
+      iter[i] = row.iter();
       h1[i] = row.h1();
       h2[i] = row.h2();
       h3[i] = row.h3();
@@ -113,6 +106,7 @@ private:
     table->addColumn<int>("lay1", lay1, "inner-hit CA layer id", -1);
     table->addColumn<int>("lay2", lay2, "middle-hit CA layer id", -1);
     table->addColumn<int>("lay3", lay3, "outer-hit CA layer id", -1);
+    table->addColumn<int>("iter", iter, "pixelTrack::Iteration enum value", -1);
     table->addColumn<uint32_t>("h1", h1, "inner merged-hit index (truth join key)", -1);
     table->addColumn<uint32_t>("h2", h2, "middle merged-hit index (truth join key)", -1);
     table->addColumn<uint32_t>("h3", h3, "outer merged-hit index (truth join key)", -1);

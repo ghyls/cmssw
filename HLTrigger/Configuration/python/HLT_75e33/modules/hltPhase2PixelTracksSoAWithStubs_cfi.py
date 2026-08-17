@@ -218,15 +218,14 @@ hltPhase2PixelTracksSoAWithStubs = cms.EDProducer('CAHitNtupletAlpakaPhase2OTStu
     pixelRecHitSrc = cms.InputTag('hltPhase2SiPixelRecHitsSoA'),
     stubsSrc = cms.InputTag('hltOTStubProducer'),
 
-    # In-kernel classifiers: ON; their working points are BAKED in the weight headers (CATripletDNNWeights_*.h,
-    # CATrackDNNWeights_*.h) by the retraining scripts, so no explicit threshold is set here (-1 = baked).
+    # Prompt iteration: no hit is masked; the empty tag means no mask product is consumed at all.
+    hitMask = cms.InputTag(''),
+    iterationName = cms.string('promptHighPt'),
+    # In-kernel triplet and track classifiers; the working points are baked into the weight headers.
     useTripletDNN = cms.bool(True),
     useTrackDNN = cms.bool(True),
 
-    # Generic cut scalars that differ from the topology defaults. Everything not listed here
-    # (ptmin, dzdrFact, maxDYPred, the fishbone and duplicate-removal switches, the fit and DNN
-    # flags, the covariance gate width) is left at the Phase2OTStubs default, which already is
-    # this chain's working point.
+    # Generic cut scalars that differ from the Phase2OTStubs defaults; everything else stays at its default.
     hardCurvCut = cms.double(0.02),
     minYsizeB1 = cms.int32(15),
     minYsizeB2 = cms.int32(14),

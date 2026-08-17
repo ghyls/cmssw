@@ -39,7 +39,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                        ParamsOnDevice const* cpeParams,
                                                        Queue queue) const;
     };
-
   }  // namespace pixelgpudetails
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE
 

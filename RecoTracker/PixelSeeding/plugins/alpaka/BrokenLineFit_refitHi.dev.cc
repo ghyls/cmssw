@@ -4,9 +4,10 @@
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
-  BLFIT_REFIT_SIG(9);
-  BLFIT_REFIT_SIG(10);
-  BLFIT_REFIT_SIG(11);
-  BLFIT_REFIT_SIG(12);
+  // The fused ladder's per-bin fast-fit scans, same N-range (see BrokenLineFit_refitLo.dev.cc).
+  BLFIT_REFIT_SCAN_SIG(9);
+  BLFIT_REFIT_SCAN_SIG(10);
+  BLFIT_REFIT_SCAN_SIG(11);
+  BLFIT_REFIT_SCAN_SIG(12);
 
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE

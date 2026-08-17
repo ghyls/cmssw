@@ -18,6 +18,7 @@ namespace reco {
   using Vector5f = Eigen::Matrix<float, 5, 1>;
   using Vector15f = Eigen::Matrix<float, 15, 1>;
   using Quality = pixelTrack::Quality;
+  using Iteration = pixelTrack::Iteration;
 
   GENERATE_SOA_LAYOUT(TrackLayout,
                       SOA_COLUMN(Quality, quality),
@@ -30,11 +31,12 @@ namespace reco {
                       SOA_EIGEN_COLUMN(Vector15f, covariance),
                       SOA_SCALAR(int, nTracks),
                       SOA_COLUMN(uint32_t, hitOffsets),
-                      // Fitted degrees of freedom (2 * measurements-in-fit - 5, outlier drops
-                      // included; 0 = never fitted).
+                      // CA iteration that produced the track, notIteration on unused tail slots; the
+                      // track provenance in the merged collection.
+                      SOA_COLUMN(Iteration, iteration),
+                      // Fitted ndof: 2*measurements - 5, outlier drops included; 0 = never fitted.
                       SOA_COLUMN(int8_t, ndof))
-
-  // attached: 0 = hit found by the CA, 1 = hit attached to the track after the CA.
+  // attached: 1 for hits added to the track by the extension stage, 0 for hits found by the CA.
   GENERATE_SOA_LAYOUT(TrackHitsLayout,
                       SOA_COLUMN(uint32_t, id),
                       SOA_COLUMN(uint32_t, detId),

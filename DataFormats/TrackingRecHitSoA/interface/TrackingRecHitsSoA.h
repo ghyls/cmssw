@@ -49,6 +49,8 @@ namespace reco {
                       SOA_SCALAR(int32_t, endCapZPos),
                       SOA_SCALAR(int32_t, endCapZNeg))
 
+  GENERATE_SOA_LAYOUT(TrackingRecHitsMaskingLayout, SOA_COLUMN(uint32_t, recHitMask));
+
   using TrackingRecHitSoA = TrackingHitsLayout<>;
   using TrackingRecHitView = TrackingRecHitSoA::View;
   using TrackingRecHitConstView = TrackingRecHitSoA::ConstView;
