@@ -1,8 +1,9 @@
 import FWCore.ParameterSet.Config as cms
 from .hltPhase2PixelTracksSoA_cfi import hltPhase2PixelTracksSoA as _hltPhase2PixelTracksSoA
 
-# Displaced arm of the default (non-stub) chain: the prompt CA producer reading the hit mask instead
-# of all hits. With phase2CAStubs it is replaced by the stub version.
+# Displaced iteration under the label the two-iteration sequence schedules: the prompt CA producer
+# reading the hit mask, replaced by the stub version with phase2CAStubs. The sequence runs only in
+# the stub chain, where the mask is built on the stub-merged rechits this version reads.
 hltPhase2PixelTracksSoADisplaced = _hltPhase2PixelTracksSoA.clone(
     iterationName = cms.string('displaced'),
     hitMask       = cms.InputTag('hltPhase2PixelTrackHighPtMasking'),

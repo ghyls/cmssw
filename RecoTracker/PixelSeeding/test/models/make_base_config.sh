@@ -28,7 +28,7 @@
 #   --geometry G   (default: ExtendedRun4D121)
 #   --conditions C (default: auto:phase2_realistic_T35)
 #   --modifiers M  --procModifiers, verbatim                (default: ngtScouting)
-#                  ngtScouting = phase2CAStubs + pixelTrackMask + ngtScoutingBase:
+#                  ngtScouting = phase2CAStubs + pixelTrackMask + ngtScouting:
 #                  the two-iteration stub CA runs unchanged and hltGeneralTracks
 #                  becomes a pass-through RecoTrackSelector over the pixel tracks,
 #                  so no iterative tracking runs and a dump is cheap. The pixel

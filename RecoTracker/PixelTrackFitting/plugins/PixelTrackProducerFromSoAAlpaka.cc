@@ -98,6 +98,7 @@ private:
   int32_t const minNumberOfHits_;
   pixelTrack::Quality const minQuality_;
   const bool useOTExtension_;
+  const bool throwOnMissing_;
   const bool expandStubs_;
   const bool requireQuadsFromConsecutiveLayers_;
   const bool verbose_;
@@ -115,6 +116,7 @@ PixelTrackProducerFromSoAAlpaka::PixelTrackProducerFromSoAAlpaka(const edm::Para
       minNumberOfHits_(iConfig.getParameter<int>("minNumberOfHits")),
       minQuality_(pixelTrack::qualityByName(iConfig.getParameter<std::string>("minQuality"))),
       useOTExtension_(iConfig.getParameter<bool>("useOTExtension")),
+      throwOnMissing_(iConfig.getParameter<bool>("throwOnMissing")),
       expandStubs_(iConfig.getParameter<bool>("expandStubs")),
       requireQuadsFromConsecutiveLayers_(iConfig.getParameter<bool>("requireQuadsFromConsecutiveLayers")),
       verbose_(iConfig.getUntrackedParameter<bool>("verbose")) {
@@ -195,6 +197,11 @@ void PixelTrackProducerFromSoAAlpaka::fillDescriptions(edm::ConfigurationDescrip
   desc.add<int>("minNumberOfHits", 0);
   desc.add<std::string>("minQuality", "loose");
   desc.add<bool>("useOTExtension", false);
+  desc.add<bool>("throwOnMissing", true)
+      ->setComment(
+          "Throw when the track SoA is absent; false makes the validation clones write empty collections for the "
+          "events "
+          "whose HLT paths did not run the pixel tracking");
   desc.add<bool>("expandStubs", false);
 
   // this option for removing tracks with exactly 4 hits is a temporary solution to reduce the fake rate in Phase-2
@@ -239,6 +246,16 @@ void PixelTrackProducerFromSoAAlpaka::produce(edm::StreamID streamID,
   // get the maps for the detId of the OT modules
   auto const &detIdIsUsedOTModule = runCache(iEvent.getRun().index())->detIdIsUsedOTModule_;
   auto const &detIdToOTModuleId = runCache(iEvent.getRun().index())->detIdToOTModuleId_;
+
+  // Validation clones run for every event, including those whose HLT paths did not run the
+  // pixel tracking: without the track SoA they write empty collections.
+  if (not throwOnMissing_ and not iEvent.getHandle(trackSoAToken_).isValid()) {
+    iEvent.put(std::make_unique<TrackingRecHitCollection>());
+    iEvent.put(std::make_unique<reco::TrackExtraCollection>());
+    iEvent.put(std::make_unique<reco::TrackCollection>());
+    iEvent.put(std::move(indToEdmP));
+    return;
+  }
 
   // get beamspot
   const auto &bsh = iEvent.get(beamSpotToken_);

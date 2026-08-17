@@ -1,7 +1,5 @@
 import FWCore.ParameterSet.Config as cms
 
-# Legacy track converter for stub-based tracking
-# Converts SoA tracks to legacy reco::Track with stub expansion
 hltPhase2PixelTracksWithStubs = cms.EDProducer("PixelTrackProducerFromSoAAlpaka",
     beamSpot = cms.InputTag("hltOnlineBeamSpot"),
     trackSrc = cms.InputTag("hltPhase2PixelTrackTorchHighPuritySelector"),
@@ -14,4 +12,10 @@ hltPhase2PixelTracksWithStubs = cms.EDProducer("PixelTrackProducerFromSoAAlpaka"
     useOTExtension = cms.bool(True),
     expandStubs = cms.bool(True),
     requireQuadsFromConsecutiveLayers = cms.bool(False)
+)
+
+# Two-iteration stub chain (pixelTrackMask): trackSrc is the final high-purity selection, not the merger.
+from Configuration.ProcessModifiers.pixelTrackMask_cff import pixelTrackMask
+pixelTrackMask.toModify(hltPhase2PixelTracksWithStubs,
+    trackSrc = cms.InputTag("hltPhase2PixelTrackHighPuritySelectorMerged"),
 )
