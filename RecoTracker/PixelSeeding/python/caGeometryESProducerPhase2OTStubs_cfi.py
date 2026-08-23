@@ -1,24 +1,11 @@
 import FWCore.ParameterSet.Config as cms
 
-# Per-topology alpaka ESProducer (Phase2OTStubs) for the geometry-only blocks of the CA geometry SoA
-# (per-module surface frames, per-CA-layer geometry classification, the layer-pair graph, and the
-# per-layer fishbone cut). Registered by CAGeometryESProducer<pixelTopology::Phase2OTStubs>; used by
-# the OT-stubs prompt (hltPhase2PixelTracksSoAWithStubs) and displaced
-# (hltPhase2PixelTracksSoADisplacedWithStubs) arms that the phase2CAStubs modifier swaps in. The
-# framework selects the backend (CPU serial, CUDA, ROCm) at runtime.
-#
-# `geometry` MUST match the CA producer that shares this geometry (same layer-pair graph +
-# fishbone thresholds); copy its pairGraph/startingPairs/skipsLayers/fishboneCuts when instantiating.
+# Geometry-only blocks of the CA geometry SoA for Phase2OTStubs: module surface frames and per-CA-layer
+# classification, shared by both OT-stub CA iterations and the merger. Nothing here is per iteration.
 caGeometryESProducerPhase2OTStubs = cms.ESProducer('CAGeometryESProducerPhase2OTStubs@alpaka',
-    # The geometry-only members of upstream's CA `geometry` PSet (pairGraph = flat [i0,o0,i1,o1,...],
-    # startingPairs = list of pair IDs, skipsLayers per pair, fishboneCuts per layer), copied from the
-    # CA producer that shares this geometry.
-    geometry = cms.PSet(
-        pairGraph     = cms.vuint32(),
-        startingPairs = cms.vuint32(),
-        skipsLayers   = cms.vuint32(),
-        fishboneCuts  = cms.vdouble(),
-    ),
+    # pixelTopology::Phase2OTStubs::numberOfLayers, 28 pixel + 26 outer-tracker CA layers; must match
+    # every CA producer sharing this geometry.
+    nLayers = cms.uint32(54),
     appendToDataLabel = cms.string(''),
     alpaka = cms.untracked.PSet(
         backend = cms.untracked.string('')  # Empty string = use default backend

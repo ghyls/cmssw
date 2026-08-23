@@ -111,7 +111,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     using Tuples = caStructures::SequentialContainer;
     using TupleMultiplicity = caStructures::GenericContainer;
 
-    explicit HelixFit(float bf, bool fitNas4) : bField_(bf), fitNas4_(fitNas4) {}
+    explicit HelixFit(float bf) : bField_(bf) {}
     ~HelixFit() { deallocate(); }
 
     void setBField(double bField) { bField_ = bField; }
@@ -283,8 +283,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // One-shot post-fit device dump of the first verboseDumpN_ tracks (see setVerboseDump).
     bool verboseDump_ = false;
     uint32_t verboseDumpN_ = 10;
-
-    const bool fitNas4_;
   };
 
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE

@@ -22,39 +22,28 @@
 
 namespace reco {
 
-  // Build the GEOMETRY-ONLY blocks of the CA geometry SoA once at conditions time. This is a
-  // faithful lift of the module/layer/graph fill in CAHitNtuplet.cc globalBeginRun (the geometry,
-  // per-CA-layer classification, and layer-pair graph). It intentionally does NOT fill the
-  // doublet/triplet/ntuplet cut blocks: those are per-producer configuration, not conditions, and
-  // are left default in the returned product (only `layers.fishboneCut` and the `graph` block --
-  // which are pure per-run geometry/topology inputs -- are written here alongside the module and
-  // layer geometry).
-  //
-  //   trackerGeometry / trackerTopology : the per-run tracker geometry + topology records.
-  //   stackedGeometry                   : the CA-ordered OT stacked-module geometry (non-null only
-  //                                       for the Phase2OTStubs topology); provides the OT module
-  //                                       ordering and per-sensor frames.
-  //   layerPairs / startingPair / skipsLayers : the layer-pair graph configuration (per producer;
-  //                                       identical across producers sharing a geometry).
-  //   fishboneCuts                      : per-CA-layer fishbone merge threshold (sizes n_layers).
+  // Build the geometry-only blocks of the CA geometry SoA, a pure function of (TrackerGeometry, TrackerTopology,
+  // StackedModuleGeometry, nLayers): layers (layerStarts, isBarrel, isOT, isSS; nLayers + 1 rows, the extra
+  // layerStarts slot holding the total module count) and modules (detFrame, innerSensorFrame; one row per CA
+  // module). One copy serves every CA iteration over the same geometry. stackedGeometry is non-null only for
+  // Phase2OTStubs; nCutPairs / nCutLayers (default 0) size the cut blocks, which a CA producer that keeps its
+  // cuts in the same product fills in place.
   template <typename TrackerTraits>
   reco::CAGeometryHost buildCAGeometryHost(TrackerGeometry const& trackerGeometry,
                                            TrackerTopology const& trackerTopology,
                                            reco::StackedModuleGeometryHost const* stackedGeometry,
-                                           std::vector<unsigned int> const& layerPairs,
-                                           std::vector<unsigned int> const& startingPair,
-                                           std::vector<unsigned int> const& skipsLayers,
-                                           std::vector<double> const& fishboneCuts) {
+                                           int nLayers,
+                                           int nCutPairs = 0,
+                                           int nCutLayers = 0) {
     using Rotation = SOARotation<float>;
     using Frame = SOAFrame<float>;
 
-    int n_layers = fishboneCuts.size();
-    int n_pairs = layerPairs.size() / 2;
+    int n_layers = nLayers;
     int n_modules = 0;
 
-    assert(n_pairs == int(startingPair.size()));
-    assert(n_pairs == int(skipsLayers.size()));
-    assert(int(*std::max_element(layerPairs.begin(), layerPairs.end())) < n_layers);
+    assert(n_layers > 0);
+    assert(nCutPairs >= 0);
+    assert(nCutLayers == 0 || nCutLayers == n_layers);
 
     auto const& dets = trackerGeometry.dets();
 
@@ -136,18 +125,10 @@ namespace reco {
       counter++;
     }
 
-    // Process OT stacked modules for Phase-2 with stubs
-    // CA layers follow inside-out ordering:
-    // - CA layers 28-33: Barrel (layers 1-6)
-    // - CA layers 34-43: disks 1-5 at z > 0, each disk as a PS layer (even id) then a 2S layer (odd id)
-    // - CA layers 44-53: disks 1-5 at z < 0, same PS/2S alternation
-    //
-    // IMPORTANT: StackedModuleGeometry is ALREADY sorted in CA order by StackedModuleGeometryESProducer
-    // (barrel by layer -> z > 0 disks by layer -> z < 0 disks by layer, PS before 2S) using stable_sort.
-    // We iterate through it in index order WITHOUT re-sorting to ensure the frame array
-    // index matches the detectorIndex assigned to hits/stubs (detectorIndex = nPixelModules + geomIndex).
+    // CA layers 28-33: barrel layers 1-6; 34-43: disks 1-5 at z > 0 (PS layer, then 2S layer); 44-53: the same
+    // at z < 0. StackedModuleGeometry is already sorted in this order by StackedModuleGeometryESProducer and is
+    // walked in index order, so the frame index matches detectorIndex = nPixelModules + geomIndex.
     // Number of pixel modules already processed; OT modules start at this CA module index.
-    // Used below when populating CAModulesSoA::innerSensorFrame for OT modules.
     const int nPixelModulesInCA = n_modules;
 
     if constexpr (std::is_same_v<pixelTopology::Phase2OTStubs, TrackerTraits>) {
@@ -160,7 +141,6 @@ namespace reco {
         bool prevIsPS = false;
         int prevCategory = -1;  // 0=barrel, 1=z < 0 endcap, 2=z > 0 endcap
 
-        // Iterate through StackedModuleGeometry in index order (already sorted in CA order)
         for (uint32_t i = 0; i < nStackedModules; ++i) {
           bool isBarrelMod = stackedView.isBarrel()[i];
           bool isFwdEndcap = stackedView.isFwdEndcap()[i];
@@ -171,10 +151,8 @@ namespace reco {
           // Determine category: 0=barrel, 1=z < 0 endcap, 2=z > 0 endcap
           int category = isBarrelMod ? 0 : (isFwdEndcap ? 2 : 1);
 
-          // Check if we've transitioned to a new CA layer
-          // A new layer starts when category changes OR layer number changes within same category
+          // A new CA layer starts when the category changes, or the layer number changes within one.
           if (firstModule || category != prevCategory || otLayer != prevLayer || isPS != prevIsPS) {
-            // Start new CA layer
             if (layerCount < layerStarts.size()) {
               layerIsBarrel[layerCount] = isBarrelMod;
               layerIsOT[layerCount] =
@@ -188,7 +166,6 @@ namespace reco {
             firstModule = false;
           }
 
-          // Find this module in TrackerGeometry dets list
           bool found = false;
           for (int detIdx = 0; detIdx < static_cast<int>(dets.size()); ++detIdx) {
             if (dets[detIdx]->geographicalId() == stackedDetId) {
@@ -208,15 +185,15 @@ namespace reco {
 
     layerStarts[n_layers] = n_modules;
 
+    // Block sizes, in CALayoutTemplate order: layers, graph, doubletCuts, tripletCuts, ntupletCuts,
+    // modules. With the default nCutPairs/nCutLayers = 0 the four configuration blocks get zero rows.
     reco::CAGeometryHost product{
-        cms::alpakatools::host(), n_layers + 1, n_pairs, n_pairs, n_pairs, n_layers, n_modules};
+        cms::alpakatools::host(), n_layers + 1, nCutPairs, nCutPairs, nCutPairs, nCutLayers, n_modules};
 
     auto layerSoA = product.view().layers();
-    auto graphSoA = product.view().graph();
     auto modulesSoA = product.view().modules();
 
-    // For Phase2OTStubs, stackedView is needed below to pick the right per-sensor
-    // frame for each OT module's `innerSensorFrame` per the contract:
+    // For Phase2OTStubs, stackedView picks the per-sensor frame for each OT module's `innerSensorFrame`:
     //   - PSP (moduleType==0): inner = lower sensor (P-side).
     //   - PSS (moduleType==1): inner = upper sensor (P-side).
     //   - SS:                   inner = physically-inner = lower if !isFlipped, else upper.
@@ -256,7 +233,6 @@ namespace reco {
     }
 
     for (int i = 0; i < n_layers; ++i) {
-      layerSoA.fishboneCut()[i] = fishboneCuts[i];
       layerSoA.layerStarts()[i] = layerStarts[i];
       layerSoA.isBarrel()[i] = layerIsBarrel[i];
       layerSoA.isOT()[i] = layerIsOT[i];
@@ -264,12 +240,6 @@ namespace reco {
     }
 
     layerSoA.layerStarts()[n_layers] = layerStarts[n_layers];
-
-    for (int i = 0; i < n_pairs; ++i) {
-      graphSoA.layerPair()[i] = {{uint32_t(layerPairs[2 * i]), uint32_t(layerPairs[2 * i + 1])}};
-      graphSoA.skipsLayers()[i] = uint16_t(bool(skipsLayers[i]));
-      graphSoA.startingPair()[i] = startingPair[i];
-    }
 
     return product;
   }

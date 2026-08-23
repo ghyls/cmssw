@@ -1,18 +1,16 @@
 #ifndef RecoTracker_PixelSeeding_plugins_alpaka_BrokenLineFit_h
 #define RecoTracker_PixelSeeding_plugins_alpaka_BrokenLineFit_h
 
-// Orchestration of the SPLIT BrokenLine fit build, instantiated per topology by BrokenLineFit_<Topology>.dev.cc. The heavy per-N device kernels
-// (Kernel_BLFit + fast-fit kernels) and the per-N launcher helpers
-// live in BrokenLineFitKernels.h and are explicitly instantiated in the
-// disjoint-N BrokenLineFit_*.dev.cc TUs; here they are extern-template calls only. This file
-// keeps the light launcher orchestration (HelixFit members) and the debug dump + twin-refit
-// kernels. The split is a build-time division only: the
-// launches keep the same order, arguments and grids they would have in a single TU.
+// Orchestration translation unit of the split BrokenLine fit build. The heavy per-N device kernels and
+// the launcher helpers live in BrokenLineFitKernels.h and are explicitly instantiated in the
+// BrokenLineFit_*.dev.cc translation units; here they are extern-template calls only. This file keeps
+// the launcher orchestration (HelixFit members), the debug dump and twin-refit kernels, and the HelixFit
+// explicit instantiations. The split is a build-time division: the launches keep the same order,
+// arguments and grids they would have in a single translation unit.
 #include "BrokenLineFitKernels.h"
 #include "FWCore/Utilities/interface/isFinite.h"  // bit-pattern finiteness test for the failed-refit guard
 #include "HeterogeneousCore/AlpakaInterface/interface/prefixScan.h"  // parallel hit compaction (Counts->scan->Scatter)
 #include "DataFormats/TrackSoA/interface/alpaka/TracksSoACollection.h"  // dedup union-refit scratch output SoA
-#include <optional>  // fused-ladder partition tables, allocated only on the fused arm
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
@@ -79,10 +77,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     uint32_t tagId_;
   };
 
-  // The CA main fit: one full sweep of the N-binned BLFastFit+BLFit kernels, i.e. the factorized fast
-  // BrokenLine fit (circle + line), for every CA iteration and every topology. It has ONE linearization,
-  // so it is a single sweep with no phase split and no re-linearization reference buffer. The General
-  // Broken Lines fit runs once per track downstream, in the merger (refitExtended / refitMergedTwins).
+  // The CA main fit: one full sweep of the N-binned BLFastFit and BLFit kernels, the factorized fast
+  // BrokenLine fit (circle + line), for every CA iteration and every topology. It has one linearization,
+  // so it is a single sweep with no phase split and no re-linearization reference buffer.
   template <typename TrackerTraits>
   void HelixFit<TrackerTraits>::launchBrokenLineKernels(const HitsMultiView& hv,
                                                         const ::reco::CAModulesConstView& cm,
@@ -96,10 +93,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     std::cout << "Starting HelixFit<TrackerTraits>::launchBrokenLineKernels" << std::endl;
 #endif
 
-    // Main-fit block dimension: kFitBlock. Launch
-    // dimension only -- the fast-fit and fit kernels are grid-stride loops with the invalid-tkid break,
-    // so the fitted-lane set and every fitted value are independent of it.
-    const uint32_t blockSize = kFitBlock;
     // The launch grid sizes off maxNumberOfTuples, the host-known per-event tuple capacity (the
     // hit-count-scaled cap the CA sizes its tuple/multiplicity containers to; not a device readback). The
     // exact per-N-bin population lives only device-side (tupleMultiplicity); a tighter trim would need a
@@ -121,42 +114,26 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     constexpr int kScratchPerFit = brokenline::kLegacyFitScratchDoubles<int(maxN)>;
     auto gblScratchDevice = cms::alpakatools::make_device_buffer<double[]>(
         queue, std::size_t(maxNumberOfConcurrentFits_) * std::size_t(kScratchPerFit));
-    // The per-bin ladder is the fitNas4 arm: that mode launches the N=4 bin once per rolling index and
-    // then the tail bin, which is not a partition, so it cannot be expressed as a fused launch. It is also
-    // what keeps runMainBin<N, TrackerTraits> (and the per-N Kernel_BLFastFit / Kernel_BLFit
-    // instantiations of the split TUs) referenced.
-    const bool serialLadder = fitNas4_;
-
     // Dynamic-partition bookkeeping of the fused ladder (see the block comment at the head of
     // BrokenLineFitKernels.h). One uint32 allocation holding, in order: the per-bin round cursor
     // [0, kNBins), the per-bin {firstLane, nLanes, tupleBase} ranges, and the per-block
     // {bin, firstLane, endLane} dispatch table (a few kB, caching-allocator backed). No memset:
     // Kernel_BLMainLaneRanges writes every word it later reads (the cursor on the first round, the ranges
-    // and the block map on every round). The per-bin ladder never touches it.
+    // and the block map on every round).
     constexpr uint32_t kNBins = kMainNBins<TrackerTraits>;
     constexpr uint32_t kFusedBlk = kMainFusedBlocks<TrackerTraits>;
     constexpr uint32_t kPartWords = kNBins + kMainRangeStride * kNBins + kMainBlockMapStride * kFusedBlk;
-    // Allocated only on the fused arm, so the per-bin ladder keeps its own allocation sequence: the
-    // caching allocator hands out blocks in call order, and an extra allocation would change which block
-    // every later allocation of the event gets.
-    std::optional<decltype(cms::alpakatools::make_device_buffer<uint32_t[]>(queue, kPartWords))> partDevice;
-    uint32_t* pCursor = nullptr;
-    uint32_t* pRange = nullptr;
-    uint32_t* pBlockMap = nullptr;
-    if (!serialLadder) {
-      partDevice.emplace(cms::alpakatools::make_device_buffer<uint32_t[]>(queue, kPartWords));
-      pCursor = partDevice->data();
-      pRange = pCursor + kNBins;
-      pBlockMap = pRange + kMainRangeStride * kNBins;
-    }
-    // Fused grid: kMainFusedBlocks blocks of kFitBlock, the width that covers EVERY partition the
+    auto partDevice = cms::alpakatools::make_device_buffer<uint32_t[]>(queue, kPartWords);
+    uint32_t* pCursor = partDevice.data();
+    uint32_t* pRange = pCursor + kNBins;
+    uint32_t* pBlockMap = pRange + kMainRangeStride * kNBins;
+    // Fused grid: kMainFusedBlocks blocks of kFitBlock, the width that covers every partition the
     // per-event populations can produce. Fixed and host-known; the device table says which blocks are
     // live and on which bin.
     const WorkDiv1D workDivFused = cms::alpakatools::make_workdiv<Acc1D>(kFusedBlk, kFitBlock);
 
-    // Per-N launch state for the extern-template runMainBin helpers (see BrokenLineFitKernels.h).
-    // The per-N (fast-fit + fit) launches live in runMainBin<N,TrackerTraits>, explicitly instantiated in
-    // the BrokenLineFit_*.dev.cc N-range TUs so nvcc compiles the heavy per-N kernels in parallel.
+    // Launch state of the fused ladder (see BrokenLineFitKernels.h). The fused fast-fit and fit
+    // launchers are explicitly instantiated one phase per TU so nvcc compiles them in parallel.
     const BLMainLaunchCtx<TrackerTraits> ctx{queue,
                                              tuples_,
                                              tupleMultiplicity_,
@@ -176,15 +153,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                              pBlockMap,
                                              workDivFused};
 
-    // Chunk+bin-aware main-fit launch elision, driven by the tuple-multiplicity per-N-bin offsets:
-    // (a) stop the chunk loop at the runtime fitted population and (b) elide any N-bin whose population
-    // the chunk base offset already covers. Both are exactly the on-device no-op the launched kernel
-    // would have performed (each thread's tuple_idx >= totTK on the first lane -> writes the invalid
-    // sentinel and breaks -> no SoA write), so the collapse cannot move a result. Without it the offset
-    // loop chunks the hit-scaled tuple cap and launches every N-bin in every chunk.
+    // Round-count bound of the fused ladder, driven by the tuple-multiplicity per-N-bin offsets: stop
+    // at the runtime fitted population instead of the hit-scaled tuple cap. A round beyond it is exactly
+    // the on-device no-op the launched kernel would have performed (each thread's tuple_idx >= totTK on
+    // the first lane -> writes the invalid sentinel and breaks -> no SoA write), so this cannot move a
+    // result.
     constexpr uint32_t kNOff = TrackerTraits::maxHitsOnTrack + 2u;  // == the offsets buffer length
     uint32_t offHost[kNOff] = {0};
-    bool skipEmpty = false;
     uint32_t chunkBound = maxNumberOfTuples;  // no offsets available: iterate the full hit-scaled cap
     if (hostTupleMultiplicityOffsets_ != nullptr) {
       // The caller (the producer's acquire) already read the offsets back with one async D2H and the
@@ -194,26 +169,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       // break condition sees; nothing is re-derived here.
       for (uint32_t b = 0; b < kNOff; ++b)
         offHost[b] = hostTupleMultiplicityOffsets_[b];
-      skipEmpty = true;
       // Total fitted population off[maxHitsOnTrack]-off[3] (tuples with selected-hit count in
-      // [3, maxHitsOnTrack-1]) is an upper bound on any single N-bin's population, so a loop bounded by
-      // it runs at least as many stride chunks as the largest bin needs; the per-bin gate elides the
-      // rest. In practice this population is well below the stride, so the loop collapses to one chunk.
+      // [3, maxHitsOnTrack-1]). In practice it is well below the lane stride, so one round drains it.
       const uint32_t lo = offHost[3];
       const uint32_t hi = offHost[TrackerTraits::maxHitsOnTrack];
       chunkBound = (hi > lo) ? (hi - lo) : 0u;
     }
-    // Per-(N-bin, chunk) launch gate. A bin holding off[nHitsH+1]-off[nHitsL] tuples has NO work once the
-    // chunk base offset reaches that count (Kernel_BLFastFit breaks on the first lane, Kernel_BLFit breaks
-    // on the invalid sentinel -> zero SoA writes), so eliding the launch changes nothing.
-    auto runBinGated = [&](auto Ntag, WorkDiv1D const& wd, uint32_t nHitsL, uint32_t nHitsH, uint32_t baseOffset) {
-      constexpr int Nv = decltype(Ntag)::value;
-      if (skipEmpty && baseOffset >= (offHost[nHitsH + 1u] - offHost[nHitsL]))
-        return;
-      runMainBin<Nv, TrackerTraits>(ctx, wd, nHitsL, nHitsH, baseOffset);
-    };
-
-    if (!serialLadder) {
+    {
       // The fused ladder. Per round: 1 range kernel + 1 fused fast fit + 1 fused fit, instead of the
       // per-bin ladder's 2 * kMainNBins launches per chunk. One round seats maxNumberOfConcurrentFits_
       // tuples and the demand can never exceed the population chunkBound counts, so
@@ -221,9 +183,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       // chunkBound == 0 (no fitted population) runs zero rounds.
       const uint32_t nRounds = cms::alpakatools::divide_up_by(chunkBound, maxNumberOfConcurrentFits_);
       for (uint32_t round = 0; round < nRounds; ++round) {
-        // The DYNAMIC PARTITION: prefix-sum the per-bin populations (read straight off
-        // tupleMultiplicity -- no count kernel, no readback, no sync) into lane ranges and the
-        // block -> bin dispatch table.
+        // Dynamic partition: prefix-sum the per-bin populations, read straight off tupleMultiplicity with
+        // no count kernel, readback or sync, into lane ranges and the block -> bin dispatch table.
         alpaka::exec<Acc1D>(queue,
                             cms::alpakatools::make_workdiv<Acc1D>(1u, 1u),
                             Kernel_BLMainLaneRanges<TrackerTraits>{},
@@ -237,61 +198,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         runMainFusedFit<TrackerTraits>(ctx);
       }
     }
-
-    for (uint32_t offset = 0; serialLadder && offset < chunkBound; offset += maxNumberOfConcurrentFits_) {
-      // Size THIS chunk's grid from the remaining host-known tuple capacity. A full chunk
-      // (>= a lane count of tuples still to come) takes the full 128-block triplet / 32-block quad-penta
-      // grid; the last chunk -- and, when maxNumberOfTuples < the lane count, the only chunk -- trims to
-      // divide_up(remaining). Grid-stride (uniform_elements over the lane stride) + the invalid-tkid break
-      // make the fitted-lane set, and its values, independent of the block count. numberOfBlocks is >= 1
-      // (remaining >= 1 while the loop runs); the quad-penta count is floored at 1 so its /4 never
-      // collapses to a 0-block launch.
-      const uint32_t chunkFits = std::min<uint32_t>(maxNumberOfConcurrentFits_, maxNumberOfTuples - offset);
-      const uint32_t numberOfBlocks = cms::alpakatools::divide_up_by(chunkFits, blockSize);
-      const WorkDiv1D workDivTriplets = cms::alpakatools::make_workdiv<Acc1D>(numberOfBlocks, blockSize);
-      const WorkDiv1D workDivQuadsPenta =
-          cms::alpakatools::make_workdiv<Acc1D>(std::max<uint32_t>(1u, numberOfBlocks / 4), blockSize);
-      // fit triplets
-      runBinGated(std::integral_constant<int, 3>{}, workDivTriplets, 3u, 3u, offset);
-#ifdef GPU_DEBUG
-      alpaka::wait(queue);
-      std::cout << "Kernel_BLFastFit(3) and Kernel_BLFit(3) -> done! " << std::endl;
-#endif
-
-      if (fitNas4_) {
-        // fit all as 4
-        riemannFit::rolling_fits<4, TrackerTraits::maxHitsOnTrack, 1>(
-            [&runBinGated, &offset, &workDivQuadsPenta](auto i) {
-              (void)i;
-              runBinGated(std::integral_constant<int, 4>{}, workDivQuadsPenta, 4u, 4u, offset);
-            });
-
-        static_assert(TrackerTraits::maxHitsOnTrackForFullFit < TrackerTraits::maxHitsOnTrack);
-
-        //Fit all the rest using the maximum from previous call
-        runBinGated(std::integral_constant<int, int(TrackerTraits::maxHitsOnTrackForFullFit)>{},
-                    workDivQuadsPenta,
-                    TrackerTraits::maxHitsOnTrackForFullFit,
-                    TrackerTraits::maxHitsOnTrack - 1,
-                    offset);
-      } else {
-        // Rolling fits for multiplicities 4 to maxHitsOnTrackForFullFit
-        riemannFit::rolling_fits<4, TrackerTraits::maxHitsOnTrackForFullFit, 1>(
-            [&runBinGated, &offset, &workDivQuadsPenta](auto i) {
-              constexpr int Nv = decltype(i)::value;
-              runBinGated(i, workDivQuadsPenta, uint32_t(Nv), uint32_t(Nv), offset);
-            });
-
-        static_assert(TrackerTraits::maxHitsOnTrackForFullFit < TrackerTraits::maxHitsOnTrack);
-
-        // Fit all the rest using maxHitsOnTrackForFullFit hits
-        runBinGated(std::integral_constant<int, int(TrackerTraits::maxHitsOnTrackForFullFit)>{},
-                    workDivQuadsPenta,
-                    TrackerTraits::maxHitsOnTrackForFullFit,
-                    TrackerTraits::maxHitsOnTrack - 1,
-                    offset);
-      }
-    }  // loop on concurrent fits
 
     if (verboseDump_) {
       // tag=1 -> post-fit dump of the main-fit launch
@@ -361,10 +267,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       // the Kernel_BLFitPhase* kernels). Caching-allocator backed like the other refit scratch.
       auto phaseDevice =
           cms::alpakatools::make_device_buffer<double[]>(queue, std::size_t(nt) * std::size_t(kBLPhaseDoubles));
-      // Per-lane fit-hit-id table (fitHitId[lane*N + i]). Only wired when the caller asked for the
-      // fit-rejected hit to be removed from the emitted list (dropOutlierHitId_ set by refitMergedTwins);
-      // otherwise pFitHitId stays null and Kernel_BLFastFitRefit skips the write. Tiny (nt*maxN uint32
-      // ~ 98 kB at kRefitStride) and caching-allocator backed like the other refit scratch.
+      // Per-lane fit-hit-id table (fitHitId[lane*N + i]), wired only when the caller asked for the
+      // fit-rejected hit to be removed from the emitted list; otherwise pFitHitId stays null and
+      // Kernel_BLFastFitRefit skips the write.
       const bool dropOutlierActive = (dropOutlierHitId_ != nullptr);
       auto fitHitIdDevice = cms::alpakatools::make_device_buffer<uint32_t[]>(
           queue, dropOutlierActive ? std::size_t(nt) * std::size_t(maxN) : std::size_t(1));
@@ -379,16 +284,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       uint8_t* const pFitHitIsCore = coreProtectActive ? fitHitIsCoreDevice.data() : nullptr;
 
       constexpr uint32_t blockSize = 64;  // scan/compaction work division
-      // Fit block dimension kFitBlock. Launch dimension only: the fit kernels are grid-stride loops over
-      // the same nt lanes and break on the invalid-tkid sentinel, so the fitted-lane set and every
-      // arithmetic operation are independent of it. Applied to the fused fit work division only --
+      // Fit block dimension kFitBlock, a launch dimension only: the fit kernels are grid-stride loops
+      // over the same nt lanes and break on the invalid-tkid sentinel, so the fitted-lane set and every
+      // arithmetic operation are independent of it. It applies to the fused fit work division only;
       // workDivScan keeps blockSize for Kernel_BLFastFitRefit's atomic lane claiming. A small block suits
-      // this solver: it is L1/LSU-pipe bound rather than FP64-latency bound, so the resident lanes are
-      // better spread over more SMs at one warp each.
-      // Fused grid: kFusedBlocks = nt/kFitBlock + kRefitNBins blocks, the width that covers EVERY
-      // partition the per-event count can produce (a bin of n_b lanes needs ceil(n_b/kFitBlock) blocks
-      // and there are kRefitNBins of them). Fixed and host-known; the device table says which blocks
-      // are live and on which bin.
+      // this solver, which is L1/LSU-pipe bound rather than FP64-latency bound.
+      // Fused grid: kFusedBlocks = nt/kFitBlock + kRefitNBins blocks, the width that covers every
+      // partition the per-event count can produce, a bin of n_b lanes needing ceil(n_b/kFitBlock) blocks.
       const WorkDiv1D workDivFused = cms::alpakatools::make_workdiv<Acc1D>(kFusedBlocks, kFitBlock);
       const uint32_t numberOfBlocksScan =
           cms::alpakatools::divide_up_by(std::max<uint32_t>(1u, maxNumberOfTuples), blockSize);
@@ -460,7 +362,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         for (uint32_t round = 0; round < nRounds; ++round) {
           alpaka::memset(queue, counterDevice, 0);
           alpaka::memset(queue, tkidDevice, 0xff);
-          // DYNAMIC PARTITION: count the round's per-bin demand, then prefix-sum it into lane ranges and
+          // Dynamic partition: count the round's per-bin demand, then prefix-sum it into lane ranges and
           // the block -> bin dispatch table. Device-only, no readback, no sync.
           alpaka::exec<Acc1D>(queue,
                               workDivScan,
@@ -480,7 +382,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                               rangeDevice.data(),
                               blockMapDevice.data(),
                               nt);
-          // The SCANS stay per-bin: each carries the grid-scope atomic slot claim that must complete
+          // The scans stay per-bin: each carries the grid-scope atomic slot claim that must complete
           // before any phase of that bin reads ptkids. They seat their tracks in disjoint lane ranges so
           // all ten survive to the fused fit.
           launchScan(std::integral_constant<int, 3>{}, 3u, 3u);
@@ -515,10 +417,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   }
 
   // ---------------------------------------------------------------------------------------------
-  // Merger-side twin refit support: build a SequentialContainer over the MERGED track CSR so the
-  // refitExtended machinery can be reused on the twin-united winners. off[0]=0, off[t+1] =
-  // the merged track's cumulative hit-end (tracks.hitOffsets()); content ALIASES the merged
-  // trackHits id column (bit30 OT tags preserved) so no hit copy is needed.
+  // Merger-side twin refit support: build a SequentialContainer over the merged track CSR so the
+  // refitExtended machinery can be reused on the twin-united winners. off[0] = 0, off[t+1] = the merged
+  // track's cumulative hit-end; content aliases the merged trackHits id column, bit30 OT tags preserved,
+  // so no hit copy is needed.
   // ---------------------------------------------------------------------------------------------
   class Kernel_fillTwinRefitOffsets {
   public:
@@ -534,8 +436,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // Wire the container header to its (already-filled) offsets + aliased content, WITHOUT zeroing
-  // the offsets (unlike launchZero). Single grid thread.
+  // Wire the container header to its already-filled offsets and aliased content, without zeroing the
+  // offsets. Single grid thread.
   class Kernel_initTwinRefitContainer {
   public:
     ALPAKA_FN_ACC void operator()(Acc1D const& acc, caStructures::SequentialContainerView view) const {
@@ -546,21 +448,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // Trajectory-order + physically-dedup the refit input of each united winner. Two union pathologies
-  // break the GBL fit (which assumes the inside-out, one-measurement-per-crossing lists the CA provides),
-  // showing downstream as huge chi2 / NaN covariance:
-  //   (1) ORDER: the merger's track filter (Kernel_filterTracksScatter) appends the loser's non-shared
-  //       hits after the winner's, so the chain zig-zags in radius. Fix: stable insertion sort by 3D
-  //       radius x^2+y^2+z^2 (monotonic along an outgoing near-prompt trajectory in both barrel and
-  //       endcap; transverse r alone scrambles same-ring disk hits).
-  //   (2) SAME PHYSICAL HIT, TWO IDS: one arm attached a raw OT rechit (bit30-tagged id), the other
-  //       carries the same cluster as a merged-SoA stub id. Identical positions => zero-length GBL
-  //       segment => singular normal matrix. The dedup walk only merges consecutive merged-pixel pairs,
-  //       never stub/OT ids. Fix: after sorting, collapse a consecutive pair closer than kDedupDsMin
-  //       (3D here) when at least one member is a stub/OT id; compact the span and pad the tail with an
-  //       untagged out-of-range sentinel (the dedup walk break-terminates on it).
-  // content is a COPY, so the output SoA hit list is untouched. Only unitedMask[t] >= 0 spans are
-  // processed.
+  // Order and dedup the refit input of each united winner (unitedMask[t] >= 0), in a copy of the hit
+  // list. The GBL fit assumes inside-out lists with one measurement per crossing, and a union breaks
+  // that in two ways: the loser's non-shared hits are appended after the winner's (fixed by a stable
+  // insertion sort by x^2+y^2+z^2, monotonic along an outgoing near-prompt trajectory), and the same
+  // physical hit can appear as a raw OT rechit id and as a stub id (identical positions give a
+  // zero-length GBL segment; fixed by collapsing consecutive pairs closer than kDedupDsMin when one
+  // member is a stub/OT id, then padding the tail with an out-of-range sentinel).
   class Kernel_sortUnitedRefitHits {
   public:
     caExtension::OTHitsSource otSource_{};
@@ -618,7 +512,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           }
           content[j] = v;
         }
-        // (2) collapse same-physical-hit duplicates (vs the previous KEPT entry), compact, pad.
+        // (2) collapse same-physical-hit duplicates against the previous kept entry, compact, pad.
         uint32_t w = b;
         float px = 0.f, py = 0.f, pz = 0.f;
         bool pPix = false, havePrev = false;
@@ -733,19 +627,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // ================ PARALLEL dropped-hit compaction (Counts -> prefix-scan -> Scatter) ================
-  // Dropped-hit compaction on the standard Counts->inclusive-scan->Scatter family (mirrors
-  // Kernel_finalDedup{Counts,Scatter}). WHICH hit id each track loses -- dropHitId[t], published by the
-  // fit outlier stage -- is decided elsewhere; these kernels only remove it from the emitted list.
-  //
-  // Semantics: "remove at most one hit with id == dropHitId[t], the first match, keeping every other hit
-  // in its original order". (i) Counts sets hitCnt[t] = span(t) - (dropHitId[t] present ? 1 : 0); a
-  // set-but-absent drop removes nothing. (ii) newOff = inclusive prefix scan of hitCnt is the write
-  // cursor after track t, so tracks[t].hitOffsets() = newOff[t]. (iii) Scatter forward-copies the kept
-  // hits, in order, into [newOff[t-1], newOff[t]). (iv) hitCnt is memset to 0 over the scan capacity so
-  // tail slots [nTracks, cap) stay 0 and the unused tail's hitOffsets is left untouched. The compaction
-  // only removes, so newOff <= origOff everywhere; the Scatter reads from a stable id/detId/attached
-  // snapshot, which keeps parallel per-track writes from clobbering another track's not-yet-read source.
+  // Dropped-hit compaction (Counts -> inclusive scan -> Scatter): remove at most one hit with
+  // id == dropHitId[t] (the first match) from each track, keeping the order. Counts sets
+  // hitCnt[t] = span(t) - (present ? 1 : 0); the scan gives the write cursor tracks[t].hitOffsets(); Scatter
+  // forward-copies the kept hits from a stable id/detId/attached snapshot. hitCnt is memset over the scan
+  // capacity so the unused tail stays 0.
 
   // Snapshot the emitted hit columns before the in-place compacted rewrite.
   class Kernel_e3SnapshotHits {
@@ -764,7 +650,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // Counts: per-track kept-hit count + snapshot of the ORIGINAL per-track hit-end (hitOffsets is rewritten
+  // Counts: per-track kept-hit count and snapshot of the original per-track hit-end (hitOffsets is rewritten
   // by the Scatter, so the source spans must be read from origOff). hitCnt is memset to 0 over the scan
   // capacity by the launcher.
   class Kernel_e3CompactCounts {
@@ -789,7 +675,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           for (uint32_t r = rBeg; r < rEnd; ++r) {
             if (trackHits[r].id() == drop) {
               present = true;
-              break;  // remove exactly ONE hit: the first match
+              break;  // remove exactly one hit: the first match
             }
           }
         }
@@ -848,11 +734,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     if constexpr (std::is_same_v<pixelTopology::Phase2OTStubs, TrackerTraits>) {
       if (nTracksCap == 0)
         return;
-      // Build the merged-CSR SequentialContainer (transient, caching-allocator backed -> the frees
-      // are stream-ordered after the refit kernels that read them, exactly like refitExtended's own
-      // scratch). content = a COPY of the merged trackHits id column (bit30 OT tags preserved):
-      // the united winners' spans get trajectory-ordered below, and the output SoA hit list must
-      // keep its own (converter-facing) order.
+      // Build the merged-CSR SequentialContainer, transient and caching-allocator backed, so the frees
+      // are stream-ordered after the refit kernels that read them. content is a copy of the merged
+      // trackHits id column, bit30 OT tags preserved: the united winners' spans are trajectory-ordered
+      // below, while the output SoA hit list keeps its own converter-facing order.
       const uint32_t nHitsTot = uint32_t(mergedHits.metadata().size());
       auto contHeader = cms::alpakatools::make_device_buffer<caStructures::SequentialContainer>(queue);
       auto offBuf = cms::alpakatools::make_device_buffer<caStructures::SequentialContainerOffsets[]>(

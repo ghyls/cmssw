@@ -30,18 +30,19 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caPixelDoublets {
   public:
     using HitsMultiView = caStructures::HitsViewT<TrackerTraits>;
 
+    // ntupletCuts: per-CA-layer cut block; only `fishboneCut` is read here, indexed by the CA layer
+    // of the shared outer hit.
     ALPAKA_FN_ACC void operator()(Acc2D const& acc,
                                   HitsMultiView hh,
-                                  ::reco::CALayersSoAConstView const& ll,
+                                  ::reco::CANtupletCutsSoAConstView const& ntupletCuts,
                                   ::reco::CAGraphSoAConstView const& cc,
                                   CACell<TrackerTraits>* cells,
-                                  uint32_t const* __restrict__ nCells,
                                   HitToCell const* __restrict__ outerHitHisto,
                                   CellToTracks const* __restrict__ cellTracksHisto,
                                   uint32_t outerHits,
                                   bool checkTrack,
-                                  uint32_t* __restrict__ pipelineCounters = nullptr,
-                                  bool checkSameLayerOnly = false) const {
+                                  uint32_t* __restrict__ pipelineCounters,
+                                  bool checkSameLayerOnly) const {
       // outermost parallel loop, using all grid elements along the slower dimension (Y or 0 in a 2D grid)
       for (uint32_t idy : cms::alpakatools::uniform_elements_y(acc, outerHits)) {
         uint32_t size = outerHitHisto->size(idy);
@@ -60,8 +61,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caPixelDoublets {
         auto yo = c0.outer_y(hh);
         auto zo = c0.outer_z(hh);
         auto const lo = c0.outerLayer(cc);
-        auto const threshold = ll[lo].fishboneCut();
-        //printf("first cell %d xo %.2f yo %.2f zo %.2f - ",bin[0],c0.outer_x(hh),c0.outer_y(hh),c0.outer_z(hh));ve
+        auto const threshold = ntupletCuts[lo].fishboneCut();
 
 #ifdef GPU_DEBUG
         for (auto idx = 0u; idx < size; idx++) {
@@ -99,7 +99,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caPixelDoublets {
                    cj.inner_z(hh));
 #endif
 
-            // Same detector module check with special handling for stubs
             if (ci.inner_detIndex(hh) == cj.inner_detIndex(hh)) {
               // Two stubs on the same module are duplicates only if they were built from the same
               // lower cluster, i.e. the same lowerHitIdx: one measurement paired with two different
@@ -108,18 +107,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caPixelDoublets {
               if constexpr (std::is_same_v<pixelTopology::Phase2OTStubs, TrackerTraits>) {
                 auto innerHitI = ci.inner_hit_id();
                 auto innerHitJ = cj.inner_hit_id();
-                // Check if both inner hits are stubs
                 if (isStub(hh, innerHitI) && isStub(hh, innerHitJ)) {
                   auto lowerHitI = hh.stub(innerHitI).lowerHitIdx();
                   auto lowerHitJ = hh.stub(innerHitJ).lowerHitIdx();
-                  // If different lower hits (different P-hits on same module), skip
-                  // These are not duplicates - they represent different physical P-hits
                   if (lowerHitI != lowerHitJ) {
                     continue;
                   }
 
-                  // Same lower hit: these are duplicate stubs from the same P-hit
-                  // Check which stub dPhiDr is more compatible with the doublet
+                  // Duplicate stubs: keep the one whose dPhiDr agrees better with the doublet.
                   auto iphio = ci.outer_iphi(hh);
                   auto iphii = ci.inner_iphi(hh);
                   auto ro = ci.outer_r(hh);
@@ -129,21 +124,17 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caPixelDoublets {
                   auto dPhiDiffI = std::abs(dphi - dr * ci.inner_dPhiDr(hh));
                   auto dPhiDiffJ = std::abs(dphi - dr * cj.inner_dPhiDr(hh));
 
-                  // keep the one that agrees better (smaller abs dPhiDiff)
-                  // and kill the other cell
-                  // Note: we also don't remember the other cell as a fishbone in the CACell because
-                  //       the killed cell probably had a fake stub (worse alignment)
+                  // The killed cell is not remembered as a fishbone: it probably carried a fake stub.
                   if (dPhiDiffI < dPhiDiffJ)
                     cj.kill();
                   else
                     ci.kill();
                 }
-                // continue since stubs are fully dealt with above
-                // and if one is no stub we don't want to remove any
+                // If either inner hit is not a stub, remove neither.
                 continue;
 
               } else {
-                // Other topologies: cells whose inner hits sit on the same module are never compared
+                // Other topologies: cells sharing the inner module are never compared.
                 continue;
               }
             }

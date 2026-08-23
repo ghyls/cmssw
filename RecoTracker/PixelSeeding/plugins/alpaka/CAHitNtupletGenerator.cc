@@ -91,7 +91,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       desc.add<double>("hardCurvCut", TrackerTraits::maxCurv)
           ->setComment("Cut on minimum curvature, used in DCA ntuplet selection");
 
-      // ---- OT-stub extension: triplet scalars with no upstream counterpart ----
+      // OT-stub extension triplet scalars.
       desc.add<double>("maxPhiResid", -1.0)
           ->setComment(
               "OT-stub extension. Max |phi residual| per connection during chain extension [rad]. "
@@ -106,18 +106,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
               "OT-stub extension. If true, require dPhi12 * dPhi23 > 0 in a triplet. Off on every "
               "topology but Phase2OTStubs.");
 
-      // -------------------------------------------------------------------------------------------
-      // Layer- and layer-pair-dependent configuration: the `geometry` PSet.
-      //
-      // The CA SoA is organised by purpose (layers / graph / doubletCuts / tripletCuts / ntupletCuts)
-      // and indexes the two triplet cuts by LAYER PAIR rather than by layer; CAHitNtuplet.cc performs
-      // the conversion when it builds the geometry product, broadcasting each per-layer value onto the
-      // pairs whose own INNER layer it belongs to. That broadcast is exactly the indexing the kernels
-      // read back (caDCACuts at the triplet's innermost layer, caThetaCuts at its middle layer).
-      //
-      // The OT-stub extension adds a small set of OPTIONAL parameters at the end of this block; every
-      // one of them is absent from a non-stub configuration and inert when absent.
-      // -------------------------------------------------------------------------------------------
+      // Layer- and layer-pair-dependent configuration: the `geometry` PSet. The CA SoA is organised by
+      // purpose (layers / graph / doubletCuts / tripletCuts / ntupletCuts) and indexes the two triplet
+      // cuts by layer pair rather than by layer; CAHitNtuplet.cc broadcasts each per-layer value onto the
+      // pairs whose inner layer it belongs to, which is the indexing the kernels read back (caDCACuts at
+      // the triplet's innermost layer, caThetaCuts at its middle layer). The OT-stub extension parameters
+      // at the end of the block are optional and inert when absent.
       edm::ParameterSetDescription geometryParams;
 
       // ---- layers params ----
@@ -218,11 +212,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
               std::vector<double>(TrackerTraits::maxDZ, TrackerTraits::maxDZ + TrackerTraits::nPairsForQuadruplets))
           ->setComment("Cuts in maximum dz between hits for cells");
 
-      // ---------------------------------------------------------------------------------------
-      // OT-stub extension. All entries below are OPTIONAL: the three "...PerPair" vectors fall back
-      // to the broadcast of their per-layer / scalar source, the stub-only cuts fall back to the
-      // disabled sentinel -1.
-      // ---------------------------------------------------------------------------------------
+      // OT-stub extension. All entries below are optional: the three "...PerPair" vectors fall back to
+      // the broadcast of their per-layer or scalar source, the stub-only cuts to the sentinel -1.
       geometryParams.addOptional<std::vector<double>>("caDCACutsPerPair")
           ->setComment(
               "OT-stub extension. Per-layer-pair override of caDCACuts: one entry per layer pair, replacing the "
@@ -305,7 +296,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       desc.add<unsigned int>("minHitsForSharingCut", kStubs ? 1 : 10)
           ->setComment("Maximum number of hits in a tuple to clean also if the shared hit is on bpx1");
 
-      desc.add<bool>("fitNas4", false)->setComment("fit only 4 hits out of N");
+      desc.add<bool>("fitNas4", false)
+          ->setComment(
+              "obsolete: the serial per-bin fit ladder it selected has been removed, only the fused ladder "
+              "remains. Kept so the deployed menus still validate; setting it true is a configuration error.");
       desc.add<bool>("verboseBLFit", false)
           ->setComment("one-shot device dump of the first fitted tracks at the end of each BL-fit launch (debug)");
       desc.add<bool>("useRiemannFit", false)->setComment("true for Riemann, false for BrokenLine");
@@ -399,6 +393,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       // Designated initializers: the field set of AlgoParams is shared with upstream and grows there,
       // so a positional aggregate initialization would silently shift every value the next time a
       // member is inserted. Keep this list keyed by name.
+      if (cfg.getParameter<bool>("fitNas4"))
+        throw cms::Exception("Configuration")
+            << "fitNas4 is no longer supported: the serial per-bin BrokenLine fit ladder has been removed.";
       return AlgoParams{
           // Container sizes
           .avgHitsPerTrack_ = (float)cfg.getParameter<double>("avgHitsPerTrack"),
@@ -433,14 +430,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           .useTrackDNN_ = cfg.getParameter<bool>("useTrackDNN"),
           .trackDNNThreshold_ = (float)cfg.getParameter<double>("trackDNNThreshold"),
 
-          // Allocation strategy: the single useExactAllocations switch drives both internal modes --
-          // the deferred demand-based allocations (delayAllocations_) and the count-only doublet pass
-          // (countDoubletsFirst_). The count pass is forced off on the CPU backend: it costs real
-          // serial time, while its only benefit is trimming a device allocation to the exact size --
-          // on the host the generous cap is cheap. The accepted doublet set is identical either way
-          // (the capacity guard in the doublet writer never binds in either regime), so the physics
-          // output does not depend on this choice and one configuration runs unchanged on every
-          // backend.
+          // The single useExactAllocations switch drives both the deferred demand-based allocations
+          // (delayAllocations_) and the count-only doublet pass (countDoubletsFirst_). The count pass is
+          // forced off on the CPU backend, where it costs serial time and only trims an allocation. The
+          // accepted doublet set is the same either way, so the physics output does not depend on it.
           .delayAllocations_ = cfg.getParameter<bool>("useExactAllocations"),
           .countDoubletsFirst_ =
               cfg.getParameter<bool>("useExactAllocations") && !std::is_same_v<Device, alpaka::DevCpu>,
@@ -655,6 +648,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   typename CAHitNtupletGenerator<TrackerTraits>::PendingTuples CAHitNtupletGenerator<TrackerTraits>::beginTuplesAsync(
       HitsInput const& hitsInput,
       CAGeometryOnDevice const& geometry_d,
+      CAGeometryOnDevice const& cuts_d,
       float bfield,
       uint32_t nDoublets,
       uint32_t nTracks,
@@ -672,8 +666,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     pending.maxDoublets = nDoublets;
 
     // Output trackHits rows: the same expression the kernels use for the internal per-track hit
-    // container, so the SoA the hits are copied into is never smaller than the container that
-    // feeds it (see caHitNtupletGenerator::nHitRowsForTuples).
+    // container, so the SoA the hits are copied into is never smaller than the container feeding it.
     const uint32_t nHitRows = caHitNtupletGenerator::nHitRowsForTuples(nTracks, m_params.algoParams_.avgHitsPerTrack_);
     pending.tracks.emplace(queue, nTracks, nHitRows);
 
@@ -683,12 +676,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     auto const& trackingHits = hitsInput.hits;
     auto const& hitModules = hitsInput.modules;
 
+    // Geometry blocks from the geometry handle, configuration blocks from the cuts handle. The two are
+    // the same object for every topology that does not consume the shared EventSetup geometry; when they
+    // differ, a block not owned by a handle has zero rows in it, so taking it from the wrong one gives an
+    // empty view.
     auto layers = geometry_d.view().layers();
-    auto graph = geometry_d.view().graph();
-    auto doubletCuts = geometry_d.view().doubletCuts();
-    auto tripletCuts = geometry_d.view().tripletCuts();
-    auto ntupletCuts = geometry_d.view().ntupletCuts();
     auto modules = geometry_d.view().modules();
+    auto graph = cuts_d.view().graph();
+    auto doubletCuts = cuts_d.view().doubletCuts();
+    auto tripletCuts = cuts_d.view().tripletCuts();
+    auto ntupletCuts = cuts_d.view().ntupletCuts();
 
     const uint32_t nHits = hitsInput.nHits;
     const uint32_t offsetBPIX2 = static_cast<uint32_t>(hitsInput.offsetBPIX2);
@@ -706,9 +703,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         m_params, nHits, nOTHitsDomain, offsetBPIX2, nDoublets, nTracks, layers.metadata().size(), queue);
     auto& kernels = *pending.kernels;
 
-    // Lazy per-stream init of the always-on overflow accumulator (kOvfWords device words) and of
-    // its pinned mirror (two kOvfWords slots, see the member declaration), then arm the kernels
-    // object so classifyTuples launches the sentinel into it.
+    // Lazy per-stream init of the overflow accumulator (kOvfWords device words) and of its pinned mirror
+    // (two kOvfWords slots), then arm the kernels object so classifyTuples launches the sentinel into it.
     if (!ovfAccum_) {
       ovfAccum_.emplace(cms::alpakatools::make_device_buffer<uint32_t[]>(queue, kOvfWords));
       ovfHost_.emplace(cms::alpakatools::make_host_buffer<uint32_t[]>(queue, 2u * kOvfWords));
@@ -717,15 +713,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
     kernels.ovfAccum_ = ovfAccum_->data();
 
-    // Both internal switches are driven by the single useExactAllocations configuration flag (the
-    // count pass is additionally excluded on the CPU backend -- see the parameter construction).
-    // With the flag off, all buffers are allocated up-front in the kernels constructor and there is
-    // no device->host synchronization here.
+    // With useExactAllocations off, all buffers are allocated up-front in the kernels constructor and
+    // there is no device-to-host synchronization here.
     const bool delay = m_params.algoParams_.delayAllocations_;
-    // The count pass already reads the doublet count back to the host inside buildDoublets, to size
-    // the cells buffer and the hit->cell storage. That value is handed back here and reused as the
-    // allocateAfterDoublets basis, so the scalar crosses the bus (and blocks the host) exactly once
-    // per event.
+    // The count pass already reads the doublet count back inside buildDoublets, to size the cells buffer
+    // and the hit->cell storage; that value is reused as the allocateAfterDoublets basis, so the scalar
+    // crosses the bus exactly once per event.
     const bool countFirst = m_params.algoParams_.countDoubletsFirst_;
 
     kernels.prepareHits(trackingHits, hitModules, layers, queue);
@@ -745,18 +738,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                           offsetBPIX2,
                           layers.metadata().size(),
                           pending.tracks->view(),
-                          layers,
                           graph,
                           tripletCuts,
                           ntupletCuts,
                           queue);
 
-    // Size the hit->track storage from the actual hits-in-tracks count. Under delayAllocations
-    // the count is not read back here: the counter block is enqueued as an async D2H into the
-    // pending buffer, the framework seam guarantees it has landed before finishTuplesAsync runs,
-    // and the allocation happens there -- still ahead of its first consumer (classifyTuples).
-    // The demand-exact sizing is kept at zero host-blocking cost. Without delay the storage is
-    // allocated up-front and the call here only keeps the GPU_DEBUG allocation report complete.
+    // Size the hit->track storage from the actual hits-in-tracks count. Under delayAllocations the count
+    // is not read back here: the counter block is enqueued as an async device-to-host copy into the
+    // pending buffer, the framework seam guarantees it has landed before finishTuplesAsync runs, and the
+    // allocation happens there, still ahead of its first consumer (classifyTuples).
     if (delay) {
       pending.countsHost.emplace(
           cms::alpakatools::make_host_buffer<cms::alpakatools::AtomicPairCounter::DoubleWord[]>(queue, 5u));
@@ -765,10 +755,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       kernels.allocateAfterNtuplets(0u, queue);
     }
 
-    // Seam readback: one async D2H of the tuple-multiplicity per-N-bin offsets into the pinned
-    // pending buffer. No wait here -- the framework's acquire->produce boundary guarantees the
-    // copy has landed before finishTuplesAsync consumes it (both fit passes then run with the
-    // launch-elision information for free; see HelixFit::setHostTupleMultiplicityOffsets).
+    // One async device-to-host copy of the tuple-multiplicity per-N-bin offsets into the pinned pending
+    // buffer. No wait here: the framework's acquire->produce boundary guarantees the copy has landed
+    // before finishTuplesAsync consumes it, and the fit passes then get the launch-elision information.
     if (const uint32_t* offDev = kernels.tupleMultiplicityOffsets(); offDev != nullptr) {
       constexpr uint32_t kNOff = TrackerTraits::maxHitsOnTrack + 2u;
       pending.offsetsHost.emplace(cms::alpakatools::make_host_buffer<uint32_t[]>(queue, std::size_t(kNOff)));
@@ -791,10 +780,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     auto& kernels = *pending.kernels;
 
     // Deferred hit->track storage sizing (delayAllocations): the counter block enqueued in
-    // beginTuplesAsync has landed (framework seam guarantee). Word [0] is the tuple
-    // AtomicPairCounter -- low half tuple count, high half hits-in-tracks total; every track has
-    // >= 1 hit, so the larger half is the hits-in-tracks total. Allocate here, ahead of
-    // classifyTuples, its first consumer.
+    // beginTuplesAsync has landed (framework seam guarantee). Word [0] is the tuple AtomicPairCounter,
+    // low half tuple count and high half hits-in-tracks total; every track has at least one hit, so the
+    // larger half is the hits-in-tracks total. Allocated here, ahead of classifyTuples.
     if (pending.countsHost) {
       const uint64_t apcRaw = static_cast<uint64_t>(pending.countsHost->data()[0]);
       const uint32_t apcLo = static_cast<uint32_t>(apcRaw & 0xFFFFFFFFull);
@@ -805,43 +793,38 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     auto tracks = pending.tracks->view().tracks();
     auto const& trackingHits = hitsInput.hits;
     const uint32_t nHits = hitsInput.nHits;
+    // `modules` is the only geometry block the fit passes read; geometry_d is the geometry handle.
     auto modules = geometry_d.view().modules();
     const uint32_t nTracks = pending.maxTuples;
     const float bfield = pending.bfield;
 
-    HelixFit fitter(bfield, m_params.algoParams_.fitNas4_);
+    HelixFit fitter(bfield);
     fitter.setVerboseDump(m_verboseBLDump);
     fitter.setMaterialMap(pending.rhoMapDevice);  // device BLMaterialMap (EventSetup condition)
-    // Device BLBFieldMap: the (Bz,Br) r-z condition, queried through blEffectiveBField. Read by the fit
-    // only under useFitCorrections (see
-    // HelixFit::setBFieldMap and Kernel_BLFit::bMap_); otherwise inert.
+    // Device BLBFieldMap: the same (Bz,Br) r-z condition the merger's GBL refit reads. Consumed by the
+    // fit only under useFitCorrections, otherwise inert.
     fitter.setBFieldMap(pending.bMapDevice);
     fitter.allocate(kernels.tupleMultiplicity(), tracks, kernels.hitContainer());
-    // The per-N-bin offsets were read back once in beginTuplesAsync and have landed (framework
-    // seam); the fit consumes the host values -- zero fit-side readbacks or waits. If the
-    // container was absent, fall back to the cap-bounded fit (no elision).
+    // The per-N-bin offsets were read back once in beginTuplesAsync and have landed (framework seam), so
+    // the fit consumes host values. If the container was absent, fall back to the cap-bounded fit.
     if (pending.offsetsHost)
       fitter.setHostTupleMultiplicityOffsets(pending.offsetsHost->data());
     if (m_params.algoParams_.useRiemannFit_) {
       fitter.launchRiemannKernels(trackingHits, modules, nHits, TrackerTraits::maxNumberOfQuadruplets, queue);
     } else {
-      // The CA main fit is the factorized fast BrokenLine fit (circle+line, 5 params + factorized cov +
-      // chi2), one launchBrokenLineKernels call for every CA iteration and every topology. The fit's
-      // per-tuple work bound is the runtime tuple capacity nTracks (the
-      // per-event cap the tuple containers are sized to), not the compile-time maxNumberOfQuadruplets:
-      // tuple ids are always < nTracks, so the extra chunks the launcher would iterate over with the
-      // compile-time cap could only launch empty kernels.
+      // The CA main fit is the factorized fast BrokenLine fit (circle + line, 5 params, factorized cov
+      // and chi2); the General Broken Lines fit runs once per track downstream, in the merger. The
+      // per-tuple work bound is the runtime tuple capacity nTracks rather than the compile-time
+      // maxNumberOfQuadruplets: tuple ids are always < nTracks, so the extra chunks would be empty.
       fitter.setFitCorrections(m_params.algoParams_.useFitCorrections_);
       fitter.launchBrokenLineKernels(trackingHits, modules, nHits, nTracks, queue);
     }
     kernels.classifyTuples(trackingHits, tracks, queue, nullptr);
 
-    // Refresh the pinned overflow mirror with the running totals. Ordered after classifyTuples,
-    // which is where the always-on overflow sentinel is enqueued on this same queue, so the
-    // snapshot includes this event. Async, no wait; consumed at endStream via reportOverflows
-    // once every event queue has drained. The destination alternates between the mirror's two
-    // slots so that the copies of two consecutive events -- which run on different queues and can
-    // therefore overlap -- never write the same bytes.
+    // Refresh the pinned overflow mirror with the running totals. Ordered after classifyTuples, which
+    // enqueues the overflow sentinel on this same queue, so the snapshot includes this event; consumed at
+    // endStream once every event queue has drained. The destination alternates between the mirror's two
+    // slots, so that the copies of two consecutive events, which can overlap, never write the same bytes.
     const uint32_t ovfSlot = ovfSlot_;
     ovfSlot_ ^= 1u;
     auto ovfHostSlot = cms::alpakatools::make_host_view(ovfHost_->data() + ovfSlot * kOvfWords, kOvfWords);
@@ -853,10 +836,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     {
       uint32_t dumpNTracks, dumpNHitsInTracks, dumpNCells, dumpNTriplets, dumpNCellTracks;
       kernels.readbackAllCounts(queue, dumpNTracks, dumpNHitsInTracks, dumpNCells, dumpNTriplets, dumpNCellTracks);
-      // The cell->cell edge count is the triplet count (Kernel_connect writes triplets into
-      // deviceTriplets_ which is sized from nCells * avgCellsPerCell). The cell->track edge
-      // count is nCellTracks (Kernel_connect writes cell->track pairs into deviceTracksCells_
-      // which is sized from nCells * avgTracksPerCell).
+      // The cell->cell edge count is the triplet count, in deviceTriplets_ sized from
+      // nCells * avgCellsPerCell; the cell->track edge count is nCellTracks, in deviceTracksCells_
+      // sized from nCells * avgTracksPerCell.
       const auto dumpIterName = ::pixelTrack::iterationName[uint8_t(m_params.algoParams_.iterationName_)];
       printf(
           "[CA Sizing] iter=%.*s nHits=%u nCells=%u capCells=%u nTriplets=%u capTrips=%u "
@@ -880,10 +862,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 #endif
 
 #ifdef CA_TRIPLET_DUMP
-    // Surface the per-built-triplet dump out of the (function-local) kernels object before it is
-    // destroyed: move its device buffer into the generator member so the producer can emplace it.
-    // nValid was already stamped device-side in Kernel_connect; the buffer is sized to the full
-    // triplet capacity (tripletsN_). Empty/zero footprint when CA_TRIPLET_DUMP is off.
+    // Surface the per-built-triplet dump out of the function-local kernels object before it is destroyed:
+    // its device buffer moves into the generator member so the producer can emplace it. nValid was
+    // stamped device-side in Kernel_connect and the buffer is sized to the full triplet capacity.
     device_tripletDump_ = std::move(kernels.tripletDumpBuffer());
 #endif
 
@@ -910,9 +891,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                    cms::alpakatools::make_device_view(queue, mask.view().recHitMask(), nHits),
                    cms::alpakatools::make_device_view(queue, mask_d.view().recHitMask(), nHits));
 
-    // When masking is deactivated, return a pass-through copy of the input mask:
-    // no hits from this iteration's tracks are added, so the next iteration sees
-    // all hits. The module stays wired (data dependency / ordering preserved).
+    // When masking is deactivated, return a pass-through copy of the input mask: no hits from this
+    // iteration's tracks are added, so the next iteration sees all hits, and the module stays wired.
     if (applyMasking) {
       CAHitMaskingAndMergerKernels kernels;
 
@@ -990,11 +970,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     auto inptracksd_view = inpTracks.view().tracks();
     auto inptracks_hitsd_view = inpTracks.view().trackHits();
 
-    // Strict cross-arm twin merge (requested by the caller). Compute per-track twin pairing
-    // + winner/loser bookkeeping, then let filterTracks drop losers and unite their hits onto the
-    // winners. The scratch buffers are stream-ordered (freed on the same queue) so they may safely
-    // destruct at function scope after the async launches. armOfTrack must be a device pointer with
-    // nTracks entries (0 = prompt-side, 1 = displaced-side).
+    // Strict cross-arm twin merge: compute per-track twin pairing and winner/loser bookkeeping, then let
+    // filterTracks drop losers and unite their hits onto the winners. The scratch buffers are
+    // stream-ordered, so they may destruct at function scope after the async launches. armOfTrack must be
+    // a device pointer with nTracks entries (0 = prompt-side, 1 = displaced-side).
     const int32_t* loserOf_d = nullptr;
     const int32_t* isLoser_d = nullptr;
     std::optional<cms::alpakatools::device_buffer<Device, int32_t[]>> bestTwin, loserOf, isLoser;
@@ -1084,7 +1063,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       otSrcPtr = &otSrc;
     }
 
-    Fitter fitter(bfield, /*fitNas4=*/false);
+    Fitter fitter(bfield);
     fitter.setMaterialMap(rhoMapDevice);   // device BLMaterialMap (same EventSetup condition the CA uses)
     fitter.setBFieldMap(bFieldMapDevice);  // device BLBFieldMap (Bz,Br) r-z map; null => the scalar field
     fitter.setDropOutlierFromHitList(dropOutlierFromHitList);  // merger final-refit only, default off

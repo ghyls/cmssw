@@ -1,10 +1,9 @@
 #ifndef RecoTracker_PixelSeeding_plugins_alpaka_BrokenLineFitKernels_h
 #define RecoTracker_PixelSeeding_plugins_alpaka_BrokenLineFitKernels_h
 
-// Shared BL-fit device kernels + per-N launcher helpers for the SPLIT build.
-// Every heavy per-N kernel is `extern template` here and explicitly instantiated in exactly one small
-// N-range TU (BrokenLineFit_*.dev.cc), so nvcc compiles disjoint kernel subsets in parallel. Build-time
-// division only: the kernels and their launch arguments are unchanged either way.
+// Shared BL-fit device kernels and per-N launcher helpers. Every heavy per-N kernel is `extern template`
+// here and explicitly instantiated in exactly one N-range TU (BrokenLineFit_*.dev.cc), so nvcc compiles
+// disjoint kernel subsets in parallel.
 
 // #define BROKENLINE_DEBUG
 // #define GPU_DEBUG
@@ -26,8 +25,8 @@
 #include "RecoTracker/PixelTrackFitting/interface/BLBFieldMap.h"  // (Bz,Br) r-z map for the effective bending field
 
 #include "CAFitHitSelection.h"
-#include "CAExtensionKernels.h"                           // caExtension::OTHitsSource (extended-N refit OT hit source)
-#include "RecoTracker/PixelSeeding/interface/OTHitTag.h"  // caOTHitTag::isOTId / otIdx (refit tagged-id fetch)
+#include "CAExtensionKernels.h"                           // OT hit source of the extended-N refit
+#include "RecoTracker/PixelSeeding/interface/OTHitTag.h"  // tagged OT-id encoding
 #include "HelixFit.h"
 
 using OutputSoAView = reco::TrackSoAView;
@@ -35,24 +34,18 @@ using TupleMultiplicity = caStructures::GenericContainer;
 using Tuples = caStructures::SequentialContainer;
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
-  // CUDA block dim of the fit work divisions (launch dim only: the kernels are grid-stride loops that
-  // break on the invalid-tkid sentinel). 32 is the L1-pressure optimum of this solver. Kept here so
-  // the FUSED refit ladder can express its bin <-> lane partition in units of it.
+  // Block dimension of the fit work divisions (launch dimension only: the kernels are grid-stride loops
+  // that break on the invalid-tkid sentinel). The fused refit ladder expresses its bin/lane partition in
+  // units of it.
   inline constexpr uint32_t kFitBlock = 32u;
 
-  // ---------------------------------------------------------------------------------------------
-  // FUSED REFIT LADDER -- the dynamic bin <-> lane-range partition. The ten N-bins partition one
-  // lane-strided buffer set into disjoint lane ranges, so all ten run in one fused launch per
-  // (phase, iteration). The partition is computed per event on the device from the actual populations
-  // (no fixed per-bin quota, nothing crosses to the host): Kernel_BLRefitBinCount fills the ten per-bin
-  // demands; Kernel_BLRefitLaneRanges prefix-sums them into contiguous ranges [base_b, base_b+n_b) and
-  // writes the block->bin dispatch table the fused kernels read.
-  // Disjointness: hits/hits_ge/fast_fit are column-major (stride kRefitStride), so two lanes never share
-  // a byte; pphase is lane-major at the fixed per-lane quota kBLPhaseDoubles; pgnodes/pgblScratch are
-  // lane-major with a per-lane quota that is non-decreasing in N (kRefitQuotaMonotone below pins this),
-  // so the ordered ranges stay disjoint for any partition.
-  // Capacity: one pass seats kRefitStride lanes; unseated tracks wait for the next round (exact through
-  // the per-track "served" flag), and ceil(nTracksCap/kRefitStride) rounds always drain the population.
+  // Fused refit ladder: ten N-bins share one lane-strided buffer set, partitioned per event on the device
+  // into disjoint lane ranges (Kernel_BLRefitBinCount counts the per-bin demands, Kernel_BLRefitLaneRanges
+  // prefix-sums them and writes the block->bin dispatch table).
+  // Disjointness: hits/hits_ge/fast_fit are column-major with stride kRefitStride; pphase is lane-major at
+  // the fixed quota kBLPhaseDoubles; pgnodes/pgblScratch are lane-major with a per-lane quota that is
+  // non-decreasing in N (kRefitQuotaMonotone), so the ordered ranges stay disjoint.
+  // One pass seats kRefitStride lanes; the per-track "served" flag carries the rest to later rounds.
   inline constexpr uint32_t kRefitNBins = 10u;  // N = 3 .. kRefitMaxN, the top bin absorbing the tail
   inline constexpr int kRefitMinN = 3;
 
@@ -67,8 +60,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   inline constexpr uint32_t kFusedBlocks =
       HelixFit<::pixelTopology::Phase2OTStubs>::kRefitStride / kFitBlock + kRefitNBins;
 
-  // Per-lane pgnodes/pgblScratch quotas -- the SAME expressions the phase kernels build their per-lane
-  // pointers with, restated so the disjointness static_assert below can reference them.
+  // Per-lane pgnodes/pgblScratch quotas, the expressions the phase kernels build their per-lane pointers
+  // with; referenced by the disjointness static_assert below.
   template <int N, typename TrackerTraits>
   inline constexpr int kRefitSlotNodes = generalBrokenLine::kGblSplitNodes<(
       int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N) : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
@@ -90,16 +83,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   static_assert(kRefitNBins == HelixFit<::pixelTopology::Phase2OTStubs>::kRefitMaxN - uint32_t(kRefitMinN) + 1u,
                 "the bin ladder must cover N = kRefitMinN .. kRefitMaxN");
 
-  // Per-lane quota of the fit-hit-id / pixel-core-flag tables. Under the lane partition the scan works in
-  // bin-local slots while the fused outlier works in absolute lanes, so the quota must be the
-  // ladder-wide kRefitMaxN for every bin (same values, uniform addressing).
+  // Per-lane quota of the fit-hit-id / pixel-core-flag tables. The scan works in bin-local slots while the
+  // fused outlier works in absolute lanes, so the quota is the ladder-wide kRefitMaxN for every bin.
   inline constexpr uint32_t kRefitFitIdQuota = HelixFit<::pixelTopology::Phase2OTStubs>::kRefitMaxN;
 
-  // Selected-hit multiplicity -> bin. THE ONE DEFINITION of the ladder's binning, so the count kernel
-  // and the per-bin scans cannot drift apart: it reproduces exactly the (nHitsL, nHitsH) pairs
-  // refitExtended launches the scans with -- the exact bins N = kRefitMinN .. kRefitMaxN-1, and the
-  // top bin absorbing the tail [kRefitMaxN, maxFitSel]. Returns kRefitNBins for a track the ladder
-  // does not fit at all.
+  // Selected-hit multiplicity -> bin: the exact bins N = kRefitMinN .. kRefitMaxN-1, the top bin absorbing
+  // the tail [kRefitMaxN, maxFitSel]. Returns kRefitNBins for a track the ladder does not fit.
   ALPAKA_FN_ACC ALPAKA_FN_INLINE uint32_t refitBinOfNSel(uint32_t nSel, uint32_t maxFitSel) {
     constexpr uint32_t kMaxN = HelixFit<::pixelTopology::Phase2OTStubs>::kRefitMaxN;
     if (nSel < uint32_t(kRefitMinN) || nSel > maxFitSel)
@@ -108,20 +97,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     return nEff - uint32_t(kRefitMinN);
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // FUSED MAIN-FIT LADDER -- the refit ladder's dynamic partition (above) applied to the CA fit. The
-  // bins are disjoint in tuples (tupleMultiplicity bins every tuple by its selected multiplicity, and
-  // begin(nHitsL)..end(nHitsH) are contiguous non-overlapping slices of it), so two bins never write the
-  // same SoA row; they partition the one lane-strided buffer set into disjoint lane ranges and run in
-  // one fused launch per phase. No count kernel is needed: bin b's demand is end(nHitsH) - begin(nHitsL),
-  // the expression the per-bin fast fit's totTK reads; Kernel_BLMainLaneRanges (single thread) prefix-sums
-  // the demands into ranges and writes the block -> bin dispatch table. Lane disjointness is
-  // unconditional: every per-lane buffer is column-major with the fixed inter-element stride
-  // riemannFit::stride, so lane l occupies exactly the elements {l + e*stride} whatever N it carries.
-  // One pass seats riemannFit::maxNumberOfConcurrentFits lanes, handed out in bin order; a per-bin cursor
-  // (lane l of bin b is that bin's (tupleBase_b + l - base_b)-th tuple, a deterministic map rather than
-  // an atomic claim) carries unseated tuples to the next round, and ceil(chunkBound / lanes) rounds
-  // always drain the population.
+  // Fused main-fit ladder: the bins are disjoint slices of tupleMultiplicity, so two bins never write the same
+  // SoA row, and bin b's demand is end(nHitsH) - begin(nHitsL), so no count kernel is needed:
+  // Kernel_BLMainLaneRanges prefix-sums the demands into lane ranges and writes the block->bin table. Every
+  // per-lane buffer is column-major with stride riemannFit::stride, so lanes are disjoint whatever N they
+  // carry. One pass seats maxNumberOfConcurrentFits lanes in bin order; a per-bin cursor carries the rest to
+  // later rounds.
   inline constexpr int kMainMinN = 3;
   template <typename TrackerTraits>
   inline constexpr uint32_t kMainNBins = uint32_t(TrackerTraits::maxHitsOnTrackForFullFit) - uint32_t(kMainMinN) + 1u;
@@ -132,20 +113,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   inline constexpr uint32_t kMainBlockMapStride = 3u;
 
   // Fused-grid width. A bin holding n_b lanes needs ceil(n_b / kFitBlock) blocks, and
-  //   sum_b ceil(n_b / kFitBlock) <= (sum_b n_b) / kFitBlock + kMainNBins
-  //                               <= maxNumberOfConcurrentFits / kFitBlock + kMainNBins,
-  // so this width covers EVERY partition the populations can produce. The grid is fixed and
-  // host-known; which of its blocks are live, and on which bin, is what the device table decides. A
-  // block carries exactly one bin, so the switch over compile-time N never diverges inside a warp.
+  //   sum_b ceil(n_b / kFitBlock) <= maxNumberOfConcurrentFits / kFitBlock + kMainNBins,
+  // so this width covers every partition the populations can produce. The grid is fixed and host-known;
+  // the device table decides which blocks are live and on which bin. A block carries exactly one bin, so
+  // the switch over compile-time N never diverges inside a warp.
   template <typename TrackerTraits>
   inline constexpr uint32_t kMainFusedBlocks =
       riemannFit::maxNumberOfConcurrentFits / kFitBlock + kMainNBins<TrackerTraits>;
 
-  // THE ONE DEFINITION of the main ladder's binning, so the range kernel and the fused switch cannot
-  // drift apart: it reproduces exactly the (nHitsL, nHitsH) pairs launchBrokenLineKernels launches the
-  // per-bin ladder with -- the exact bins N = kMainMinN .. maxHitsOnTrackForFullFit - 1 (rolling_fits
-  // is End-EXCLUSIVE), and the top bin N = maxHitsOnTrackForFullFit absorbing the tail
-  // [maxHitsOnTrackForFullFit, maxHitsOnTrack - 1].
+  // The main ladder's binning: the exact bins N = kMainMinN .. maxHitsOnTrackForFullFit - 1, with the top
+  // bin N = maxHitsOnTrackForFullFit absorbing the tail [maxHitsOnTrackForFullFit, maxHitsOnTrack - 1].
   template <typename TrackerTraits>
   ALPAKA_FN_HOST_ACC ALPAKA_FN_INLINE constexpr uint32_t mainBinNHitsL(uint32_t b) {
     return uint32_t(kMainMinN) + b;
@@ -156,12 +133,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                  : (uint32_t(kMainMinN) + b);
   }
 
-  // Out-of-line boundary of the per-lane fit bodies. RecoTracker/PixelSeeding is built with -Ofast
-  // (-ffast-math), so the compiler may reassociate FP and form FMAs per function: two inlined copies of
-  // the same source (the per-bin ladder's kernel vs the fused ladder's switch) would produce different
-  // doubles, and a bordered-band solve amplifies that into a different chi2. Pinned out of line, both
-  // ladders call one compiled function. `noclone` keeps -fipa-cp-clone from specialising a copy on one
-  // call site's constants.
+  // Out-of-line boundary of the per-lane fit bodies. This package is built with -Ofast, so two inlined
+  // copies of the same source may reassociate differently and a bordered-band solve amplifies that into a
+  // different chi2; pinned out of line, every caller runs one compiled function. `noclone` keeps
+  // -fipa-cp-clone from specialising a copy on one call site's constants.
 #if defined(__CUDACC__)
 #define BL_REFIT_NOINLINE __noinline__
 #elif defined(__clang__)
@@ -203,7 +178,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
       auto nHits = foundNtuplets->size(tkid);
 
-      // multiplicity binning / assertions use the SELECTED hit count (nSel), computed below.
+      // multiplicity binning and assertions use the selected hit count (nSel), computed below.
       riemannFit::Map3xNd<N> hits(phits + local_idx);
       riemannFit::Map4d fast_fit(pfast_fit + local_idx);
       riemannFit::Map6xNf<N> hits_ge(phits_ge + local_idx);
@@ -219,7 +194,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       ALPAKA_ASSERT_ACC(nSel >= nHitsL);
       ALPAKA_ASSERT_ACC(nSel <= nHitsH);
 
-      // Uniform sampling: select hitsInFit hits uniformly from the DEDUPED selected hits.
+      // Select hitsInFit hits uniformly from the deduped selected hits.
       uint32_t selectedHits[N];
       uint32_t nSelected = 0;
       {
@@ -365,27 +340,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     return bField * (sSum / double(n));
   }
 
-  // Fit-consistent effective bending field: the SAME B_bend samples blEffectiveBField averages, but
-  // weighted by the fit's own curvature-information kernel instead of by 1/n. The published momentum is
-  // bFieldEff/|curvature|, so bFieldEff must be the B_bend average the fit's curvature estimator actually
-  // takes. A linearized curvature estimator gives near-zero weight to the arc ends (where hits fix the
-  // chord) and peaks at mid-arc (where the sagitta lives); a 1/n comb would weight crowded pixel nodes the
-  // same as mid-arc nodes, making the answer depend on hit placement rather than the field.
-  //
-  // The fit's functional is free: the GBL normal system eliminates the 1x1 q/p border with a scalar Schur
-  // complement, delta(0) = (b(0) - sum_i w[i] b(1+i)) / schur. A residual along the first (bending) offset
-  // at measurement node j enters the curvature with coefficient -g/schur, where
-  //     g = w[u-1]*P(0,0) + w[u]*P(1,0),   u = 1 + 2j (node's offset index),
-  // and the common -1/schur cancels in the ratio. Feeding that estimator the varying-field trajectory
-  //     utilde_i = INT_0^{s_i} (s_i - t) b(t) dt,   b = B_bend/Bz(0,0),
-  // normalised by the constant-unit case (utilde_i = s_i^2/2):
-  //     B_eff = bField * SUM_i g_i utilde_i / SUM_i g_i s_i^2/2 .
-  // Computed on the DEVIATION beta = b - 1 (constant field returns bField EXACTLY, and the correction is
-  // ~1e-2 of the total, so the deviation form keeps its relative precision):
-  //     utilde_i = s_i^2/2 + (s_i J1_i - J2_i),  J1/J2 = running integrals of beta,
-  //     B_eff = bField * (1 + SUM_i g_i (s_i J1_i - J2_i) / SUM_i g_i s_i^2/2) .
-  // `nodes`/`nNodes` are the solve's node array (measured nodes in hit order). `infl` is the influence
-  // vector (see kGblInfluenceOffset). Degenerate input returns `fallback` (the hit-count average).
+  // Fit-consistent effective bending field: the B_bend samples of blEffectiveBField weighted by the fit's own
+  // curvature-information kernel (a residual along the bending offset at measurement node j enters the
+  // curvature with weight g = w[u-1]*P(0,0) + w[u]*P(1,0), u = 1 + 2j). With b = B_bend/Bz(0,0), beta = b - 1
+  // and its running integrals J1/J2,
+  //     B_eff = bField * (1 + SUM_i g_i (s_i J1_i - J2_i) / SUM_i g_i s_i^2/2) ,
+  // exactly bField for a constant field. `infl` is the influence vector (kGblInfluenceOffset); degenerate
+  // input returns `fallback`.
   template <typename TAcc, typename M3xN, typename V4>
   ALPAKA_FN_ACC ALPAKA_FN_INLINE double blKernelWeightedBField(const TAcc& acc,
                                                                const M3xN& hits,
@@ -410,8 +371,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     const double ex = -fast_fit(2) * cx / cNorm;
     const double ey = -fast_fit(2) * cy / cNorm;
     const double slopeDen = fast_fit(3) * absR;
-    // Running node walk: J1/J2 are the two integrals of the field profile's DEVIATION from unity, from
-    // the FIRST measured node up to the current one, over the cells that reach midway to each neighbour.
+    // J1/J2 are the two integrals of the field profile's deviation from unity, from the first measured
+    // node up to the current one, over the cells that reach midway to each neighbour.
     double s0 = 0., sPrev = 0., bPrev = 0., j1 = 0., j2 = 0., num = 0., den = 0.;
     int iHit = -1;
     for (int j = 0; j < nNodes; ++j) {
@@ -455,17 +416,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     return bField * scale;
   }
   // The CA main fit: the factorized Blobel circle+line fit, run by every CA iteration of every topology.
-  // Every track then gets exactly one General Broken Lines fit in the merger refit, which lives in the
-  // Kernel_BLFitPhase* pipeline further down (instantiated only by the refit ladder, Phase2OTStubs, at
-  // HelixFit::kRefitStride). Stride = the launch's concurrent-fit count (the fit-buffer lane stride);
-  // it defaults to the global riemannFit::stride.
+  // Stride is the launch's concurrent-fit count (the fit-buffer lane stride), riemannFit::stride by
+  // default.
   template <int N, typename TrackerTraits, uint32_t Stride = riemannFit::stride>
   struct Kernel_BLFit {
   public:
-    // Out-of-line per-lane body of the fit (BL_REFIT_NOINLINE): the per-bin ladder's operator() below and
-    // the fused ladder's switch (Kernel_BLFitFused, through blMainFitLaneOutOfLine) call this one compiled
-    // function. It fits lane `local_idx` of the shared stride-wide buffers and writes the one SoA row
-    // ptkids[local_idx] names.
+    // Out-of-line per-lane body of the fit: fits lane `local_idx` of the shared stride-wide buffers and
+    // writes the one SoA row ptkids[local_idx] names.
     ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
                                               uint32_t local_idx,
                                               TupleMultiplicity const* __restrict__ tupleMultiplicity,
@@ -495,11 +452,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           pscratch + local_idx + std::size_t(brokenline::kPreparedDataDoubles<N>) * std::size_t(Stride));
       brokenline::karimaki_circle_fit circle;
       riemannFit::LineFit line;
-      // Per-track effective bending field (blEffectiveBField): the hit-average
-      // of B_bend(r,z)/Bz(0,0), charge-free, returning bField exactly where the map is flat. It carries
-      // the |z| falloff of Bz and the endcap radial component, i.e. the forward pT bias of a scalar field.
-      // Evaluated before the fit state exists so its scalars are dead by prepareBrokenLineData's O(N) set.
-      // fitCorrections_ off, or null bMap_, => scalar bField.
+      // Per-track effective bending field: the hit-average of B_bend(r,z)/Bz(0,0), charge-free, equal to
+      // bField where the map is flat. It carries the |z| falloff of Bz and the endcap radial component.
+      // With fitCorrections_ off or bMap_ null this is the scalar bField.
       const double bFieldEff = fitCorrections_ ? blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_) : bField;
       // bFieldEff enters as the momentum p = bFieldEff * radius * sqrt(1+slope^2) the Highland variance is
       // divided by, as the 1/bFieldEff of copyFromCircle's geometric-curvature -> q/pT conversion, and as
@@ -548,15 +503,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
     // Device pointer to the uploaded Geant4 material density grid (blMaterialMap, kSize floats).
     const float* __restrict__ rhoMap_ = nullptr;
-    // Device pointer to the (Bz,Br) r-z field map (blBFieldMap), an EventSetup condition. Consumed only
-    // under fitCorrections_: the material/field model is one, so the
-    // scattering variance is only correct if its momentum comes from the same field that bent the track.
-    // Off, or null, => scalar bField (the upstream algebra).
+    // Device pointer to the (Bz,Br) r-z field map (blBFieldMap). Consumed only under fitCorrections_: the
+    // scattering variance is only correct if its momentum comes from the field that bent the track. Null
+    // => scalar bField.
     const float* __restrict__ bMap_ = nullptr;
     // Fit correctness package (producer parameter useFitCorrections; see the head of BrokenLine.h): thin
     // scatterer per gap, rigid-node guard, Karimaki-Fisher covariance blend, pion 1/beta Highland form,
-    // trapezoid material quadrature, full 3x3 blend, per-track effective bending field, and ionization
-    // energy-loss offset. Off => upstream algebra. Default true for Phase2OTStubs, false otherwise.
+    // trapezoid material quadrature, full 3x3 blend, per-track effective bending field and ionization
+    // energy-loss offset. Default true for Phase2OTStubs.
     bool fitCorrections_ = false;
 
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
@@ -567,9 +521,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                   double* __restrict__ phits,
                                   float* __restrict__ phits_ge,
                                   double* __restrict__ pfast_fit,
-                                  // Per-lane fit scratch: the prepared-data vectors, the shared band block and
-                                  // the helper vectors of the factorized fit, held off the kernel stack frame
-                                  // (the frame drives the driver's per-thread local-memory reservation).
+                                  // Per-lane fit scratch, held off the kernel stack frame (the frame
+                                  // drives the driver's per-thread local-memory reservation).
                                   double* __restrict__ pscratch) const {
       ALPAKA_ASSERT_ACC(results_view.pt().data());
       ALPAKA_ASSERT_ACC(results_view.eta().data());
@@ -580,7 +533,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
       // same as above...
       // look in bin for this hit multiplicity
-      const auto nt = Stride;  // lane count = this launch's buffer stride (main: global stride)
+      const auto nt = Stride;  // lane count = this launch's buffer stride
       for (auto local_idx : cms::alpakatools::uniform_elements(acc, nt)) {
         if (invalidTkId == ptkids[local_idx])
           break;
@@ -589,11 +542,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // ---------------------------------------------------------------------------------------------
-  // THE DYNAMIC PARTITION of the main fit ladder. Single-threaded, device-only (no host crossing): hands
-  // lanes out in bin order, writes the block->bin dispatch table (one bin per block, idle tail at
-  // kMainNBins). Nothing is memset -- the kernel writes every word it reads.
-  // ---------------------------------------------------------------------------------------------
+  // Dynamic partition of the main fit ladder. Single-threaded, device-only: hands lanes out in bin order
+  // and writes the block->bin dispatch table (one bin per block, idle tail at kMainNBins). Nothing is
+  // memset: the kernel writes every word it reads.
   template <typename TrackerTraits>
   class Kernel_BLMainLaneRanges {
   public:
@@ -609,7 +560,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       constexpr uint32_t kNBins = kMainNBins<TrackerTraits>;
       uint32_t base = 0u;
       for (uint32_t b = 0; b < kNBins; ++b) {
-        // The bin's population, off the SAME container slice the per-bin fast fit's totTK reads.
+        // The bin's population, off the same container slice the per-bin fast fit reads.
         const int32_t tot = int32_t(tupleMultiplicity->end(mainBinNHitsH<TrackerTraits>(b)) -
                                     tupleMultiplicity->begin(mainBinNHitsL<TrackerTraits>(b)));
         const uint32_t have = firstRound ? 0u : pCursor[b];  // seated in earlier rounds
@@ -652,9 +603,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     bool hasStubs = false;
   };
 
-  // The fit's out-of-line trampoline: rebuilds the bin's kernel object from the shared config inside the
-  // callee's frame and calls the pinned lane body. (The fast fit needs no trampoline -- Kernel_BLFastFit<N>
-  // carries no members, so the fused switch calls its static `lane` directly.)
+  // Out-of-line trampoline: rebuilds the bin's kernel object from the shared config inside the callee's
+  // frame and calls the pinned lane body. The fast fit needs none: Kernel_BLFastFit<N> carries no members,
+  // so the fused switch calls its static `lane` directly.
   template <int N, typename TrackerTraits, uint32_t Stride>
   ALPAKA_FN_ACC BL_REFIT_NOINLINE void blMainFitLaneOutOfLine(
       Acc1D const& acc,
@@ -672,12 +623,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     k.lane(acc, lane, tupleMultiplicity, bField, results_view, ptkids, phits, phits_ge, pfast_fit, pscratch);
   }
 
-  // The fused main-fit kernels. The block index picks the bin (and its compile-time N) out of the device
-  // table Kernel_BLMainLaneRanges wrote for this round; the elements of that block are the bin's lanes.
-  // One block carries one bin, so the switch over N cannot diverge inside a warp; an unused block returns
-  // at once. Bin b runs the same out-of-line Kernel_BLFastFit/BLFit<b+kMainMinN>::lane the per-bin ladder
-  // calls; only the lane a tuple lands in differs, and no lane body reads its lane index beyond its own
-  // addresses, so the arithmetic and the set of fitted tuples are the same on both ladders.
+  // Fused main-fit kernels. The block index picks the bin (and its compile-time N) out of the device table
+  // Kernel_BLMainLaneRanges wrote for this round; the elements of that block are the bin's lanes. One block
+  // carries one bin, so the switch over N cannot diverge inside a warp. No lane body reads its lane index
+  // beyond its own addresses, so the arithmetic does not depend on where a tuple lands.
   template <typename TrackerTraits>
   struct Kernel_BLFastFitFused {
     using HitsMultiView = caStructures::HitsViewT<TrackerTraits>;
@@ -687,8 +636,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // maxHitsOnTrackForFullFit past 10 must be a build error.
     static_assert(kMainNBins<TrackerTraits> <= 8u,
                   "the fused main ladder dispatches bins 0..7; add cases when a traits set carries more");
-    // No Stride template here (unlike Kernel_BLFitFused): the fast fit uses the default-stride maps
-    // (riemannFit::stride == maxNumberOfConcurrentFits), the same lane space the fit kernel asserts on.
+    // The fast fit uses the default-stride maps (riemannFit::stride == maxNumberOfConcurrentFits), the
+    // same lane space the fit kernel asserts on.
     BLMainFusedCfg cfg_;
 
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
@@ -702,7 +651,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                   double* __restrict__ pfast_fit,
                                   const uint32_t* __restrict__ pRange,
                                   const uint32_t* __restrict__ pBlockMap) const {
-      // The per-bin kernel's entry assertions (see Kernel_BLFastFit::operator()).
       ALPAKA_ASSERT_ACC(foundNtuplets);
       ALPAKA_ASSERT_ACC(tupleMultiplicity);
       ALPAKA_ASSERT_ACC(phits);
@@ -765,7 +713,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   struct Kernel_BLFitFused {
     static_assert(Stride == riemannFit::maxNumberOfConcurrentFits,
                   "the fused main ladder spans the main fit's lane buffers");
-    // Same guard as Kernel_BLFastFitFused: the switch dispatches bins 0..7 by hand.
     static_assert(kMainNBins<TrackerTraits> <= 8u,
                   "the fused main ladder dispatches bins 0..7; add cases when a traits set carries more");
     BLMainFusedCfg cfg_;
@@ -797,9 +744,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           const uint32_t local_idx = laneLo + uint32_t(el.local);
           if (local_idx >= laneHi)
             break;
-          // Safety net only: a bin's range IS its exact count and the fused fast fit above filled
-          // every lane of it, so the sentinel cannot be reached unless the range and the fill ever
-          // disagree.
+          // Safety net: a bin's range is its exact count and the fused fast fit filled every lane of it.
           if (invalidTkId == ptkids[local_idx])
             continue;
 #define BL_MAIN_FUSED_FIT_CASE(BIN)                                                                                     \
@@ -828,17 +773,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   };
 
   // Phase-buffer lane stride (doubles): the per-lane cross-launch scratch of the Kernel_BLFitPhase*
-  // pipeline, indexed by the named slots below. The device allocation strides at this value
-  // (see launchBrokenLineKernels / refitExtended).
-  //
-  // Slots [64..104] hold the ITERATION-INVARIANT tail (values a second linearization would recompute):
-  //   [64..64+N-1] matXX0      the Geant4 material march (function of hit positions alone)
-  //   [64+N]       innerXX0     function of hit 0; at the END of the window where prepareGblFitData's
-  //                              matCached contract reads it (matCached[n]). Window sized for N<=12.
-  //   [77] [78]    innerD1/W1   segmentXX0Moments, function of hit 0 alone
-  //   [79]         bFieldEff    blEffectiveBField of THIS linearization (reads fast_fit, but invariant
-  //                              across the prep/out/outlier phases of one linearization).
-  // so no phase indexes the buffer by a bare number.
+  // pipeline, indexed by the named slots below. Slots [64..104] hold the iteration-invariant tail:
+  //   [64..64+N-1] matXX0     the material march (function of hit positions alone)
+  //   [64+N]       innerXX0   function of hit 0, at the end of the window prepareGblFitData's matCached
+  //                           contract reads (matCached[n]); the window is sized for N <= 12
+  //   [77] [78]    innerD1/W1 segmentXX0Moments, function of hit 0 alone
+  //   [79]         bFieldEff  effective field of this linearization, invariant across its phases
   constexpr int kBLPhaseJacBack = 0;     // [0..24]  hit0 -> PCA backward jacobian (hits-only node layout)
   constexpr int kBLPhaseUsedInner = 25;  // 1 if the inner-node layout was built for this lane
   constexpr int kBLPhaseQCharge = 26;
@@ -867,21 +807,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   constexpr int kBLPhaseInnerCol = kBLPhaseMatCol + 3 * kBLPhaseMatMax;
   constexpr int kBLPhaseDoubles = kBLPhaseInnerCol + 3;  // 144
 
-  // Ionization-loss enable flag for the GBL node builders (the refit ladder; passed as
-  // applyELossCorrection). The size of the charge comes from the Landau laws in GeneralBrokenLine.h
-  // (elossMostProbable/elossTypicalColumn), so no magnitude belongs here.
+  // Ionization-loss enable flag for the GBL node builders (passed as applyELossCorrection); the magnitude
+  // comes from the Landau laws in GeneralBrokenLine.h.
   constexpr bool kApplyELossCorrection = true;
 
-  // ---------------------------------------------------------------------------------------------
-  // PHASE-SPLIT GBL fit pipeline. One kernel carrying prep+solve+extract+outlier at once spills a
-  // per-thread frame the driver reserves for every max-resident thread; per-phase kernels keep the live
-  // set to a few hundred bytes with no spill. Per-fit intermediates cross launches through a per-lane
-  // phase buffer (kBLPhaseDoubles doubles, caching-allocator scratch; slot layout above). Every boundary
-  // value is a fully-materialized double, so the store/load boundary cannot change any rounding.
-  //
-  // Phase (i): per-node preparation. Loads the (possibly overridden) linearization reference (before
-  // prepareGblFitData, since every prep step depends on it), rebuilds arc-length/material/gnodes, and
-  // persists the iteration-invariant scalars + jacBack into the phase buffer.
+  // Phase-split GBL fit pipeline: one kernel carrying prep+solve+extract+outlier would spill a per-thread frame
+  // for every resident thread; per-phase kernels keep the live set to a few hundred bytes. Per-fit
+  // intermediates cross launches through the per-lane phase buffer (kBLPhaseDoubles doubles, slot layout
+  // above) as fully materialized doubles, so the store/load boundary changes no rounding.
+  // Phase (i): per-node preparation (reference, arc lengths, material, gnodes, invariant scalars, jacBack).
   template <int N, typename TrackerTraits, uint32_t Stride = riemannFit::stride>
   struct Kernel_BLFitPhasePrep {
   public:
@@ -892,41 +826,28 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // Normalized (Bz,Br) r-z field map. When set, the momentum feeding the MS weights / dE/dx uses a
     // per-track hit-averaged effective field; when null the scalar bField is used instead.
     const float* __restrict__ bMap_ = nullptr;
-    // This launch is a RE-linearization of a fit whose FIRST linearization ran on the SAME lane of the
-    // SAME phase buffer, so the iteration-invariant material rows are already there and the Geant4 map
-    // march can be skipped. Only ever true where that is structurally guaranteed: the refit ladder's
-    // iteration 1 (one scan, two fit iterations, one phase buffer -- see runRefitFusedPrep). When false the
-    // material is marched from the map.
+    // This launch re-linearizes a fit whose first linearization ran on the same lane of the same phase
+    // buffer, so the iteration-invariant material rows are read from there instead of marching the map.
     bool matFromPhase_ = false;
-    // Take the effective field from the phase buffer instead of averaging B_bend over the hits. Set only on
-    // a RE-linearization whose predecessor's solve published a fit-consistent field there: the field the
-    // fit is linearized on is then the one the fit's own curvature weights define, and re-deriving the
-    // hit-count average here would discard it. When false this phase computes the hit-count average.
+    // Take the effective field from the phase buffer instead of averaging B_bend over the hits; set only
+    // on a re-linearization whose predecessor's solve published a fit-consistent field there.
     bool fieldFromPhase_ = false;
-    // Charge-symmetric corrections package (see the block at the head of BrokenLine.h). Two terms, both
-    // charge-odd by construction: on, the node-0 -> PCA step in gblHelixAtPca uses a SIGNED arc and the
-    // node prep adds the bending-field PROFILE deterministic offset; off, the arc is unsigned and no
-    // profile offset is applied. The second term additionally needs bMap_, so it is inert where the map
-    // is null.
+    // Charge-symmetric corrections (see the head of BrokenLine.h): the node-0 -> PCA step in gblHelixAtPca
+    // uses a signed arc and the node prep adds the bending-field profile offset. The second term needs
+    // bMap_ and is inert where the map is null.
     bool chargeSymmetric_ = false;
-    // Reference-trajectory corrections package (see the block at the head of BrokenLine.h). On, both node
-    // builders seed the node-0 path length from the reference helix, take the arc->azimuth sign that
-    // places a measurement-less node from it, and form the field's B_r lambda row (which additionally
-    // needs bMap_); off, the path length is seeded 0, the sign is taken unsigned and only the B_z row is
-    // formed. The node LAYOUT is the same either way.
+    // Reference-trajectory corrections (see the head of BrokenLine.h): both node builders seed the node-0
+    // path length from the reference helix, take the arc->azimuth sign from it and form the field's B_r
+    // lambda row (which needs bMap_). The node layout is the same either way.
     bool trajectoryCorrections_ = false;
-    // On, Highland's log is evaluated at the track's TOTAL declared material and the resulting variance
-    // apportioned to the gaps by thickness; off, each gap evaluates the log at its own thickness (see
-    // prepareGblData in GeneralBrokenLine.h). Forwarded to BOTH node builders.
+    // On, Highland's log is evaluated at the track's total declared material and the variance apportioned
+    // to the gaps by thickness; off, each gap evaluates the log at its own thickness.
     bool scatteringLogAtTotal_ = false;
     // On, the typical energy loss is the single-column Landau law at the accumulated thickness and each
-    // node is charged its increment of it (elossTypicalColumn in GeneralBrokenLine.h); off, each lump is
-    // charged its own Landau MPV. Forwarded to BOTH node builders.
+    // node is charged its increment of it; off, each lump is charged its own Landau MPV.
     bool elossCumulative_ = false;
 
-    // One lane of this phase, pinned out of line (BL_REFIT_NOINLINE): the fused kernel's trampoline
-    // calls this one compiled function. The invalid-tkid sentinel is not tested here: the caller tests
-    // it before dispatching.
+    // One lane of this phase, pinned out of line. The invalid-tkid sentinel is tested by the caller.
     ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
                                               uint32_t local_idx,
                                               double bField,
@@ -941,7 +862,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       riemannFit::Map4dS<Stride> fast_fit(pfast_fit + local_idx);
       riemannFit::Map6xNfS<N, Stride> hits_ge(phits_ge + local_idx);
       double* phase = pphase + std::size_t(local_idx) * std::size_t(kBLPhaseDoubles);
-      // Reference override BEFORE any reference-dependent preparation.
+      // Reference override before any reference-dependent preparation.
       if (iterFromPhase_) {
         fast_fit(0) = phase[kBLPhaseNextRef + 0];
         fast_fit(1) = phase[kBLPhaseNextRef + 1];
@@ -951,10 +872,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       // Per-track effective field; with bMap_ null this is the scalar bField.
       const double bFieldEff =
           fieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
-      // Publish this linearization's effective field so the out and outlier phases read it instead of
-      // re-running the same O(N) two-bilinears-per-hit map loop on the same fast_fit. Written on every
-      // prep, so each phase always sees its own iteration's value. When the value CAME from the slot it
-      // is already there, and rewriting it would only cost a store.
+      // Publish this linearization's effective field for the out and outlier phases. Written on every
+      // prep, so each phase sees its own iteration's value.
       if (!fieldFromPhase_)
         phase[kBLPhaseBFieldEff] = bFieldEff;
       static_assert(int(N) <= kBLPhaseMatMax, "the phase buffer's matXX0 window must cover N");
@@ -982,9 +901,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
       double innerD1 = 0., innerW1 = 0.;
       if (matFromPhase_) {
-        // The upstream two-thin split is a function of hit 0 alone, so it rides the same cache.
-        // Loaded unconditionally: the iteration-0 prep left 0/0 here whenever innerXX0 was not
-        // positive, which is exactly what the else branch would produce.
+        // Function of hit 0 alone, so it rides the same cache; the iteration-0 prep left 0/0 wherever
+        // innerXX0 was not positive, which is what the else branch produces.
         innerD1 = phase[kBLPhaseInnerD1];
         innerW1 = phase[kBLPhaseInnerW1];
       } else {
@@ -1019,15 +937,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         phase[kBLPhaseInnerCol + 1] = data.innerCol.eLnI;
         phase[kBLPhaseInnerCol + 2] = data.innerCol.eLnRho;
       }
-      // hit0->PCA backward transport: only the hits-only node layout uses it, so it is set by
-      // prepareGblData; identity here keeps the phase buffer defined when a layout that extracts at
-      // node 0 (the inner-node layout, and the split) is built instead.
+      // hit0->PCA backward transport: only the hits-only node layout uses it, so identity here keeps the
+      // phase buffer defined for the layouts that extract at node 0.
       generalBrokenLine::Matrix5d jacBack = generalBrokenLine::Matrix5d::Identity();
       bool usedInner = false;
       bool usedSplit = false;
       if constexpr (int(N) >= 3) {
-        // the 2N+1 layout. It refuses a track whose gaps cannot carry an interior scatterer at all;
-        // that track then takes the arrival-node layout below, which is well posed for any gap.
+        // The 2N+1 layout refuses a track whose gaps cannot carry an interior scatterer; that track takes
+        // the arrival-node layout below, which is well posed for any gap.
         usedSplit = generalBrokenLine::prepareGblDataSplit<Acc1D, N>(acc,
                                                                      hits,
                                                                      hits_ge,
@@ -1079,11 +996,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                     matCol,
                                                     data.innerCol);
 #ifdef BL_LAYER_DUMP
-      // BL_LAYER_DUMP: fit-input trace, one block per track per linearization -- the reference fast fit,
-      // the field, the charge and the material this pass was built on, plus every hit and its ge error
-      // row. The last block emitted for a tkid is the final linearization, whose solve produces the
-      // published state. Run single-threaded on the serial backend so a track's TRK/HIT lines stay
-      // contiguous in stdout.
+      // Fit-input trace, one block per track per linearization: the reference fast fit, the field, the
+      // charge and the material of this pass, plus every hit and its ge error row. Run single-threaded on
+      // the serial backend so a track's lines stay contiguous in stdout.
       const auto tkid = ptkids[local_idx];  // the dump is this phase's only consumer of the tuple id
       printf("BLDUMP_TRK %u N %d bfield %.17g ff %.17g %.17g %.17g %.17g q %d innerXX0 %.17g\n",
              (unsigned)tkid,
@@ -1134,12 +1049,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // Normalized (Bz,Br) r-z field map, forwarded only so this phase can re-sample B_bend at the nodes;
     // when null the effective field in the phase buffer is left alone.
     const float* __restrict__ bMap_ = nullptr;
-    // On, replace the hit-count-averaged effective field left in the phase buffer by the fit-consistent
-    // one this solve's own influence vector defines (see blKernelWeightedBField); off, this phase writes
-    // no field and the hit-count average stands.
+    // On, replace the hit-count-averaged effective field in the phase buffer by the fit-consistent one
+    // this solve's own influence vector defines (blKernelWeightedBField).
     bool fieldKernelWeights_ = false;
-    // ONE LANE of this phase, pinned OUT OF LINE (BL_REFIT_NOINLINE): the fused kernel's trampoline calls
-    // THIS function.
+    // One lane of this phase, pinned out of line.
     ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
                                               uint32_t local_idx,
                                               double bField,
@@ -1153,9 +1066,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N)
                                                                 : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
       generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
-      // sized for the widest node chain this lane can build: the exact split's 2N+1 nodes when the
-      // material model is on, the arrival-node layout's N+2 otherwise. One stride for both, so the
-      // solve's band region and the outlier phase's pull region never overlap in either layout.
+      // Sized for the widest node chain this lane can build (the exact split's 2N+1 nodes, else the
+      // arrival-node layout's N+2), so the band region and the pull region never overlap in either layout.
       constexpr int kSplitN = generalBrokenLine::kGblSplitNodes<N> - 1;
       constexpr int kBandDoubles = generalBrokenLine::kGblScratchDoubles<kSplitN>;
       // Scratch overlay: gFullDelta lives in the head of the band region (= Mb); gNodeVar stays
@@ -1178,7 +1090,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       generalBrokenLine::Matrix5d covPca, gcov;
       double gchi2 = 0.;
       if (usedSplit) {
-        // 2N+1 nodes; like the inner-node layout, node 0 IS the PCA, so the extraction is exact.
+        // 2N+1 nodes; node 0 is the PCA, so the extraction is exact.
         covPca = generalBrokenLine::gblFitPca<Acc1D, kSplitN>(acc,
                                                               gnodes,
                                                               gblScratch,
@@ -1223,11 +1135,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       for (int r = 0; r < 5; ++r)
         for (int c = 0; c < 5; ++c)
           phase[kBLPhaseCovPca + 5 * r + c] = covPca(r, c);
-      // Fit-consistent conversion field. The influence vector this solve just built is the only place the
-      // fit's own curvature weights exist, so the effective field is re-derived here and republished into
-      // the slot the extraction and outlier phases read; the prep of the NEXT linearization picks it up
-      // from the same slot. The solve's own arithmetic is untouched -- this reads w and the node
-      // precisions after the fact and writes one double.
+      // Fit-consistent conversion field: the influence vector this solve built is the only place the fit's
+      // own curvature weights exist, so the effective field is re-derived here and republished into the
+      // slot the extraction, outlier and next prep read. The solve's own arithmetic is untouched.
       if (fieldKernelWeights_ && bMap_ != nullptr) {
         constexpr int kInflInner = generalBrokenLine::kGblInfluenceOffset<N + 1>;
         constexpr int kInflOuter = generalBrokenLine::kGblInfluenceOffset<N - 1>;
@@ -1251,14 +1161,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // Normalized (Bz,Br) r-z field map. When set, the curvature->pT conversion + the PCA perigee use a
     // per-track hit-averaged effective field; when null they use the scalar bField.
     const float* __restrict__ bMap_ = nullptr;
-    // Read this linearization's effective field from the phase buffer instead of recomputing it (the prep
-    // of the SAME iteration wrote it there). Only set where the prep is structurally guaranteed to have
-    // run on this lane in this iteration: the refit ladder.
+    // Read this linearization's effective field from the phase buffer instead of recomputing it; set only
+    // where the prep of the same iteration is guaranteed to have run on this lane.
     bool bFieldFromPhase_ = false;
     // Charge-symmetric corrections package (see Kernel_BLFitPhasePrep::chargeSymmetric_).
     bool chargeSymmetric_ = false;
 
-    // One lane of this phase, pinned out of line (BL_REFIT_NOINLINE): the fused kernel's trampoline calls it.
+    // One lane of this phase, pinned out of line.
     ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
                                               uint32_t local_idx,
                                               double bField,
@@ -1274,11 +1183,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       const int qCharge = int(phase[kBLPhaseQCharge]);
       const double sTrans0 = phase[kBLPhaseSTrans0];
       const double gchi2 = phase[kBLPhaseGChi2];
-      // When bFieldFromPhase_ is set, THIS linearization's prep already evaluated blEffectiveBField on
-      // exactly this fast_fit and these hits (neither has been touched since) and published the double
-      // into the phase buffer, so re-running the O(N) two-bilinears-per-hit map loop here can only
-      // reproduce it. When it is false the field is recomputed here; with bMap_ null that call is a
-      // single early return anyway.
+      // With bFieldFromPhase_ the prep of this linearization evaluated the field on exactly this fast_fit
+      // and these hits, so recomputing it here could only reproduce it.
       const double bFieldEff =
           bFieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
       generalBrokenLine::Vector5d corrPca;
@@ -1310,8 +1216,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       results_view[tkid].chi2() = float(gchi2 / (ndof > 0 ? ndof : 1));
       results_view[tkid].ndof() = int8_t(ndof > 0 ? ndof : 1);
 #ifdef BL_LAYER_DUMP
-      // BL_LAYER_DUMP: the fitted state (SoA convention: hp(2) = 1/pt) plus the native chi2, in the same
-      // stdout stream as the input blocks above.
+      // The fitted state (SoA convention: hp(2) = 1/pt) and the native chi2.
       printf("BLDUMP_FIT %u hp %.17g %.17g %.17g %.17g %.17g chi2 %.17g\n",
              (unsigned)tkid,
              hp(0),
@@ -1331,29 +1236,25 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   struct Kernel_BLFitPhaseOutlier {
   public:
     const bool outlierReject_ = true;
-    // When BOTH pointers are non-null (the merger refit, when the fit-rejected hit is to be removed from
-    // the emitted list) and a hit is dropped, name the dropped hit into dropHitId_[tkid] using the
-    // per-lane fitHitId_ table. Both null wherever the caller left that compaction off, and nothing is written.
+    // When both are set and a hit is dropped, the dropped hit's raw id is written to dropHitId_[tkid] from
+    // the per-lane fitHitId_ table. Both null: nothing is written.
     const uint32_t* __restrict__ fitHitId_ = nullptr;
     uint32_t* __restrict__ dropHitId_ = nullptr;
-    // Core-protected outlier: when coreProtect_ and fitHitIsCore_ are set, the worst-pull scan skips
-    // ORIGINAL PIXEL-CORE nodes (fitHitIsCore_[lane*kRefitFitIdQuota + i] != 0), so the drop can only ever land on an
-    // appended extra. With coreProtect_ false / fitHitIsCore_ null the scan considers every node.
+    // Core-protected outlier: with coreProtect_ and fitHitIsCore_ set, the worst-pull scan skips original
+    // pixel-core nodes (fitHitIsCore_[lane*kRefitFitIdQuota + i] != 0), so the drop can only land on an
+    // appended extra.
     const uint8_t* __restrict__ fitHitIsCore_ = nullptr;
     bool coreProtect_ = false;
     // Normalized (Bz,Br) r-z field map. When set, the re-solve's curvature->pT conversion + PCA perigee
     // use a per-track hit-averaged effective field; when null (as on the CA path) they use the scalar
     // bField.
     const float* __restrict__ bMap_ = nullptr;
-    // See Kernel_BLFitPhaseOut::bFieldFromPhase_. The outlier phase runs after the FINAL out phase, so
-    // the value in the buffer is the final linearization's -- exactly what its own recompute would yield
-    // (fast_fit is not touched after the final prep).
+    // See Kernel_BLFitPhaseOut::bFieldFromPhase_. This phase runs after the final out phase, so the value
+    // in the buffer is the final linearization's.
     bool bFieldFromPhase_ = false;
     // Charge-symmetric corrections package (see Kernel_BLFitPhasePrep::chargeSymmetric_).
     bool chargeSymmetric_ = false;
-    // One lane of this phase, pinned out of line (BL_REFIT_NOINLINE): the fused kernel's trampoline
-    // calls this one compiled function. The invalid-tkid sentinel is not tested here: the caller tests
-    // it before dispatching.
+    // One lane of this phase, pinned out of line. The invalid-tkid sentinel is tested by the caller.
     ALPAKA_FN_ACC BL_REFIT_NOINLINE void lane(Acc1D const& acc,
                                               uint32_t local_idx,
                                               double bField,
@@ -1371,9 +1272,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           int(N) > int(TrackerTraits::maxHitsOnTrackForFullFit) ? int(N)
                                                                 : int(TrackerTraits::maxHitsOnTrackForFullFit))>;
       generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
-      // sized for the widest node chain this lane can build: the exact split's 2N+1 nodes when the
-      // material model is on, the arrival-node layout's N+2 otherwise. One stride for both, so the
-      // solve's band region and the outlier phase's pull region never overlap in either layout.
+      // Sized for the widest node chain this lane can build (the exact split's 2N+1 nodes, else the
+      // arrival-node layout's N+2), so the band region and the pull region never overlap in either layout.
       constexpr int kSplitN = generalBrokenLine::kGblSplitNodes<N> - 1;
       constexpr int kBandDoubles = generalBrokenLine::kGblScratchDoubles<kSplitN>;
       // Scratch overlay: gFullDelta lives in the head of the band region (= Mb); gNodeVar stays
@@ -1396,7 +1296,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       const double bFieldEff =
           bFieldFromPhase_ ? phase[kBLPhaseBFieldEff] : blEffectiveBField(acc, hits, int(N), fast_fit, bField, bMap_);
       // The hits-only layout carrying upstream inner material cannot be re-solved faithfully, so it is
-      // excluded here; the launcher only runs this phase after the fit's final linearization.
+      // excluded here.
       const bool canResolve = outlierReject_ && (phase[kBLPhaseSplit] != 0. || usedInner || !(innerXX0 > 0.));
       if (!canResolve)
         return;
@@ -1406,11 +1306,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       auto uIdxOf = [](int k) { return 1 + 2 * k; };
       double worst = 0.;
       int worstNode = -1;
-      // Fit-hit index of the current measurement node (# measured nodes before k), used to look up
-      // its core flag. Advances only on measured nodes -- same mapping the drop-id emit below uses.
+      // Fit-hit index of the current measurement node (number of measured nodes before k), used to look up
+      // its core flag; the same mapping the drop-id emit below uses.
       int diScan = 0;
       const bool coreProtectOn = coreProtect_ && fitHitIsCore_ != nullptr;
-      // Worst pull among PROTECTED (core) nodes; it drives the abstain rule below.
+      // Worst pull among protected (core) nodes; it drives the abstain rule below.
       double worstCore = 0.;
       for (int k = 0; k < nFitNodes; ++k) {
         if (!fitNodes[k].hasMeas)
@@ -1419,8 +1319,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         const bool isCoreNode =
             coreProtectOn &&
             fitHitIsCore_[std::size_t(local_idx) * std::size_t(kRefitFitIdQuota) + std::size_t(diThis)] != 0;
-        // A core node is scanned but never becomes a drop CANDIDATE: it only feeds the worstCore
-        // shadow, which decides whether the stage abstains this round (see the decision below).
+        // A core node never becomes a drop candidate: it only feeds the worstCore shadow that decides
+        // whether the stage abstains.
         const double ru = fitNodes[k].measResidual(0) - gFullDelta[uIdxOf(k)];
         const double rv = fitNodes[k].measResidual(1) - gFullDelta[uIdxOf(k) + 1];
         const generalBrokenLine::Matrix2d V = generalBrokenLine::inv2(fitNodes[k].measPrec);
@@ -1432,7 +1332,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           continue;  // numerically non-PD residual covariance: no reliable pull
         const double pull2 = (ru * (s11 * ru - s01 * rv) + rv * (s00 * rv - s01 * ru)) / det;
         if (isCoreNode) {
-          if (pull2 > worstCore)  // shadow only; a core node is still never a real drop candidate
+          if (pull2 > worstCore)  // shadow only: never a drop candidate
             worstCore = pull2;
           continue;
         }
@@ -1442,17 +1342,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         }
       }
       constexpr double kOutlierChi2Cut = 13.8;  // ~99.9% of the chi2 distribution for 2 dof
-      // Abstain when the largest-pull measured node is a protected core node: the evidence points at a
-      // hit the stage may not delete, and deleting the next-worst instead would be a different hypothesis
-      // that degrades the curvature resolution. The cut is not consulted: when worstCore <= worst the rule
-      // is inactive anyway, and when worstCore > worst the non-core candidate is the one being declined.
+      // Abstain when the largest-pull measured node is a protected core node: the evidence points at a hit
+      // the stage may not delete, and dropping the next-worst instead would be a different hypothesis.
       const bool abstain = coreProtectOn && worstCore > worst;
       if (!abstain && worstNode >= 0 && worst > kOutlierChi2Cut) {
         fitNodes[worstNode].hasMeas = false;
-        // The dropped measurement node maps to fit hit i = (# of measured nodes before it),
-        // and fitHitId_[lane*kRefitFitIdQuota + i] is that hit's raw id. Publish it so the merger drops it from the
-        // emitted hit list (nHits -> nMeasFit). Guarded on both pointers, so a caller that left them null
-        // gets no write.
+        // The dropped measurement node maps to fit hit i = number of measured nodes before it; publish its
+        // raw id, fitHitId_[lane*kRefitFitIdQuota + i], so the merger drops it from the emitted hit list.
         if (fitHitId_ != nullptr && dropHitId_ != nullptr) {
           int di = 0;
           for (int k2 = 0; k2 < worstNode; ++k2)
@@ -1496,18 +1392,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // ---------------------------------------------------------------------------------------------
-  // THE FUSED PHASE LADDER. Run per bin, one (phase, iteration) of the refit ladder would be ten
-  // serialised launches, each with only a few hundred live lanes while the rest of the device idles; the
-  // solver is latency-bound (one thread marching a bordered-band double solve), so the per-bin
-  // serialisation starves occupancy. With the lane partition at the head of this file all ten bins are
-  // resident in one launch per (phase, iteration), and wall time becomes the slowest bin, not their sum.
-  // Bin b runs the out-of-line Kernel_BLFitPhase*<b+kRefitMinN>::lane (the trampolines below rebuild the
-  // bin's kernel object from the shared config); no lane body reads its lane index beyond its own
-  // addresses, so the arithmetic does not depend on where in the lane space a track lands.
-  //
-  // N-independent config of one fused launch: the members the per-N phase kernels carry, so one object
-  // serves all ten cases; the trampoline rebuilds the bin's kernel from it inside the callee's frame.
+  // Fused phase ladder: with the lane partition all ten N-bins run in one launch per (phase, iteration), so
+  // wall time is the slowest bin, not their sum. Bin b runs the out-of-line Kernel_BLFitPhase*<b+kRefitMinN>::lane
+  // through the trampolines below; no lane body reads its lane index beyond its own addresses.
+  // N-independent config of one fused launch: the members the per-N phase kernels carry, so one object serves
+  // all ten cases; the trampoline rebuilds the bin's kernel from it.
   struct BLRefitFusedCfg {
     const float* __restrict__ rhoMap = nullptr;
     const float* __restrict__ bMap = nullptr;
@@ -1606,9 +1495,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     k.lane(acc, lane, bField, results_view, ptkids, phits, pfast_fit, pgnodes, pscratch, pphase);
   }
 
-  // THE FUSED KERNELS. The block index picks the bin (and its compile-time N) out of the device table
+  // Fused kernels. The block index picks the bin (and its compile-time N) out of the device table
   // Kernel_BLRefitLaneRanges wrote; the block's elements are the bin's lanes. One bin per block, so the
-  // switch over N cannot diverge inside a warp; an unused block returns at once.
+  // switch over N cannot diverge inside a warp.
   template <typename TrackerTraits, uint32_t Stride>
   struct Kernel_BLFitPhasePrepFused {
     static_assert(Stride == HelixFit<TrackerTraits>::kRefitStride, "the fused ladder spans the refit lane buffer");
@@ -1635,8 +1524,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           const uint32_t local_idx = laneLo + uint32_t(el.local);
           if (local_idx >= laneHi)
             break;
-          // Safety net only: a bin's range IS its exact count, so the scan fills every lane of it and
-          // the sentinel cannot be reached unless the count and the fill ever disagree.
+          // Safety net: a bin's range is its exact count, so the scan fills every lane of it.
           if (invalidTkId == ptkids[local_idx])
             continue;
 #define BL_REFIT_FUSED_PREP_CASE(BIN)                                                       \
@@ -1769,8 +1657,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // The outlier phase runs for N >= 5 only, so bins 0 and 1 fall through to `default` and are left
-  // untouched: their solve never filled the pulls the phase would read.
+  // The outlier phase runs for N >= 5 only: bins 0 and 1 fall through to `default`, their solve never
+  // filled the pulls it would read.
   template <typename TrackerTraits, uint32_t Stride>
   struct Kernel_BLFitPhaseOutlierFused {
     static_assert(Stride == HelixFit<TrackerTraits>::kRefitStride, "the fused ladder spans the refit lane buffer");
@@ -1825,17 +1713,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
 #undef BL_REFIT_NOINLINE
 
-  // ---------------------------------------------------------------------------------------------
-  // Extended-N REFIT. After the merger's OT hit-attach rewrite, each accepted-extended track's REWRITTEN
-  // hit container holds its originals + attached extras (tagged OT-rechit ids carry bit30). A full GBL
-  // refit -- the OT lever arm shrinks the longitudinal/pT covariance -- overwrites the pre-refit state/cov/chi2.
-  // The fit kernels are hit-source agnostic (reused as-is); only the hit LOAD needs merged-vs-OT dispatch.
-  // Runs wherever refitExtended is called: refitMergedTwins and refitDedupUnions.
-  // ---------------------------------------------------------------------------------------------
+  // Extended-N refit. Each accepted-extended track's rewritten hit container holds its originals plus the
+  // attached extras (tagged OT-rechit ids carry bit30); a full GBL refit, whose OT lever arm shrinks the
+  // longitudinal and pT covariance, overwrites the pre-refit state, covariance and chi2. The fit kernels
+  // are hit-source agnostic: only the hit load dispatches merged vs OT.
 
-  // Fit-hit selection over the rewritten container (caFitHitSel::dedupWalk), but INCLUDING tagged
-  // OT-rechit ids (bit30): they index the raw OT source and must be counted as fit hits (unlike the
-  // verify guard, which SKIPS them). Same kMode filter + pixel-overlap dedup. k<0 -> count; k>=0 -> k-th.
+  // Fit-hit selection over the rewritten container (caFitHitSel::dedupWalk), including tagged OT-rechit
+  // ids (bit30), which index the raw OT source and count as fit hits. Same kMode filter and pixel-overlap
+  // dedup. k < 0 counts; k >= 0 returns the k-th.
   template <typename TupleCont, typename HitsView>
   ALPAKA_FN_ACC ALPAKA_FN_INLINE uint32_t
   refitDedupWalk(TupleCont const* __restrict__ hitContainer, uint32_t it, HitsView hh, bool hasStubs, int k) {
@@ -1848,12 +1733,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       auto const h = hitId[j];
       const bool ot = caOTHitTag::isOTId(h);
       if (!ot && h >= static_cast<uint32_t>(nTot))
-        break;  // genuine content-overflow guard (untagged out-of-range id)
+        break;  // content-overflow guard (untagged out-of-range id)
       // OT extras count as stubs for the kMode filter; merged ids consult the SoA stub flag.
       const bool hitIsStub = ot ? true : reco::isStub(hh, int32_t(h));
       if (!caFitHitSel::useHit(hitIsStub, hasStubs))
         continue;
-      // Merge only two consecutive kept MERGED-PIXEL hits (never an OT extra or a stub).
+      // Merge only two consecutive kept merged-pixel hits, never an OT extra or a stub.
       if (hasStubs && lastKeptJ >= 0 && !ot && !reco::isStub(hh, int32_t(h))) {
         auto const hp = hitId[lastKeptJ];
         if (!caOTHitTag::isOTId(hp) && !reco::isStub(hh, int32_t(hp))) {
@@ -1871,12 +1756,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     return nkept;
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // THE DYNAMIC PARTITION, part 1: count. One launch for the WHOLE ladder -- nSel does not depend
-  // on N, so this kernel is not templated and one sweep produces all ten demands. It walks the same
-  // population/gates/refitDedupWalk as the per-bin scans, binned with refitBinOfNSel, so count and
-  // claim cannot disagree. The counters are the DEMAND of this round (exclude earlier-round seated).
-  // ---------------------------------------------------------------------------------------------
+  // Dynamic partition, part 1: count. nSel does not depend on N, so one sweep produces all ten demands.
+  // It walks the same population, gates and refitDedupWalk as the per-bin scans, binned with
+  // refitBinOfNSel, so count and claim cannot disagree. The counters are the demand of this round.
   class Kernel_BLRefitBinCount {
   public:
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
@@ -1897,17 +1779,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         const uint32_t nSel = refitDedupWalk(hitContainer, tkid, hh, hasStubsRt, /*k=*/-1);
         const uint32_t bin = refitBinOfNSel(nSel, maxFitSel);
         if (bin >= kRefitNBins)
-          continue;  // outside the ladder: no bin fits this track, exactly as in the per-bin scans
+          continue;  // outside the ladder: no bin fits this track
         alpaka::atomicAdd(acc, pCounts + bin, 1u, alpaka::hierarchy::Grids{});
       }
     }
   };
 
-  // ---------------------------------------------------------------------------------------------
-  // THE DYNAMIC PARTITION, part 2: ranges. Single-threaded, device-only (no host crossing): hands
-  // kRefitStride lanes out in bin order, writes the block->bin dispatch table (one bin per block,
-  // idle tail at kRefitNBins). The per-track served flag makes the round-bound exact.
-  // ---------------------------------------------------------------------------------------------
+  // Dynamic partition, part 2: ranges. Single-threaded, device-only: hands kRefitStride lanes out in bin
+  // order and writes the block->bin dispatch table (one bin per block, idle tail at kRefitNBins). The
+  // per-track served flag makes the round bound exact.
   class Kernel_BLRefitLaneRanges {
   public:
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
@@ -1947,32 +1827,30 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // Prepares the BLFit input buffers for the extended-N refit. Keeps accepted-extended tuples whose
-  // selected multiplicity falls in [nHitsL,nHitsH], dense-compacts into ptkids/buffers via a grid atomic
-  // (ptkids pre-set to the invalid sentinel, preserving the fit kernels' break-on-invalid tail).
-  // Per-hit dispatch: raw OT SoA for tagged ids, merged SoA + innerSensorFrame otherwise (same as Kernel_BLFastFit).
+  // Prepares the BLFit input buffers for the extended-N refit: keeps accepted-extended tuples whose
+  // selected multiplicity falls in [nHitsL,nHitsH] and dense-compacts them into ptkids/buffers through a
+  // grid atomic (ptkids pre-set to the invalid sentinel, preserving the break-on-invalid tail). Tagged ids
+  // load from the raw OT SoA, the rest from the merged SoA through innerSensorFrame.
   template <int N, uint32_t Stride = riemannFit::stride>
   class Kernel_BLFastFitRefit {
   public:
     // OT source by value (as the extension kernels take it): default (nOTHits==0) => no tagged ids.
     caExtension::OTHitsSource otSource_{};
-    // Per-lane record of the RAW hit id loaded into each fit slot (fitHitId_[lane*kRefitFitIdQuota + i] = id of fit
-    // hit i). The outlier phase maps its dropped measurement node back to this id so the merger can
-    // remove the fit-rejected hit from the emitted TrackHitSoA list. Null means no such record is kept.
+    // Per-lane raw hit id of each fit slot (fitHitId_[lane*kRefitFitIdQuota + i]). The outlier phase maps
+    // its dropped measurement node back to this id, so the merger can remove the fit-rejected hit from the
+    // emitted TrackHitSoA list. Null means no such record is kept.
     uint32_t* __restrict__ fitHitId_ = nullptr;
-    // Core-protected outlier: per-lane record of whether each fit slot is an ORIGINAL PIXEL-CORE hit
-    // (id below offsetStubs, not a bit30 OT tag). The outlier phase reads it to restrict the drop to
-    // non-core (appended) nodes. Null (core protection off) means no such record is kept.
+    // Core-protected outlier: per-lane flag of whether each fit slot is an original pixel-core hit (id
+    // below offsetStubs, not a bit30 OT tag), read by the outlier phase to restrict the drop to appended
+    // nodes. Null means no such record is kept.
     uint8_t* __restrict__ fitHitIsCore_ = nullptr;
     // Device-resident lane range of this bin for this round, {firstLane, nLanes} at
-    // pLaneRange_[kRefitRangeStride*(N-kRefitMinN)], written by Kernel_BLRefitLaneRanges. Null means
-    // base 0 and the whole buffer stride (the extension's prediction scans, ExtPredCoeff.dev.cc).
-    // Launch-only: decides where, never a value.
+    // pLaneRange_[kRefitRangeStride*(N-kRefitMinN)], written by Kernel_BLRefitLaneRanges. Null means base 0
+    // and the whole buffer stride. Decides where a lane lands, never a value.
     const uint32_t* __restrict__ pLaneRange_ = nullptr;
-    // Per-track "already seated in an earlier round" flag, nTracksCap bytes. A track is skipped while
-    // it is set and it is set the moment the track claims a lane, so consecutive rounds partition the
-    // population exactly: each round seats min(remaining, capacity) tracks and none is seated twice.
-    // Null means single-round behaviour with no gate and no marking (the extension's prediction scans).
+    // Per-track "already seated in an earlier round" flag, nTracksCap bytes: set the moment a track claims
+    // a lane, so consecutive rounds partition the population exactly. Null means single-round behaviour
+    // with no gate and no marking.
     uint8_t* __restrict__ pServed_ = nullptr;
 
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
@@ -1991,8 +1869,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                   bool hasStubs) const {
       constexpr uint32_t hitsInFit = N;
       constexpr uint32_t kBin = uint32_t(N) - uint32_t(kRefitMinN);
-      // Where this bin's lanes are, and how many of them there are, in the shared stride-wide buffer.
-      // Without a range table this is the whole buffer from lane 0 (the extension's prediction scans).
+      // Where this bin's lanes are in the shared stride-wide buffer, and how many of them there are.
+      // Without a range table this is the whole buffer from lane 0.
       const uint32_t laneBase = (pLaneRange_ != nullptr) ? pLaneRange_[kRefitRangeStride * kBin] : 0u;
       const uint32_t nt = (pLaneRange_ != nullptr) ? pLaneRange_[kRefitRangeStride * kBin + 1] : Stride;
       const bool hasStubsRt = hasStubs && (static_cast<int32_t>(hh.offsetStubs()) >= 0);
@@ -2006,11 +1884,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           continue;  // not this N-bin
         const uint32_t slot = alpaka::atomicAdd(acc, pSlot, 1u, alpaka::hierarchy::Grids{});
         if (slot >= nt) {
-          // Under the round loop (pServed_ set) this is the expected round overflow: the bin's lane
-          // range was cut by the round capacity and the track is simply left for the next round, so
-          // nothing is reported. Without a range table the slot cap binds and the
-          // track keeps its unrefit CA state: exactly one thread per launch observes slot == nt (the
-          // slot comes from a grid-scope atomicAdd), so the report is one line per binding launch.
+          // With pServed_ set this is the expected round overflow and the track is left for the next
+          // round. Without a range table the slot cap binds and the track keeps its unrefit CA state;
+          // exactly one thread per launch observes slot == nt, so the report is one line per launch.
           if (pServed_ == nullptr && slot == nt)
             printf(
                 "[refit slot cap] BOUND: N-bin %u..%u demanded > kRefitStride %u; tracks beyond the cap keep "
@@ -2031,8 +1907,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         riemannFit::Map4dS<Stride> fast_fit(pfast_fit + lane);
         riemannFit::Map6xNfS<N, Stride> hits_ge(phits_ge + lane);
 
-        // Uniform sampling of hitsInFit hits from the deduped selected set (force the last kept
-        // hit for maximum lever arm -- the outermost OT extra), identical to Kernel_BLFastFit.
+        // Uniform sampling of hitsInFit hits from the deduped selected set; the last kept hit is forced
+        // for maximum lever arm.
         uint32_t selectedHits[N];
         {
           float incr = std::max(1.f, float(nSel) / float(hitsInFit));
@@ -2048,13 +1924,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
         for (uint32_t i = 0; i < hitsInFit; ++i) {
           const uint32_t hid = hitId[selectedHits[i]];
-          // Record this fit slot's raw hit id (bit30 OT tag preserved) so the outlier phase can
-          // name the hit it drops. lane == the lane the fit/outlier kernels iterate (ptkids[lane]).
+          // Record this fit slot's raw hit id (bit30 OT tag preserved) so the outlier phase can name the
+          // hit it drops. lane is the lane the fit and outlier kernels iterate (ptkids[lane]).
           if (fitHitId_ != nullptr)
             fitHitId_[std::size_t(lane) * std::size_t(kRefitFitIdQuota) + i] = hid;
-          // Mark ORIGINAL PIXEL-CORE fit hits (id < offsetStubs and not a bit30 OT tag). Appended
-          // extras -- bit30 raw-OT (isOTId) and merged OT stubs (id >= offsetStubs) -- are non-core and
-          // remain droppable; only the pixel core is protected. Same lane*kRefitFitIdQuota + i indexing as fitHitId_.
+          // Mark original pixel-core fit hits (id < offsetStubs and not a bit30 OT tag). Appended extras,
+          // raw OT and merged OT stubs, stay droppable. Same lane*kRefitFitIdQuota + i indexing as
+          // fitHitId_.
           if (fitHitIsCore_ != nullptr) {
             const bool isCore = !caOTHitTag::isOTId(hid) && (!hasStubsRt || int32_t(hid) < int32_t(hh.offsetStubs()));
             fitHitIsCore_[std::size_t(lane) * std::size_t(kRefitFitIdQuota) + i] = isCore ? uint8_t(1) : uint8_t(0);
@@ -2062,7 +1938,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           float ge[6];
           float px, py, pz;
           if (caOTHitTag::isOTId(hid)) {
-            // Raw OT rechit: lower/upper sensor frame per position in the stack (verify/WriteFinal recipe).
+            // Raw OT rechit: lower or upper sensor frame by position in the stack.
             const uint32_t o = caOTHitTag::otIdx(hid);
             const uint32_t geom = uint32_t(otSource_.otHits[o].detectorIndex()) - ::phase2PixelTopology::nModulesPix;
             const bool isUpper = (o >= otSource_.otHitModules.upperSensorStart()[geom]);
@@ -2102,11 +1978,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // ---------------------------------------------------------------------------------------------
-  // Per-N launcher helpers (extern template). Each bundles the fast-fit + fit launches for ONE
-  // multiplicity N. The launch state travels in a small context POD, so the helper is a plain function
+  // Per-N launcher helpers (extern template). Each bundles the fast-fit and fit launches for one
+  // multiplicity N; the launch state travels in a small context POD, so the helper is a plain function
   // template that can be `extern template`-declared here and instantiated in a disjoint-N TU.
-  // ---------------------------------------------------------------------------------------------
 
   // Main-fit launch context: the launchBrokenLineKernels locals and HelixFit members the launches need.
   template <typename TrackerTraits>
@@ -2126,53 +2000,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     double* pfast_fit;
     double* pgblScratch;
     bool fitCorrections;  // fit correctness package (see Kernel_BLFit::fitCorrections_)
-    // Dynamic-partition state of the fused ladder (unused on the per-bin path, which addresses the whole
-    // buffer from lane 0). Both tables are written on the device by Kernel_BLMainLaneRanges, once per round.
+    // Dynamic-partition state, written on the device by Kernel_BLMainLaneRanges once per round.
     const uint32_t* pRange;     // per-bin {firstLane, nLanes, tupleBase}, kMainRangeStride * kMainNBins
     const uint32_t* pBlockMap;  // per-block {bin, firstLane, endLane}, kMainBlockMapStride * kMainFusedBlocks
     WorkDiv1D workDivFused;     // kMainFusedBlocks x kFitBlock, fixed and host-known
   };
 
-  // One (fast-fit + fit) launch of multiplicity N over the current chunk. nHitsL/nHitsH are the
-  // multiplicity bin of the fast-fit (== N for exact bins, [maxHitsOnTrackForFullFit, maxHitsOnTrack-1]
-  // for the "rest" bin). The CA main fit is the factorized fast BrokenLine fit: one launch, one
-  // linearization, no phase split.
-  template <int N, typename TrackerTraits>
-  void runMainBin(
-      BLMainLaunchCtx<TrackerTraits> const& c, WorkDiv1D const& wd, uint32_t nHitsL, uint32_t nHitsH, int32_t offset) {
-    alpaka::exec<Acc1D>(c.queue,
-                        wd,
-                        Kernel_BLFastFit<N>{},
-                        c.tuples,
-                        c.tupleMultiplicity,
-                        c.hv,
-                        c.cm,
-                        c.tkids,
-                        c.phits,
-                        c.phits_ge,
-                        c.pfast_fit,
-                        nHitsL,
-                        nHitsH,
-                        offset,
-                        std::is_same_v<pixelTopology::Phase2OTStubs, TrackerTraits>);
-    alpaka::exec<Acc1D>(c.queue,
-                        wd,
-                        Kernel_BLFit<N, TrackerTraits>{c.rhoMap, c.bMap, c.fitCorrections},
-                        c.tupleMultiplicity,
-                        c.bField,
-                        c.outputSoa,
-                        c.tkids,
-                        c.phits,
-                        c.phits_ge,
-                        c.pfast_fit,
-                        c.pgblScratch);
-  }
-
-  // ---------------------------------------------------------------------------------------------
-  // FUSED MAIN-LADDER LAUNCHERS. One launch per phase, all N-bins, on the fixed fused grid. Declared
-  // `extern template` and instantiated ONE PHASE PER TU: a fused kernel pulls every compile-time N of
-  // its phase into whichever TU instantiates it (per-phase rather than per-N build-time split).
-  // ---------------------------------------------------------------------------------------------
+  // Fused main-ladder launchers: one launch per phase, all N-bins, on the fixed fused grid. Declared
+  // `extern template` and instantiated one phase per TU, each pulling every compile-time N of its phase
+  // into that TU.
   template <typename TrackerTraits>
   void runMainFusedFast(BLMainLaunchCtx<TrackerTraits> const& c) {
     BLMainFusedCfg cfg{};
@@ -2236,29 +2072,28 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     generalBrokenLine::GblNodeData* pgnodes;
     double* pgblScratch;
     double* pphase;
-    // Per-lane fit-hit-id table (written by Kernel_BLFastFitRefit) + the per-merged-track
-    // dropped-hit-id output (consumed by the merger's post-refit hit-list compaction). Both null when
-    // the fit-rejected hit is left in the emitted list, in which case neither is written.
+    // Per-lane fit-hit-id table (written by Kernel_BLFastFitRefit) and the per-merged-track dropped-hit-id
+    // output (read by the merger's post-refit hit-list compaction). Both null leaves the fit-rejected hit
+    // in the emitted list and writes neither.
     uint32_t* pFitHitId;
     uint32_t* pDropHitId;
-    // Core-protected outlier: per-lane pixel-core flag table (written by
-    // Kernel_BLFastFitRefit) + the enable. With pFitHitIsCore null / coreProtect false the outlier scan
-    // considers every node.
+    // Core-protected outlier: per-lane pixel-core flag table (written by Kernel_BLFastFitRefit) and its
+    // enable. With pFitHitIsCore null or coreProtect false the outlier scan considers every node.
     uint8_t* pFitHitIsCore;
     bool coreProtect;
     // Fit-consistent curvature->pT conversion field (see Kernel_BLFitPhaseSolve::fieldKernelWeights_).
     // Needs the field map, so it is inert wherever bMap is null.
     bool fieldKernelWeights = false;
-    // Charge-symmetric corrections package (see Kernel_BLFitPhasePrep::chargeSymmetric_). Its arc-sign
-    // half is map-independent; its field-profile half needs bMap and is inert wherever the map is null.
+    // Charge-symmetric corrections (see Kernel_BLFitPhasePrep::chargeSymmetric_). Its arc-sign half is
+    // map-independent; its field-profile half needs bMap and is inert wherever the map is null.
     bool chargeSymmetric = false;
-    // Reference-trajectory corrections package (see Kernel_BLFitPhasePrep::trajectoryCorrections_).
+    // Reference-trajectory corrections (see Kernel_BLFitPhasePrep::trajectoryCorrections_).
     bool trajectoryCorrections = false;
-    // Highland's log at the track's TOTAL declared material rather than gap by gap (see
-    // Kernel_BLFitPhasePrep::scatteringLogAtTotal_). Map-independent.
+    // Highland's log at the track's total declared material rather than gap by gap (see
+    // Kernel_BLFitPhasePrep::scatteringLogAtTotal_).
     bool scatteringLogAtTotal = false;
     // Cumulative-column typical-loss law rather than the per-lump Landau MPV (see
-    // Kernel_BLFitPhasePrep::elossCumulative_). Map-independent.
+    // Kernel_BLFitPhasePrep::elossCumulative_).
     bool cumulativeEloss = false;
     // Dynamic-partition state of the fused ladder.
     // Per-bin demand of the current round (kRefitNBins uint32), filled by Kernel_BLRefitBinCount.
@@ -2273,20 +2108,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     WorkDiv1D workDivFused;
   };
 
-  // ---------------------------------------------------------------------------------------------
-  // FUSED-LADDER LAUNCHERS. One (phase, iteration) per call, all ten N-bins in one launch (sum_b W_b ==
-  // kRefitStride). Declared `extern template` and instantiated ONE PHASE PER TU: a fused kernel pulls all
-  // ten compile-time N of its phase into whichever TU instantiates it (per-phase build-time split).
-  // PHASE-BUFFER CACHES: the material march + segmentXX0Moments rows and the bFieldEff slot are carried
-  // across the two linearizations instead of being recomputed. The material rows are carried between two
-  // launches of the SAME kernel object (same machine code, so the cached doubles cannot differ from the
-  // recompute); bFieldEff is carried from PREP to OUT/OUTLIER (different inlining contexts of
-  // blEffectiveBField, may contract FMAs differently, so it can legitimately move a result at 1 ULP).
-  // ---------------------------------------------------------------------------------------------
+  // Fused-ladder launchers: one (phase, iteration) per call, all ten N-bins in one launch. Declared
+  // `extern template` and instantiated one phase per TU.
+  // Phase-buffer caches: the material rows and the bFieldEff slot are carried across the two
+  // linearizations. The material rows travel between two launches of the same kernel object, so the cached
+  // doubles cannot differ from a recompute; bFieldEff travels from prep to out/outlier, whose different
+  // inlining contexts of blEffectiveBField may contract FMAs differently and move a result by 1 ULP.
 
-  // One bin's fast-fit compaction scan for the FUSED ladder. It keeps its own launch for the grid-scope
-  // atomic slot claim that must complete before any phase reads ptkids; it claims against the bin's OWN
-  // counter and seats tracks in the bin's OWN lane range.
+  // One bin's fast-fit compaction scan for the fused ladder. It keeps its own launch for the grid-scope
+  // atomic slot claim that must complete before any phase reads ptkids; it claims against the bin's own
+  // counter and seats tracks in the bin's own lane range.
   template <int N, typename TrackerTraits>
   void runRefitScanBin(BLRefitLaunchCtx<TrackerTraits> const& c, uint32_t nHitsL, uint32_t nHitsH) {
     constexpr uint32_t kRefitStride = HelixFit<TrackerTraits>::kRefitStride;
@@ -2319,9 +2150,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     cfg.bMap = c.bMap;
     // iterFromPhase / matFromPhase / fieldFromPhase are all finalIter: the bin's one scan fixed the
     // lane->track map for both iterations and the hits never move, so iteration 1 finds its own
-    // iteration-0 reference hand-off, material rows and fit-consistent field in its own lane of c.pphase.
-    // fieldFromPhase additionally needs the fit-consistent conversion field to be on (fieldKernelOn:
-    // fieldKernelWeights with a map); otherwise the prep recomputes the hit-count average itself.
+    // iteration-0 reference, material rows and field in its own lane of c.pphase. fieldFromPhase also
+    // needs the fit-consistent conversion field to be on (fieldKernelOn).
     cfg.iterFromPhase = finalIter;
     cfg.matFromPhase = finalIter;
     cfg.fieldFromPhase = finalIter && fieldKernelOn;
@@ -2368,7 +2198,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     constexpr uint32_t kRefitStride = HelixFit<TrackerTraits>::kRefitStride;
     BLRefitFusedCfg cfg{};
     cfg.bMap = c.bMap;
-    // This iteration's prep ran on this lane and published the effective field (see PHASE-BUFFER CACHES).
+    // This iteration's prep ran on this lane and published the effective field.
     cfg.bFieldFromPhase = true;
     cfg.chargeSymmetric = c.chargeSymmetric;
     alpaka::exec<Acc1D>(c.queue,
@@ -2393,7 +2223,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     cfg.fitHitIsCore = c.pFitHitIsCore;
     cfg.outlierReject = c.outlierReject;
     cfg.coreProtect = c.coreProtect;
-    cfg.bFieldFromPhase = true;  // the final prep ran on this lane (see PHASE-BUFFER CACHES)
+    cfg.bFieldFromPhase = true;  // the final prep ran on this lane
     cfg.chargeSymmetric = c.chargeSymmetric;
     alpaka::exec<Acc1D>(c.queue,
                         c.workDivFused,
@@ -2410,13 +2240,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   }
 
   // Explicit-instantiation signatures (`extern` in the orchestration TU, bare in each
-  // BrokenLineFit_*.dev.cc to instantiate its disjoint N-subset). Factorized fast BrokenLine main fit:
-  // stubs N=3..10 in BrokenLineFit_stubsMainBL.dev.cc, four other traits N=3..6 in BrokenLineFit_main.dev.cc.
-#define BLFIT_MAIN_SIG_BL(N, T)                    \
-  template void runMainBin<N, ::pixelTopology::T>( \
-      BLMainLaunchCtx<::pixelTopology::T> const&, WorkDiv1D const&, uint32_t, uint32_t, int32_t)
-// The FUSED main ladder: one signature per PHASE and per traits set (each pulls every compile-time N
-// of that phase into the TU that instantiates it).
+  // BrokenLineFit_*.dev.cc to instantiate its disjoint subset).
+// One signature per phase and traits set, each pulling every compile-time N of that phase into the TU
+// that instantiates it.
 #define BLFIT_MAIN_FUSED_FAST_SIG(T) \
   template void runMainFusedFast<::pixelTopology::T>(BLMainLaunchCtx<::pixelTopology::T> const&)
 #define BLFIT_MAIN_FUSED_FIT_SIG(T) \
@@ -2424,8 +2250,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 #define BLFIT_REFIT_SCAN_SIG(N)                                     \
   template void runRefitScanBin<N, ::pixelTopology::Phase2OTStubs>( \
       BLRefitLaunchCtx<::pixelTopology::Phase2OTStubs> const&, uint32_t, uint32_t)
-// The FUSED ladder: one signature per PHASE (each pulls all ten compile-time N of that phase into
-// the TU that instantiates it), one TU per phase.
+// One signature per phase of the refit ladder, one TU per phase.
 #define BLFIT_REFIT_FUSED_PREP_SIG()                               \
   template void runRefitFusedPrep<::pixelTopology::Phase2OTStubs>( \
       BLRefitLaunchCtx<::pixelTopology::Phase2OTStubs> const&, bool, bool)
@@ -2439,36 +2264,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   template void runRefitFusedOutlier<::pixelTopology::Phase2OTStubs>( \
       BLRefitLaunchCtx<::pixelTopology::Phase2OTStubs> const&)
 
-  // Main fit: N = 3 .. maxHitsOnTrackForFullFit(traits). Non-stubs traits fit up to 6, Phase2OTStubs up to 10.
-  extern BLFIT_MAIN_SIG_BL(3, Phase1);
-  extern BLFIT_MAIN_SIG_BL(4, Phase1);
-  extern BLFIT_MAIN_SIG_BL(5, Phase1);
-  extern BLFIT_MAIN_SIG_BL(6, Phase1);
-  extern BLFIT_MAIN_SIG_BL(3, Phase2);
-  extern BLFIT_MAIN_SIG_BL(4, Phase2);
-  extern BLFIT_MAIN_SIG_BL(5, Phase2);
-  extern BLFIT_MAIN_SIG_BL(6, Phase2);
-  extern BLFIT_MAIN_SIG_BL(3, Phase2OT);
-  extern BLFIT_MAIN_SIG_BL(4, Phase2OT);
-  extern BLFIT_MAIN_SIG_BL(5, Phase2OT);
-  extern BLFIT_MAIN_SIG_BL(6, Phase2OT);
-  extern BLFIT_MAIN_SIG_BL(3, HIonPhase1);
-  extern BLFIT_MAIN_SIG_BL(4, HIonPhase1);
-  extern BLFIT_MAIN_SIG_BL(5, HIonPhase1);
-  extern BLFIT_MAIN_SIG_BL(6, HIonPhase1);
-
-  // Phase2OTStubs, N = 3 .. 10.
-  extern BLFIT_MAIN_SIG_BL(3, Phase2OTStubs);
-  extern BLFIT_MAIN_SIG_BL(4, Phase2OTStubs);
-  extern BLFIT_MAIN_SIG_BL(5, Phase2OTStubs);
-  extern BLFIT_MAIN_SIG_BL(6, Phase2OTStubs);
-  extern BLFIT_MAIN_SIG_BL(7, Phase2OTStubs);
-  extern BLFIT_MAIN_SIG_BL(8, Phase2OTStubs);
-  extern BLFIT_MAIN_SIG_BL(9, Phase2OTStubs);
-  extern BLFIT_MAIN_SIG_BL(10, Phase2OTStubs);
-
-  // Main fit, FUSED ladder: one instantiation per (phase, traits). The stubs phases get a TU each
-  // (they carry N = 3..10); the four non-stubs traits (N = 3..6) share one.
+  // Main fit: one instantiation per (phase, traits). The stubs traits (N = 3..10) get a TU each; the four
+  // non-stubs traits (N = 3..6) share one.
   extern BLFIT_MAIN_FUSED_FAST_SIG(Phase1);
   extern BLFIT_MAIN_FUSED_FAST_SIG(Phase2);
   extern BLFIT_MAIN_FUSED_FAST_SIG(Phase2OT);
@@ -2480,8 +2277,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   extern BLFIT_MAIN_FUSED_FIT_SIG(HIonPhase1);
   extern BLFIT_MAIN_FUSED_FIT_SIG(Phase2OTStubs);
 
-  // Extended-N refit, FUSED ladder: N = 3 .. kRefitMaxN (12), Phase2OTStubs only. The per-bin fast-fit
-  // scans keep their own launch and are instantiated in the N-range TUs BrokenLineFit_refitLo/Hi.
+  // Extended-N refit: N = 3 .. kRefitMaxN (12), Phase2OTStubs only. The per-bin fast-fit scans keep their
+  // own launch and are instantiated in the N-range TUs BrokenLineFit_refitLo/Hi.
   extern BLFIT_REFIT_SCAN_SIG(3);
   extern BLFIT_REFIT_SCAN_SIG(4);
   extern BLFIT_REFIT_SCAN_SIG(5);

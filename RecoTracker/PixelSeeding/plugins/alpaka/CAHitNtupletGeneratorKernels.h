@@ -237,7 +237,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                        uint32_t offsetBPIX2,
                        uint16_t nLayers,
                        TkSoABlocksView& view,
-                       const ::reco::CALayersSoAConstView& ll,
                        const ::reco::CAGraphSoAConstView& cc,
                        const ::reco::CATripletCutsSoAConstView& tripletCuts,
                        const ::reco::CANtupletCutsSoAConstView& ntupletCuts,
