@@ -146,3 +146,73 @@ from Configuration.ProcessModifiers.pixelTrackMask_cff import pixelTrackMask
     HLTPhase2PixelTracksAndVerticesSequence,
     _HLTPhase2PixelTracksAndVerticesSequenceCAStubsTwoIterations,
 )
+
+# SerialSync arms of the stub chain for the CPU vs. GPU validation, to be kept in sync with the two
+# sequences above. The stub formation and the pixel/stub merger stay accelerated and are shared: the
+# twins read their host copies, as the default arm reads the accelerated rechits.
+hltPhase2PixelTrackHighPtMaskingSerialSync = makeSerialClone(hltPhase2PixelTrackHighPtMasking,
+    tracksSoASrc = "hltPhase2PixelTrackTorchHighPuritySelectorSerialSync",
+)
+hltPhase2PixelTracksSoADisplacedSerialSync = makeSerialClone(hltPhase2PixelTracksSoADisplaced,
+    hitMask = "hltPhase2PixelTrackHighPtMaskingSerialSync",
+)
+hltPhase2PixelTrackHighPuritySelectorDisplacedSerialSync = makeSerialClone(hltPhase2PixelTrackHighPuritySelectorDisplaced,
+    pixelTrackSrc = "hltPhase2PixelTracksSoADisplacedSerialSync",
+)
+hltPhase2PixelTracksSoAMergerSerialSync = makeSerialClone(hltPhase2PixelTracksSoAMerger,
+    inputTkSoAs = cms.VInputTag("hltPhase2PixelTrackTorchHighPuritySelectorSerialSync",
+                                "hltPhase2PixelTrackHighPuritySelectorDisplacedSerialSync"),
+)
+hltPhase2PixelTrackHighPuritySelectorMergedSerialSync = makeSerialClone(hltPhase2PixelTrackHighPuritySelectorMerged,
+    pixelTrackSrc = "hltPhase2PixelTracksSoAMergerSerialSync",
+)
+# The legacy converter of the two-iteration chain reads the final selection.
+(phase2CAStubs & pixelTrackMask).toModify(hltPhase2PixelTracksSerialSync,
+    trackSrc = "hltPhase2PixelTrackHighPuritySelectorMergedSerialSync",
+)
+
+_HLTPhase2PixelTracksAndVerticesSequenceCAStubsSerialSync = cms.Sequence(
+    HLTBeamSpotSequence
+    +hltPhase2PixelTracksAndHighPtStepTrackingRegions
+    +hltPhase2PixelFitterByHelixProjections
+    +hltPhase2PixelTrackFilterByKinematics
+    +hltSiPixelClusters
+    +hltSiPixelRecHits
+    +hltPixelSeedingOTRecHitsSoA
+    +hltOTStubProducer
+    +hltPhase2PixelRecHitsStubsMerger
+    +hltPhase2PixelTracksSoASerialSync
+    +hltPhase2PixelTrackTorchHighPuritySelectorSerialSync
+    +hltPhase2PixelTracksSerialSync
+    +HLTPhase2PixelVertexingSequenceSerialSync
+)
+
+_HLTPhase2PixelTracksAndVerticesSequenceCAStubsTwoIterationsSerialSync = cms.Sequence(
+    HLTBeamSpotSequence
+    +hltPhase2PixelTracksAndHighPtStepTrackingRegions
+    +hltPhase2PixelFitterByHelixProjections
+    +hltPhase2PixelTrackFilterByKinematics
+    +hltSiPixelClusters
+    +hltSiPixelRecHits
+    +hltPixelSeedingOTRecHitsSoA
+    +hltOTStubProducer
+    +hltPhase2PixelRecHitsStubsMerger
+    +hltPhase2PixelTracksSoASerialSync
+    +hltPhase2PixelTrackTorchHighPuritySelectorSerialSync
+    +hltPhase2PixelTrackHighPtMaskingSerialSync
+    +hltPhase2PixelTracksSoADisplacedSerialSync
+    +hltPhase2PixelTrackHighPuritySelectorDisplacedSerialSync
+    +hltPhase2PixelTracksSoAMergerSerialSync
+    +hltPhase2PixelTrackHighPuritySelectorMergedSerialSync
+    +hltPhase2PixelTracksSerialSync
+    +HLTPhase2PixelVertexingSequenceSerialSync
+)
+
+(phase2CAStubs & ~pixelTrackMask & alpakaValidationHLT).toReplaceWith(
+    HLTPhase2PixelTracksAndVerticesSequenceSerialSync,
+    _HLTPhase2PixelTracksAndVerticesSequenceCAStubsSerialSync
+)
+(phase2CAStubs & pixelTrackMask & alpakaValidationHLT).toReplaceWith(
+    HLTPhase2PixelTracksAndVerticesSequenceSerialSync,
+    _HLTPhase2PixelTracksAndVerticesSequenceCAStubsTwoIterationsSerialSync
+)
