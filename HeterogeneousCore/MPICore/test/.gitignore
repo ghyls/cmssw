@@ -1,0 +1,5 @@
+.edmMpiSplitConfig/
+autosplit_result/
+gating_collapse_result/
+grouping_bug_result/
+gating_deadlock_result/
