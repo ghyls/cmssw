@@ -15,6 +15,7 @@
 #include "RecoTracker/PixelSeeding/interface/OTHitTag.h"
 #include "RecoTracker/PixelSeeding/interface/StackedModuleGeometrySoA.h"
 
+#include "ExtDerivedTables.h"   // the walk's fixed acceptance
 #include "CASizingDumpMacro.h"  // CA_SIZING_DUMP toggle for the attach stage's demand dump
 #include "CAStructures.h"
 #include "ExtenderGeometry.h"
@@ -38,280 +39,38 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     // second per-layer round instead of only the stub-derived merged hits. When false no OT source is
     // built and the walk sees merged hits only.
     bool useOTRecHits = false;
+    // The two compute caps of the walk: how many extra hits one track may gain, and how many layer
+    // crossings it may examine. Neither selects physics -- the gate and the hole hypothesis do -- they
+    // bound the work and the output buffers.
     int maxExtraHitsPerTrack = 4;
-    int maxWalkLayers = 6;  // nearest-reachable-layers visit budget K; 1 ~= fake-minimal, ~6 ~= full physics
-    float chi2Cut = 2.0f;
-    float endcapChi2Cut = 2.0f;
-    float typePriorityBiasCm = 15.f;
-    int pixHitsTarget = 3;
-    float maxRPhiResidCm = 0.5f;
-    float maxSecResidCm = 1.0f;
-    float endcapMaxSecResidCm = 0.5f;
-    // Alignment-noise floors [cm], added in quadrature to the chi2 denominators. alignSigmaPhiCm is the
-    // lateral (r*dphi) alignment uncertainty, so the chi2 gets (alignSigmaPhiCm / r)^2 added to sigPhi^2;
-    // alignSigmaSecCm is added directly to sigSec^2 [cm^2]. This stops over-shrunk propagation sigmas
-    // from rejecting alignment-limited hits at large radius.
-    float alignSigmaPhiCm = 0.005f;
-    float alignSigmaSecCm = 0.01f;
-    // Pre-gate: a candidate enters the search only if its fit is finite, its chi2/ndof is
-    // below preGateMaxChi2 and its pt above preGateMinPt (edup and never-fitted tuples are always
-    // skipped). maxCandidates caps the search volume (and sizes the extras buffers); overflow is
-    // counted and reported, never silent.
-    float preGateMaxChi2 = 15.f;  // host reduced-chi2 ceiling; lower restricts the walk to better-measured hosts
-    float preGateMinPt = 0.9f;    // = final-selection pt cut; extending pt<0.9 is pointless (discarded downstream)
-    // Pre-gate |eta| ceiling: a host with |cotTheta| above sinh(maxAbsEta) is not extended at all. OT
-    // attach purity collapses beyond |eta| ~2.5, where the trajectory crosses the last disc
-    // near-tangentially and the TEDD residual spread grows to several cm.
-    float maxAbsEta = 2.4f;
-    // Host-quality pre-gate: three independently sentinel-gated predicates; a host failing any active one
-    // is skipped entirely. Impure raw-OT extras concentrate on poorly-measured hosts.
-    //   extHostMaxChi2Ndof (<=0 = off): require tracks[i].chi2() < extHostMaxChi2Ndof. tracks[i].chi2()
-    //     is already the reduced (per-ndof) GBL chi2, so it is compared to a chi2/ndof threshold directly.
-    //   extHostMinHits (0 = off): require reco::nHits(tracks,i) >= extHostMinHits.
-    //   extHostMinPt  (<=0 = off): require tracks[i].pt() >= extHostMinPt (GeV).
-    float extHostMaxChi2Ndof = 0.f;
-    int extHostMinHits = 0;
-    float extHostMinPt = 0.f;
-    uint32_t maxCandidates = 128 * 1024;
-    // Ceiling on the candidate capacity the attach scratch is sized to, applied as
-    // candCapacity = min(knownCandCapacity, extRefitMaxCandidates) before the [16, maxCandidates] clamp.
-    // It must stay at or above the largest candidate count the pre-gate can produce: below that,
-    // candidates past the ceiling are dropped by the fill pass. The default keeps knownCandCapacity.
-    uint32_t extRefitMaxCandidates = 0xffffffffu;
-    // Cross-track arbitration N-way sharing: an attached extra may be owned by up to this many tracks,
-    // the N claimants with the smallest gate chi2, ties by tuple id; 1 = exclusive ownership. The claim
-    // buffer keeps N sorted slots per hit, filled by an atomicMin insertion cascade whose final N-slot
-    // set is the N smallest packed claims regardless of thread interleaving, and resolve keeps an extra
-    // iff its tuple id occupies any slot.
-    int extMaxSharedOwners = 1;
-    // Ambiguity gate in the cross-track resolve stage: a contested extra (claimed by >= 2 tracks) is kept
-    // only for its best claimant when the top-2 claimants' gate chi2 are within extAmbigDeltaChi2 of each
-    // other, a hit two tracks fit nearly equally well being an ambiguous stray for the worse one. Needs
-    // the second claim slot, so it is active only when extMaxSharedOwners >= 2; <= 0 disables it.
-    float extAmbigDeltaChi2 = 0.f;
-    // Per-class scales of the fixed-cut per-hit chi2 cut on the TOB4-6 (CA 31-33) and TID (CA 34-53)
-    // layers, multiplied into baseChi2Cut at the three gate sites (merged round, raw-OT round, partner
-    // scan) so the lane scan, the warp-reduce threshold and the partner threshold stay consistent.
-    // >1 widens, <1 tightens, 1.0 leaves the base cut. The two layer ranges are disjoint.
-    float extChi2CutScaleTOB456 = 1.0f;
-    float extChi2CutScaleTID = 1.0f;
-    // Source-scoped raw-OT veto: the walk's round 1, the raw-OT rechit scan on layers where no stub was
-    // attached, is skipped on TOB4-6 (CA 31-33) and on TID (CA 34-53) when the respective flag is set;
-    // the merged-stub round 0 is untouched. Raw OT is a less pure source than stubs, and its impure
-    // extras concentrate in these two classes. false => round 1 runs on every layer.
-    bool extRawOTVetoTOB456 = false;
-    bool extRawOTVetoTID = false;
-    // Displacement-aware inner-OT gate. When on, the walk tightens the TOB1-3 (CA 28-30) per-hit chi2
-    // accept window for hosts whose fitted transverse impact parameter is large in significance,
-    // |d0|/sigma_d0 >= sqrt(extDispGateSig2): TOB1-3 attaches are dominated by prompt strays for strongly
-    // displaced hosts. The arm is not available in-kernel, so displacement significance is the proxy.
-    bool extDisplacementAwareGate = false;
-    // Displacement-significance^2 threshold of the gate above: tip^2 >= extDispGateSig2 * V(tip). Only
-    // read when extDisplacementAwareGate is on; raising it restricts the tightening to more strongly
-    // displaced hosts.
-    float extDispGateSig2 = 400.f;
-    // Forward-eta TOB1-3 pocket gate, the |eta|-scoped companion of extDisplacementAwareGate. When on,
-    // the walk tightens the same TOB1-3 window for hosts in the forward band |eta| in [1.5, maxAbsEta),
-    // tested as |cotTheta| in [kPocketCotThetaLo, kPocketCotThetaHi), that the displacement gate does not
-    // already cover; the two are mutually exclusive, so the scales never stack.
-    bool extForwardPocketGate = false;
-    // When the pocket gate is on, apply it only to displaced-arm tracks (needs launchMergerAttach's
-    // armId argument, filled through the filterTracks compaction); false = arm-blind, no armId needed.
-    // Ignored when extForwardPocketGate is off.
-    bool extPocketGateArmScoped = true;
-    // MTV-aligned per-track extra cap. When on, the walk caps the appended-extra clusters per track at
-    // floor((n_core_clusters - 1)/kMtvSharedFracDen), so that even if every appended extra is wrong the
-    // worst-case shared fraction n_core/(n_core+n_extra) stays above 0.75. Cluster units, not raw hits:
-    // a merged 2-hit stub extra resolves to 2 clusters, a raw-OT or pixel extra to 1.
-    bool extMtvAlignedExtraCap = false;
-    // Extra reachability slack [cm] on pixel layers (CA L < 28) for prefer-pixel hosts, i.e. hosts with
-    // nPix < pixHitsTarget, whose inward OT-only-fit extrapolation can place the crossing just outside
-    // the layer's z/r envelope plus kReachSlackCm. It cannot recover the predict-invalid case, where the
-    // circle yields no crossing at all. 0 => no extra slack.
-    float extRecallReachRelax = 0.f;
-    // Pixel-first visit budget. The K = maxWalkLayers visit budget reserves up to ceil(K/2) seats for OT
-    // disks, which on a prefer-pixel host can crowd out reachable pixel layers. When > 0, on prefer-pixel
-    // hosts only, OT-disk forcing is suppressed while the nearest unvisited-reachable layer is a pixel
-    // layer (gL < 28) and fewer than this many pixel layers have been visited. 0 => never suppresses.
-    int extRecallPixelFirstBudget = 0;
-    // Per-layer-class scale on the propagated fit covariance (predPhiVar, predSecVar) entering the 2-dof
-    // gate chi2 denominators; a class scale s scales the correct-hit gate chi2 of that class by ~1/s in
-    // the propagated-dominated tail. The classes are pixel (merged round, CA L < 28), stub (merged round,
-    // CA L >= 28) and rawOT (round 1 plus the partner scan). 1.0 leaves the covariance as fitted.
-    float extCovScalePixel = 1.0f;
-    float extCovScaleStub = 1.0f;
-    float extCovScaleRawOT = 1.0f;
-    // Honest-calibration chi2 cut on pixel layers (CA L<28). chi2Cut=2.0 on a 2-dof gate is the 63.2 %
-    // (1-e^-1) efficiency quantile by construction; a 95 %-efficient 2-dof cut is -2 ln(0.05) = 5.99.
-    // When > 0 this replaces the pixel-layer baseChi2Cut (OT layers keep chi2Cut/endcapChi2Cut).
-    // <= 0 (sentinel) => pixel keeps chi2Cut/endcapChi2Cut. It composes with extCovScalePixel, so
-    // raising both at once double-loosens the pixel gate.
-    float extPixelGateChi2Cut = -1.0f;
-    // Standalone stub-bend veto in the merged round-0 gate: a stub's measured local bend dPhiDr is
-    // compared to the track's expectation through the radius-independent half-curvature significance the
-    // CA build uses, kappa = dPhiDr / sqrt(1 + r^2 dPhiDr^2), and |kappa_track - kappa_stub| /
-    // sigma(kappa_stub) must not exceed extStubBendGate. PS stubs carry a large dPhiDrError, so the veto
-    // is effectively 2S-only. <= 0 => not applied, as is the bend chi2 row of extBendPackage.
-    float extStubBendGate = -1.0f;
-    // Anchored cap exemption. The extMtvAlignedExtraCap cluster budget is 0-2 for short OT-only cores and
-    // is exhausted by the first accepted TOB4-6 stub, which blocks most TOB4-6 -> TOB5/6 continuations.
-    // When on, a candidate bypasses the cluster-cap check iff the track is anchored, already carrying at
-    // least one accepted OT extra on a previous walk layer, and the candidate is itself on an OT layer.
-    // It covers the three cap sites: walk-stop, per-accept drop and stack-partner scan.
-    bool extCapExemptAnchored = false;
-    // Budget floor, independent of the anchored exemption. When the MTV cap is on, the per-track cluster
-    // budget becomes max(floor((n_core_clusters-1)/3), extCapBudgetFloor); the cap-off sentinel is never
-    // lowered by it. 0 => unchanged.
-    int extCapBudgetFloor = 0;
-    // State process noise. Without a P += Q step the running-state covariance P only receives the
-    // subtractive measurement downdate and grows overconfident with each accept. When > 0, on each accept
-    // the just-traversed gap's Highland msVar is injected into the direction terms of P: circle-block
-    // vPhi += scale*msVar, line-block vCot += scale*msVar*(1+cot^2)^2, since d(cot)/d(theta) =
-    // -(1+cot^2). Scattering is elastic, so curvature is untouched. The injection is post-downdate, so
-    // the current measurement is not double-counted. scale multiplies the physical Q; 0 => none.
-    float extStateProcessNoise = 0.f;
-    // Force-pixel-visit. For prefer-pixel hosts and pixel layers (CA L < 28) only, the reachability
-    // envelope test is bypassed: the layer is confirmed reachable whenever the crossing prediction is
-    // valid, and the per-layer road and gate scan then decides. Bounded by the pixel geometry and by the
-    // K and pixel-first budgets.
-    bool extRecallForcePixelVisit = false;
-    // TOB4-6 scope: when both this and extCapExemptAnchored are on, the exemption fires only for
-    // candidates on CA layers 31-33, at every exemption site. false => the exemption keeps its L >= 28
-    // scope.
-    bool extCapExemptTOB46Only = false;
-    // Optional candidate-chi2 cap on the exemption: when > 0, an exempted candidate also needs its own
-    // gate chi2 < extCapExemptMaxChi2 (applied at the per-accept site, using the winner's gate chi2).
-    // <= 0 => no chi2 cap.
-    float extCapExemptMaxChi2 = 0.f;
-    // Runtime walk budget: the nearest-reachable-layers visit budget K as a runtime loop bound. Only the
-    // walk loop bounds read it; every buffer sizing/stride keeps the compile-time maxWalkLayers. Clamped
-    // in-kernel to [1, kChainMaxVisits = 8] (the shared chain/hole array size).
-    int extMaxWalkLayers = 6;
-    // Far-first disc ordering for OT-less forward pixel hosts. The walk normally visits the nearest
-    // candidate layer by envelope proxy distance, which on a forward pixel-only host collapses to
-    // min_k |Z_L - z_k| and spends the K and slot budgets inward, on hits that do not lengthen the
-    // transverse lever arm. When armed, the ordering key of the endcap pixel layers is replaced by
-    // -|layerZ[L]|, so the walk visits the farthest reachable disc crossing first; barrel and OT layers
-    // keep the nearest-first key. Arming requires all three of
-    //   A1  |cotTheta| >= sinh(extAttachFarMinAbsEta) (the host's own fitted polar angle);
-    //   A2  the host core carries no OT or stub hit (coveredMask >> 28 == 0);
-    //   A3  no OT layer is confirmed reachable: where raw-OT/TEDD content is still in reach it carries a
-    //       far longer lever arm than any pixel disc and the nearest-first order already collects it.
-    // false => the key is never rewritten and every host keeps the nearest-first order.
-    bool extAttachFarFirst = false;
-    // The |eta| floor of the far-first ordering (A1 above); below it the nearest-first order runs.
-    float extAttachFarMinAbsEta = 2.8f;
-    // Window-ambiguity condition on the far-first commit; read only when extAttachFarFirst is on. On a
-    // far crossing of an armed host, an endcap pixel layer whose |Z_L| lies beyond the largest |z| of the
-    // host's core hits, the argmin winner is committed only if at most this many candidates cleared the
-    // crossing's gate in the merged round; otherwise the walk declines the crossing, keeps the slot and
-    // carries on into the nearer discs. Larger values buy more far crossings at lower purity; <= 0
-    // switches the condition off.
-    int extAttachFarMaxWin = 1;
-    // When true, on OT layers (CA L >= 28) the walk replaces its window/gate/rank stack by a derived one:
-    //   * the r-phi prediction variance comes from the smoothed-prediction functional published per
-    //     host by the merger-side pre-attach pass (ExtPredCoeff below), not from makeRunningHelix's
-    //     perigee-propagated covariance (about a factor two too narrow in pull);
-    //   * multiple scattering enters projected, with the exact transverse-plane G brackets and the 3-D
-    //     lever (the fixed-cut road multiplies a 3-D scattering angle by the transverse arc, i.e. it is
-    //     too narrow by cosh(eta)), scaled by the measured material-dispersion factor f_ms;
-    //   * the endcap r-phi variance gains its polar-angle/z0 rows, absent from the fixed-cut gate;
-    //   * per-accept process noise enters the state from the traversed gap's exact material moments
-    //     (W, S1, S2) instead of per-visit incremental scattering added to the innovation;
-    //   * selection is one chi2 on (r-phi, secondary), cut and ranked at the measured quantile map
-    //     Q-hat(eps): window == gate == rank, one number (extDerivedEps);
-    //   * the hole hypothesis ("attach nothing here") competes in the argmin, priced from the measured
-    //     per-layer stub availability eta_L, the stub areal density rho and the window volume; inert
-    //     while the statistic has only d = 2 rows (see kExtDerHoleMinDim), the bend row arms it.
-    // The three cm residual caps become per-layer module-envelope runaway ceilings on this path, twice
-    // the layer half-extent plus the reachability slack. Pixel layers (CA L < 28) keep the fixed-cut
-    // gate: every table below is measured on OT roads only.
-    bool extDerivedSelection = false;
-    // The one free number of the package: the efficiency epsilon spent once, on the measured quantile
-    // map, for the window, the gate, the rank and the hole prior. Larger eps = wider window, gate and
-    // rank quantile, i.e. more attach yield at more fake exposure. Only read when extDerivedSelection.
-    double extDerivedEps = 0.31;
-    // The hole hypothesis, part of the same package. Inert while the measurement dimension is below
-    // kExtDerHoleMinDim: at d = 2 the window volume prices it about 6 chi2 units too cheaply.
-    bool extDerivedHole = true;
-    // Hole detection prior. The plain form sets the hit hypothesis's prior to P(hit found) = eta_L * eps
-    // and multiplies it by the full Gaussian density N(m; pred, R), but the Gaussian's own integral over
-    // the window is eps, so the window mass is counted twice. The correct pairing is prior eta_L with the
-    // untruncated density, the standard PDA no-detection weight
-    // b = lambda (2 pi)^{d/2} |S|^{1/2} (1 - P_D P_G)/P_D, in which the gate mass P_G appears only inside
-    // (1 - P_D P_G). References: Bar-Shalom & Fortmann, "Tracking and Data Association", Academic Press
-    // 1988, ch. 6; Bar-Shalom, Daum & Huang, IEEE Control Systems 29(6) 82-100, 2009,
-    // doi:10.1109/MCS.2009.934469; Petersen & Beard, IEEE Trans. Aerosp. Electron. Syst. 2022,
-    // doi:10.1109/TAES.2022.3214803 (arXiv:2108.07265), Lemma 5 eq. (46)-(47) and Appendix B.
-    // ON  => chi2_hole = 2 ln[ eta_L / ((1 - eta_L eps) nu) ]   (+ 2 ln(1/eps))
-    // OFF => the plain numerator eta_L*eps.
-    // No new number: the same eta_L table and the same single eps.
-    bool extHoleDetectionPrior = false;
-    // Hole raw-round prior. The raw-OT round runs only where the stub round attached nothing, so the
-    // hypothesis it arbitrates is whether the layer produced a usable raw cluster given that no stub
-    // formed: the conditional availability eta_cond = (eta_rawOT - eta_stub) / (1 - eta_stub), against a
-    // background of raw clusters rather than stubs. On consumes extEtaLRaw and extRhoRaw for round-1
-    // winners only; off prices both rounds with the single stub row.
-    bool extHoleRawRoundPrior = false;
-    // [kExtOTLayers] raw round's conditional availability / raw-cluster areal density. nullptr => OFF.
-    const float* extEtaLRaw = nullptr;
-    const float* extRhoRaw = nullptr;
-
-    // The measured tables (device pointers, owned by the merger; see ExtDerivedTables.h).
-    // Q-hat: the empirical quantile of the correct-hit 2-dof pull statistic X2 = p_R^2 + p_S^2 under the
-    // frozen sigma model, keyed (layer class x |eta| x visit index) and tabulated on a fixed eps grid.
-    // The producer interpolates the map at extDerivedEps once on the host and publishes the per-cell
-    // threshold; the kernel only indexes it. Layout:
-    //   [(cls * kExtQEtaBins + etaBin) * kExtQVisitBins + visitBin].
-    const float* extQhat = nullptr;  // [kExtQCells] Q-hat(extDerivedEps) per cell
-    // eta_L: P(the host's own particle left a stub on this layer), one scalar per CA layer 28..53.
-    // Both eta_L and rho are layer-keyed with no |eta| axis, so a layer's row is dominated by whichever
-    // |eta| population supplies most of its samples.
-    const float* extEtaL = nullptr;  // [kExtOTLayers]
-    // Rho: the stub areal density per layer [cm^-2], occupancy-weighted; the first-order input to the
-    // hole (chi2_hole moves as 2 ln rho).
-    const float* extRho = nullptr;  // [kExtOTLayers]
-    // Arms the 5th Q-hat |eta| bin. The producer sets it exactly when a road can legitimately be
-    // forward, i.e. when its |eta| pre-gate ceiling exceeds 2.4. See extQhatCell for why the pre-gate
-    // alone does not imply it.
-    bool extFwdEtaBin = false;
-    // The target-side additive variance dV [cm^2] per module class (see kExtMatCls* below) and the
-    // measured material-dispersion scale f_ms (barrel, endcap).
-    const float* extDV = nullptr;  // [kExtMatClasses]
-    float extFmsBarrel = 1.f;
-    float extFmsEndcap = 1.f;
-    // Per-host smoothed-prediction payload written by the merger-side pre-attach pass, indexed by
-    // attach slot.
+    int maxWalkLayers = 6;     // compile-time sizing of the dump strides and buffer geometry
+    int extMaxWalkLayers = 6;  // runtime visit budget K, clamped in-kernel to [1, kChainMaxVisits]
+    // Pre-gate: a candidate enters the search only if its fit is finite and its pt is above
+    // preGateMinPt (edup and never-fitted tuples are always skipped).
+    float preGateMinPt = 0.9f;  // = the downstream selector's pt cut; extending below it is pointless
+    // Pre-gate |eta| ceiling: a host with |cotTheta| above sinh(maxAbsEta) is not extended at all. A
+    // geometric reach bound, and the same bound the duplicate removal uses for its drop authority.
+    float maxAbsEta = 4.5f;
+    // THE efficiency of the walk, spent once: the probability mass of the innovation chi2 the gate
+    // must contain. It sets the accept threshold (the chi2 quantile of each candidate's own dof), the
+    // phi window (the bounding box of that same ball), the reachability slack and the hole prior.
+    // Fixed at extDerivedTables::kExtGateEps; it is not configurable.
+    float extGateEps = extDerivedTables::kExtGateEps;
+    // Per-host payload written by the merger-side pre-attach pass, indexed by attach slot: the
+    // material anchor (the last fitted node), the last fitted gap's exit kink and the ionisation
+    // road-centre state. nullptr => the walk anchors at the PCA and applies no road-centre shift.
     const struct ExtPredCoeff* extPred = nullptr;
-    // The third row of the walk's selection statistic, and with it the information basis the hole's own
-    // threshold is priced against; dropping it roughly doubles the wrong-attach count. When true, and
-    // only together with extDerivedSelection:
-    //   * the stub bend enters as the third chi2 row, p_b = (dPhiDr_hit - dPhiDr_track)/sqrt(R_bb),
-    //     with R_bb = sigma_b^2 + H_b C H_b^T + Q_MS,bb, i.e. the track-side prediction uncertainty is
-    //     in the denominator (the standalone extStubBendGate veto divides by the measurement error
-    //     alone, which with a corrected sigma_b costs a large fraction of the correct attachments);
-    //   * the track side is the fitted local direction of the same closed-form crossing the walk already
-    //     linearises, barrel dphi/dR and endcap (dphi/dz)/(dr/dz), in analytic form;
-    //   * sigma_b is the leak-free formation value (TrackingRecHits::dPhiDrErrorPrec) times the
-    //     measured per-class excess below;
-    //   * the standalone bend veto is not applied wherever this row is active;
-    //   * the statistic becomes 3-dof for stubs (Q-hat_3) and stays 2-dof for raw-OT / non-stub
-    //     candidates (Q-hat_2);
-    //   * the hole arms (see kExtDerMeasDim below): nu = rho (2 pi)^{3/2} sqrt(|R|).
-    bool extBendPackage = false;
-    // There is no separate bend trim: with the bend as a chi2 row the 3-dof ball already excludes what
-    // such a trim would cut, and it would add a second efficiency choice next to the single eps.
-    // Q-hat_3: the same measured-quantile map as extQhat, for the 3-dof statistic. Same keying and
-    // same cell layout; consumed by stub candidates only.
-    const float* extQhat3 = nullptr;  // [kExtQCells]
-    // The measured per-module-class excess of the honest bend error over the two-cluster precision floor
-    // dPhiDrErrorPrec delivers, indexed by kExtSigBCls* below.
-    const float* extSigBExcess = nullptr;  // [kExtSigBClasses]
-    // rho_3: the stub density in the 3-dof measurement space, rho_A / (2 b99) [cm^-1 rad^-1], with b99
-    // the measured per-layer 99th-percentile bend half-range. The hole prices "attach nothing" against
-    // the window volume, so with a bend row in the statistic the density that makes
-    // nu = rho (2 pi)^{d/2} sqrt(|R|) dimensionless is a per-area-per-bend one, not the areal rho_A.
-    const float* extRho3 = nullptr;  // [kExtOTLayers]
+    // Measured detector properties the hole hypothesis is priced from -- not tuning constants.
+    // eta_L: P(the host's own particle left a usable stub on this layer). rho: the stub areal density
+    // [cm^-2]. rho3: the same density in the 3-dof (position + bend) space [cm^-1 rad^-1], which is the
+    // one that makes nu = rho_d (2 pi)^{d/2} |S|^{1/2} dimensionless for a stub candidate. etaLRaw: the
+    // raw round's conditional availability, P(raw cluster | no stub). Both eta_L rows are layer-keyed
+    // with no |eta| axis, so a layer's row is dominated by whichever |eta| population supplies most of
+    // its samples. The raw round's density is NOT tabulated: it is the event's own OT occupancy.
+    const float* extEtaL = nullptr;     // [kExtOTLayers]
+    const float* extRho = nullptr;      // [kExtOTLayers]
+    const float* extEtaLRaw = nullptr;  // [kExtOTLayers]
+    const float* extRho3 = nullptr;     // [kExtOTLayers]
   };
 
   // The smoothed-prediction payload, one record per walk host: the 3x3 local covariance of (u, u', kappa) at
@@ -343,14 +102,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     float valid;          // 1 = usable; 0 = the walk falls back to the fixed-cut gate
   };
 
-  // Q-hat keying: 3 OT layer classes x 5 |eta| bins x 4 visit bins.
-  //   eta bin 4 (|eta| >= 2.4) is reachable only with the forward bin armed, which the producer does
-  //   from its own |eta| ceiling; see extQhatCell.
-  constexpr int kExtQClasses = 3;    // 0 = TOB1-3 (CA 28-30), 1 = TOB4-6 (31-33), 2 = TID (34-53)
-  constexpr int kExtQEtaBins = 5;    // |eta| < 0.8 / 0.8-1.5 / 1.5-2.0 / 2.0-2.4 / >= 2.4
-  constexpr int kExtQVisitBins = 4;  // walk visit index 0 / 1 / 2 / >= 3
-  constexpr int kExtQCells = kExtQClasses * kExtQEtaBins * kExtQVisitBins;  // 60
-  constexpr int kExtOTLayers = 26;                                          // CA layers 28..53
+  constexpr int kExtOTLayers = 26;  // CA layers 28..53
 
   // The coefficient pass's N-bin ladder. The band solve is templated on the hit count, so the walk hosts
   // are binned by multiplicity: one bin per N in [3, kExtPredMaxN], the top bin absorbing every host
@@ -359,71 +111,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
   constexpr int kExtPredMinN = 3;
   constexpr int kExtPredMaxN = 12;
   constexpr uint32_t kExtPredNBins = uint32_t(kExtPredMaxN - kExtPredMinN + 1);  // 10
-
-  // The measurement dimension of the derived selection statistic: two rows, (r-phi, secondary), and
-  // three once the bend row is live. The hole hypothesis prices "attach nothing" against the window
-  // volume, nu = rho (2 pi)^{d/2} |R|^{1/2}, so its threshold moves with d: dropping the bend coordinate
-  // lowers chi2_hole by about 6 units and puts it below the median gate threshold, where the hole fires
-  // on a large fraction of argmin winners. The hole therefore arms only at d = 3.
-  constexpr int kExtDerMeasDim2 = 2;    // (r-phi, secondary)          -- raw-OT / non-stub candidates
-  constexpr int kExtDerMeasDim3 = 3;    // (r-phi, secondary, bend)    -- stub candidates
-  constexpr int kExtDerHoleMinDim = 3;  // the hole hypothesis arms only at d >= 3 (see above)
-
-  // Module classes of the measured bend-error excess.
-  // dPhiDrErrorPrec delivers the two-cluster precision floor; the honest error exceeds it by a
-  // class-dependent factor, the split being PS against 2S rather than barrel against endcap. The excess
-  // and the precision floor belong together: in endcap PS the floor without the excess under-covers.
-  constexpr int kExtSigBClsBarrelFlatPS = 0;
-  constexpr int kExtSigBClsBarrelFlat2S = 1;
-  constexpr int kExtSigBClsBarrelTilted = 2;
-  constexpr int kExtSigBClsEndcapPS = 3;
-  constexpr int kExtSigBClsEndcap2S = 4;
-  constexpr int kExtSigBClasses = 5;
-
-  // Class of a stub from its own packed StubFlags (isBarrel / isFlat / isPS).
-  ALPAKA_FN_ACC ALPAKA_FN_INLINE int extSigBClass(uint8_t stubFlags) {
-    const bool bar = ::reco::StubFlags::isBarrel(stubFlags);
-    const bool ps = ::reco::StubFlags::isPS(stubFlags);
-    if (!bar)
-      return ps ? kExtSigBClsEndcapPS : kExtSigBClsEndcap2S;
-    if (!::reco::StubFlags::isFlat(stubFlags))
-      return kExtSigBClsBarrelTilted;
-    return ps ? kExtSigBClsBarrelFlatPS : kExtSigBClsBarrelFlat2S;
-  }
-  // Module classes of the target-side dV measurement.
-  constexpr int kExtMatClsPXB = 0;
-  constexpr int kExtMatClsPXD = 1;
-  constexpr int kExtMatClsTBPS = 2;
-  constexpr int kExtMatClsTB2S = 3;
-  constexpr int kExtMatClsTEDDPS = 4;
-  constexpr int kExtMatClsTEDD2S = 5;
-  constexpr int kExtMatClasses = 6;
-
-  // |eta| edges as |cot(theta)| = sinh(eta), so the hot path compares against constants instead of
-  // taking a transcendental -- the same convention the pre-gate uses.
-  constexpr float kExtCot08 = 0.888106f;  // sinh(0.8)
-  constexpr float kExtCot15 = 2.129279f;  // sinh(1.5)
-  constexpr float kExtCot20 = 3.626860f;  // sinh(2.0)
-  constexpr float kExtCot24 = 5.466229f;  // sinh(2.4)  -- the top of the last OT-measured |eta| bin
-
-  // Q-hat cell id from (CA layer, |cot(theta)|, visit index). A pixel layer has no measured class and
-  // returns -1, which is what switches the derived selection off there.
-  //
-  // fwdEtaBin arms the 5th |eta| bin. It is not implied by the pre-gate: the |cot| keying this cell uses
-  // is the walk state's, taken at the crossing after the Kalman updates, and that drifts past sinh(2.4)
-  // on a fraction of ordinary sub-2.4 hosts, so leaving the bin always on would re-key those roads too.
-  // With it off the ladder saturates at bin 3.
-  ALPAKA_FN_ACC ALPAKA_FN_INLINE int extQhatCell(int L, float absCot, int visit, bool fwdEtaBin = false) {
-    if (L < 28)
-      return -1;
-    const int cls = (L <= 30) ? 0 : ((L <= 33) ? 1 : 2);
-    const int eb =
-        (absCot < kExtCot08)
-            ? 0
-            : ((absCot < kExtCot15) ? 1 : ((absCot < kExtCot20) ? 2 : ((fwdEtaBin && absCot >= kExtCot24) ? 4 : 3)));
-    const int vb = (visit < 0) ? 0 : ((visit > 3) ? 3 : visit);
-    return (cls * kExtQEtaBins + eb) * kExtQVisitBins + vb;
-  }
 
   // Candidate-level attach dump (diagnostic; compiled in only under -DEXT_CAND_DUMP).
   // Per-(candidate, visited layer) trace of the attach walk, read back to host and emitted as
@@ -436,15 +123,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     kExtDumpAccept = 0,    // a hit committed on this layer (winnerHitId >= 0)
     kExtDumpRejEmpty = 1,  // no candidate hit fell in the phi window (nWinMerged + nWinOT == 0)
     kExtDumpRejGate = 2,   // candidates present but none cleared the per-hit chi2 + abs-residual gate
-    kExtDumpRejCap = 3,    // a gate-passing winner existed but the MTV cluster cap marked it over-budget
-                           // and the walk dropped it (the arrival-order trim).
+    kExtDumpRejCap = 3,    // a gate-passing winner refused by the extras cluster cap
     kExtDumpRejOther = 4,  // gate-passing winner uncommitted for another reason (defensive; ~unreachable)
   };
   // ExtCandLayerRec::flags bit meanings.
-  constexpr int32_t kExtDumpFlagVetoSkip = 1 << 0;  // raw-OT (round 1) veto-skipped on this layer
+  constexpr int32_t kExtDumpFlagVetoSkip = 1 << 0;  // the raw-OT round was skipped on this layer
   constexpr int32_t kExtDumpFlagPartner = 1 << 1;   // a stack-partner second raw-OT extra was attached here
   // The layer's overall-best (min-gate-chi2) road candidate, over all considered hits of both rounds,
-  // itself cleared the base per-hit gate (chi2 < baseChi2Cut/hitCut and abs-residual). Rides alongside
+  // itself cleared the per-hit gate (chi2 below its own dof's quantile). Rides alongside
   // bestHitId, so that a geometric continuation that exists but is not committed is still visible.
   constexpr int32_t kExtDumpFlagBestPass = 1 << 2;
 
@@ -831,14 +517,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
   // before use).
   void launchAttach(Queue& queue,
                     const AttachParams& params,
-                    float bf,
+                    float bf,  // Bz(0,0): the scale of the normalised (Bz,Br) map
                     const float* rhoMap,
+                    const float* bMap,  // normalised (Bz,Br) r-z lattice, read per road segment
                     const ExtPhiBinner* phiBinner,
                     ::reco::TrackSoAConstView tracks,
                     ::reco::TrackHitSoAConstView trackHits,
-                    // pocket gate: per-track arm (0=prompt, 1=displaced), in the merged-SoA order the walk
-                    // indexes; nullptr when the gate is off or arm-blind (then the kernel never reads it).
-                    const uint8_t* armId,
                     ::reco::TrackingRecHitConstView hits,
                     ::reco::HitModuleSoAConstView hitModules,
                     ::reco::TrackingRecHitsMaskingConstView hitMask,
@@ -870,11 +554,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                           const AttachParams& params,
                           float bfield,
                           const float* rhoMap,
+                          const float* bMap,  // normalised (Bz,Br) r-z lattice, read per road segment
                           ::reco::TrackSoAView tracks,
                           ::reco::TrackHitSoAView trackHits,
-                          // pocket gate: per-track arm (0=prompt, 1=displaced), in the merged-SoA order; the
-                          // merger fills it through the filterTracks compaction. nullptr => gate off/arm-blind.
-                          const uint8_t* armId,
                           ::reco::TrackingRecHitConstView hits,
                           ::reco::HitModuleSoAConstView hitModules,
                           ::reco::TrackingRecHitsMaskingConstView hitMask,

@@ -26,6 +26,7 @@
 #include "CAHitNtupletGeneratorKernels.h"
 #include "CAPixelDoublets.h"
 #include "CAPixelDoubletsAlgos.h"
+#include "ExtDerivedTables.h"  // the analytic chi2 quantile the duplicate test is taken at
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
   namespace {
@@ -944,23 +945,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                                       int const& nHits,
                                                                       TkSoADevice const& inpTracks,
                                                                       pixelTrack::Quality const& minQuality,
-                                                                      double const& matchFraction,
                                                                       Queue& queue,
                                                                       bool twinMerge,
                                                                       const int32_t* armOfTrack,
-                                                                      float twinMergeDeltaEta,
-                                                                      float twinMergeDeltaPhi,
-                                                                      int twinMergeMinSharedHits,
-                                                                      bool twinMergeTier2,
-                                                                      float twinMergeTier2DeltaEta,
-                                                                      float twinMergeTier2DeltaPhi,
-                                                                      float twinMergeNSigma2,
-                                                                      int twinMergeMinSharedFwd,
                                                                       bool twinMergeRefit,
                                                                       bool refitAllTracks,
-                                                                      int32_t* unitedWinnerMask,
-                                                                      const uint8_t* pocketArmIn,
-                                                                      uint8_t* pocketArmIdOut) const {
+                                                                      int32_t* unitedWinnerMask) const {
     CAHitMaskingAndMergerKernels kernels;
 
     reco::TracksSoACollection tracks(queue, nTracks, nHits);
@@ -986,14 +976,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       kernels.twinMerge(inptracksd_view,
                         inptracks_hitsd_view,
                         armOfTrack,
-                        twinMergeDeltaEta,
-                        twinMergeDeltaPhi,
-                        twinMergeMinSharedHits,
-                        twinMergeTier2,
-                        twinMergeTier2DeltaEta,
-                        twinMergeTier2DeltaPhi,
-                        twinMergeNSigma2,
-                        twinMergeMinSharedFwd,
+                        float(extDerivedTables::kDedupRejectChi2_3),
                         minQuality,
                         bestTwin->data(),
                         loserOf->data(),
@@ -1009,15 +992,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                          inptracksd_view,
                          inptracks_hitsd_view,
                          minQuality,
-                         matchFraction,
                          queue,
                          loserOf_d,
                          isLoser_d,
                          twinMergeRefit,
                          refitAllTracks,
-                         unitedWinnerMask,
-                         pocketArmIn,
-                         pocketArmIdOut);
+                         unitedWinnerMask);
 #ifdef GPU_DEBUG
     alpaka::wait(queue);
     std::cout << "finished filtering track SoAs on GPU" << std::endl;

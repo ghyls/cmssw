@@ -442,31 +442,19 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                       const ::reco::TrackSoAConstView& inpTrack_view,
                       const ::reco::TrackHitSoAConstView& inpTrackHit_view,
                       const pixelTrack::Quality minQuality,
-                      const double matchFraction,
                       Queue& queue,
                       const int32_t* loserOf = nullptr,
                       const int32_t* isLoser = nullptr,
                       const bool twinMergeRefit = false,
                       const bool refitAllTracks = false,
-                      int32_t* unitedMaskOut = nullptr,
-                      // Per-track arm carried through the compaction, input order in and merged-SoA
-                      // order out; both null when no arm is tracked.
-                      const uint8_t* pocketArmIn = nullptr,
-                      uint8_t* pocketArmIdOut = nullptr);
+                      int32_t* unitedMaskOut = nullptr);
 
     // Strict cross-arm twin merge. Fills bestTwin/loserOf/isLoser device arrays
     // (all sized nTracks). isLoser is zero-initialised here before use.
     void twinMerge(const ::reco::TrackSoAConstView& inpTrack_view,
                    const ::reco::TrackHitSoAConstView& inpTrackHit_view,
                    const int32_t* armOfTrack,
-                   const float twinDEta,
-                   const float twinDPhi,
-                   const int twinMinShared,
-                   const bool twinTier2,
-                   const float twinDEta2,
-                   const float twinDPhi2,
-                   const float twinNSigma2,
-                   const int twinMinSharedFwd,
+                   const float qGate3,
                    const pixelTrack::Quality minQuality,
                    int32_t* bestTwin,
                    int32_t* loserOf,

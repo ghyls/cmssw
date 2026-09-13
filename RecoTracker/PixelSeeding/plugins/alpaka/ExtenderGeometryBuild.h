@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <vector>
+#include <algorithm>
 
 #include "DataFormats/SiPixelDetId/interface/PixelSubdetector.h"
 #include "Geometry/CommonTopologies/interface/GeomDet.h"
@@ -65,21 +66,33 @@ namespace reco_extender {
       minZ.push_back(+1e30);
       maxZ.push_back(-1e30);
     };
+    // The layer envelope is the span of the module SURFACES, not of their centres: a 2S module is
+    // about 10 cm long, so an envelope built from centres declares a crossing inside the outermost
+    // module but past its centre unreachable. The four plane corners bound the surface exactly, which
+    // is what lets the reachability test drop its slack constants.
     auto accumulateDet = [&](GeomDet const* det) {
-      auto const& p = det->surface().position();
+      auto const& surf = det->surface();
+      auto const& p = surf.position();
       const double r = std::sqrt(p.x() * p.x() + p.y() * p.y());
       sumR.back() += r;
       // Signed z: endcap sides must stay distinguishable downstream; barrel means are ~0.
       sumZ.back() += p.z();
       nDets.back() += 1;
-      if (r < minR.back())
-        minR.back() = r;
-      if (r > maxR.back())
-        maxR.back() = r;
-      if (p.z() < minZ.back())
-        minZ.back() = p.z();
-      if (p.z() > maxZ.back())
-        maxZ.back() = p.z();
+      const double hw = 0.5 * surf.bounds().width();
+      const double hl = 0.5 * surf.bounds().length();
+      for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2) {
+          auto const g = surf.toGlobal(LocalPoint(sx * hw, sy * hl, 0.));
+          const double rc = std::sqrt(g.x() * g.x() + g.y() * g.y());
+          if (rc < minR.back())
+            minR.back() = rc;
+          if (rc > maxR.back())
+            maxR.back() = rc;
+          if (g.z() < minZ.back())
+            minZ.back() = g.z();
+          if (g.z() > maxZ.back())
+            maxZ.back() = g.z();
+        }
     };
 
     int n_modules = 0;
@@ -157,8 +170,12 @@ namespace reco_extender {
       const float invN = nDets[i] > 0 ? 1.f / float(nDets[i]) : 0.f;
       view.layerR()[i] = static_cast<float>(sumR[i]) * invN;
       view.layerZ()[i] = static_cast<float>(sumZ[i]) * invN;
-      view.halfExtentR()[i] = nDets[i] > 0 ? static_cast<float>(0.5 * (maxR[i] - minR[i])) : 0.f;
-      view.halfExtentZ()[i] = nDets[i] > 0 ? static_cast<float>(0.5 * (maxZ[i] - minZ[i])) : 0.f;
+      // Half-spans of the module-SURFACE envelope about the centre mean, so a crossing anywhere on a
+      // real sensor is inside the envelope.
+      const double cr = static_cast<double>(sumR[i]) * (nDets[i] > 0 ? 1. / double(nDets[i]) : 0.);
+      const double cz = static_cast<double>(sumZ[i]) * (nDets[i] > 0 ? 1. / double(nDets[i]) : 0.);
+      view.halfExtentR()[i] = nDets[i] > 0 ? static_cast<float>(std::max(maxR[i] - cr, cr - minR[i])) : 0.f;
+      view.halfExtentZ()[i] = nDets[i] > 0 ? static_cast<float>(std::max(maxZ[i] - cz, cz - minZ[i])) : 0.f;
     }
     view.layerStarts()[n_layers] = layerStarts[n_layers];
     view.isBarrel()[n_layers] = false;

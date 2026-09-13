@@ -442,6 +442,7 @@ private:
 
     const uint32_t* hitIds = trackHits.id().data();
     std::vector<int> cTrackIdx, cLayer, cIsStub, cIsOTExtra, cIsTrue, cOwnTp, cOwnN, cHasTP, cHitId, cHitNTP, cHitTpKey;
+    std::vector<float> cSecErr;  // along-strip local error of the OT sensor (PS vs 2S), -1 for pixels
     for (int it = 0; it < nTracks; ++it) {
       const uint32_t start = (it == 0) ? 0 : tracks[it - 1].hitOffsets();
       const uint32_t end = tracks[it].hitOffsets();
@@ -452,6 +453,7 @@ private:
       std::vector<std::set<uint32_t>> hitTPs(nh);
       std::vector<int> hitLayer(nh, -1), hitIsStub(nh, 0), hitIsOT(nh, 0), hitHasTP(nh, 0), hitNTP(nh, 0),
           hitTpKey(nh, -1);
+      std::vector<float> hitSecErr(nh, -1.f);
       std::map<uint32_t, int> votes;  // TP index -> # of the track's resolvable hits sharing it
       for (uint32_t k = 0; k < nh; ++k) {
         const uint32_t h = hitIds[start + k];
@@ -460,6 +462,8 @@ private:
           hitIsOT[k] = 1;
           const uint32_t o = caOTHitTag::otIdx(h);
           hitLayer[k] = soaLayer(o);
+          if (o < nOTHits)
+            hitSecErr[k] = otView[o].yerrLocal();
           if (const auto* p = soaTPs(o))
             tps = *p;
         } else if (h >= offsetStubs) {
@@ -469,6 +473,8 @@ private:
             const uint32_t lowerIdx = stubsView[stubIdx].lowerHitIdx();
             const uint32_t upperIdx = stubsView[stubIdx].upperHitIdx();
             hitLayer[k] = soaLayer(lowerIdx);
+            if (lowerIdx < nOTHits)
+              hitSecErr[k] = otView[lowerIdx].yerrLocal();
             const auto* lo = soaTPs(lowerIdx);
             const auto* up = soaTPs(upperIdx);
             const bool paired = ::reco::isStub(stubsView, stubIdx) && upperIdx < nOTHits;
@@ -514,6 +520,7 @@ private:
         cHasTP.push_back(hitHasTP[k]);
         cHitNTP.push_back(hitNTP[k]);
         cHitTpKey.push_back(hitTpKey[k]);
+        cSecErr.push_back(hitSecErr[k]);
         // Defined only for resolvable hits on a track whose own-TP plurality is shared by at least
         // minSharedForOwnTP_ hits; ownTpNShared allows a different threshold offline.
         int isTrue = -1;
@@ -529,6 +536,8 @@ private:
     t->addColumn<int>("hitId", cHitId, "raw track-hit id (global pixel/stub index; OT extras tagged bit30)", -1);
     t->addColumn<int>("layerId", cLayer, "getLayerId (Phase2 V1) OT layer 28-53, -1 if pixel/unresolved", -1);
     t->addColumn<int>("isStub", cIsStub, "1 if merged stub-region hit", -1);
+    t->addColumn<float>(
+        "secErr", cSecErr, "along-strip local error of the OT sensor [cm]: PS ~0.04, 2S ~1.4 (-1 pixel)", -1);
     t->addColumn<int>("isOTExtra", cIsOTExtra, "1 if attached raw-OT extra (tag bit set)", -1);
     t->addColumn<int>("isTrueForOwnTP", cIsTrue, "1 hit shares track's own TP, 0 not, -1 unresolved/no ownTP", -1);
     t->addColumn<int>("ownTpKey", cOwnTp, "plurality TP index over the track's resolvable hits (-1 none)", -1);

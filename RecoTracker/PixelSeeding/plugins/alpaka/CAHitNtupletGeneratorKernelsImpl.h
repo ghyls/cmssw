@@ -62,10 +62,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
   constexpr float kTwinTwoPi = 2.f * kTwinPi;
   // map: index of a track parameter -> index of its covariance
   HOST_DEVICE_CONSTANT std::array<uint8_t, nTrackParameters> iParam2iCov = {0u, 5u, 9u, 12u, 14u};
+  // cotTheta's own variance in that packed layout (parameter 3).
+  constexpr int kCovCotCot = 12;
 
-  // Phi bins of the twinFindBest pre-filter: 2pi/128 ~ 0.049 rad >= the 0.03 twin dPhi window, so a
-  // centered bin sweep visits a superset of the pairs the |dPhi| gate can accept.
+  // (eta, phi) bins of the twinFindBest pre-filter. The bins are candidate generation only -- the
+  // covariance gate is the physics -- and the sweep below sizes its window from that gate, so the
+  // binning only has to be fine enough to be worth traversing: 2pi/128 ~ 0.049 rad in phi and 0.18 in
+  // eta, against gate windows of a few times the track's own sigma.
   constexpr int kTwinPhiBins = 128;
+  constexpr int kTwinEtaSlabs = 50;
+  constexpr float kTwinEtaMax = 4.5f;
   // eta-phi binner of the 0-shared forward fallback; candidate generation only, the cov gate is the physics gate.
   constexpr int kDedupFbPhiBins = 128;
   constexpr int kDedupFbEtaSlabs = 50;
@@ -75,8 +81,22 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
   constexpr float kDedupFbDropAbsEtaMax = 2.5f;
   // Post-refit cov-dedup nSigma^2 gate; acts on the refitted covariance, unlike the twin gate.
   constexpr float kDedupNSigma2Default = 25.f;
+  // Shared-hit fraction above which two tracks are the same track: CMS reconstruction's own duplicate
+  // convention, ShareFrac = 0.19 in TrackListMerger (RecoTracker/FinalTrackSelectors), the pixel cleaner
+  // being the same rule at small hit counts. Not a knob. As in TrackListMerger (allowFirstHitShare), the
+  // innermost shared hit is taken out of both sides of the fraction.
+  constexpr float kDedupShareFrac = 0.19f;
+  // yerrLocal is a VARIANCE, and it separates the outer tracker's two sensor kinds by itself: a 5 cm
+  // strip leaves its along-strip coordinate with a variance of 5^2/12 = 2.1 cm^2, a 1.5 mm macro-pixel
+  // with 0.0019 cm^2. Above this bound the rechit measures one coordinate and leaves the other free.
+  constexpr float kStripYVarMin = 0.1f;
   // |eta| boundary of the central/forward dedup diagnostics; not a physics gate.
   constexpr float kDedupFwdEta = 1.3f;
+  // A fit that does not describe its own hits cannot be trusted to report the covariance it reports,
+  // so it may not win a duplicate comparison on that covariance. The bound is the same 5-parameter
+  // 5-sigma rejection the duplicate test itself uses (ExtDerivedTables.h kDedupRejectChi2_5 = 37.09)
+  // per degree of freedom; chi2() is already chi2/ndof everywhere in this SoA.
+  constexpr float kDedupMaxChi2Ndof = 37.0948f / 5.f;
   // Capacity of the merge-or-keep-both contested-pair list: at most one pair per loser track. Pairs
   // beyond the cap are counted and kept both.
   constexpr uint32_t kDedupConfirmMaxPairs = 1024u;
@@ -1597,16 +1617,121 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
     }
   };
 
-  // Strict cross-arm twin merge (gated by PixelTracksSoAMerger twinMerge=true). The masking chain lets a
-  // particle be reconstructed twice, as a pixel-rich prompt-arm track and an OT-rich displaced-arm track
-  // built from the unmasked disk stubs; the two are largely disjoint, so the ordinary merger dedup never
-  // pairs them. Twin-merge pairs them by trajectory and shared-hit evidence and unites their hit lists onto
-  // the winner track.
-  //
-  // Kernel_twinFindBest: for every track, the single best opposite-arm partner passing the strict gate
-  // (opposite arm, same charge, |dEta|/|dPhi| windows, >= minShared common hit ids), where best means most
-  // shared hits, then smallest dR, then lowest index. Tier 2 (twinTier2) also accepts a pair that fails the
-  // shared-hit evidence but sits inside the tighter windows; the ranking keeps tier 1 strictly ahead.
+  // Duplicate-removal compatibility test, shared by the cross-arm twin merge and the final dedup: two tracks
+  // are compatible when the Mahalanobis distance of their parameter difference, against the sum of their full
+  // covariances, is below the 5-sigma rejection quantile. n = 3 uses the arm-invariant triple (phi, q/pT,
+  // cotTheta), usable before the refit; n = 5 adds tip and zip after the common refit, where both members
+  // share one convention. Off-diagonals are kept: phi and q/pT are strongly correlated in a helix fit.
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE bool dedupCompatible(
+      const ::reco::TrackSoAConstView &tv, int32_t i, int32_t j, int n, float qGate) {
+    constexpr int off[5] = {0, 4, 7, 9, 10};
+    auto cidx = [&](int a, int b) {
+      const int lo = a < b ? a : b;
+      const int hi = a < b ? b : a;
+      return off[lo] + hi;
+    };
+    // n == 3 selects the arm-invariant parameters (phi, q/pT, cotTheta) out of the 5.
+    const int par3[3] = {0, 2, 3};
+    float d[5];
+    float A[5][5];
+    for (int a = 0; a < n; ++a) {
+      const int pa = (n == 3) ? par3[a] : a;
+      float dp = tv[i].state()[pa] - tv[j].state()[pa];
+      if (pa == 0) {  // phi: wrap to [-pi, pi]
+        while (dp > kTwinPi)
+          dp -= kTwinTwoPi;
+        while (dp < -kTwinPi)
+          dp += kTwinTwoPi;
+      }
+      d[a] = dp;
+      for (int b = 0; b < n; ++b) {
+        const int pb = (n == 3) ? par3[b] : b;
+        A[a][b] = tv[i].covariance()[cidx(pa, pb)] + tv[j].covariance()[cidx(pa, pb)];
+      }
+    }
+    // Cholesky solve of A x = d, then chi2 = d^T x. A is a sum of two covariances, so it is positive
+    // definite unless the fit produced a degenerate one; a failed factorisation means "cannot judge",
+    // which is answered with "not compatible" so nothing is dropped on a broken covariance.
+    float L[5][5] = {{0.f}};
+    for (int a = 0; a < n; ++a) {
+      for (int b = 0; b <= a; ++b) {
+        float sum = A[a][b];
+        for (int k = 0; k < b; ++k)
+          sum -= L[a][k] * L[b][k];
+        if (a == b) {
+          if (!(sum > 0.f))
+            return false;
+          L[a][a] = std::sqrt(sum);
+        } else {
+          L[a][b] = sum / L[b][b];
+        }
+      }
+    }
+    float y[5];
+    for (int a = 0; a < n; ++a) {
+      float sum = d[a];
+      for (int k = 0; k < a; ++k)
+        sum -= L[a][k] * y[k];
+      y[a] = sum / L[a][a];
+    }
+    float chi2 = 0.f;
+    for (int a = 0; a < n; ++a)
+      chi2 += y[a] * y[a];
+    return chi2 < qGate;
+  }
+
+  // How much a fit knows about its track: the generalized variance |C| of the 5x5 perigee covariance
+  // (the D-optimality measure; |C| = 1 / |Fisher information|). It is the volume of the error
+  // ellipsoid, so it uses the correlations the helix fit really has instead of five separate errors,
+  // and since both tracks live in the same parameter space the two determinants carry identical units
+  // and their comparison needs no scale. Returned as ln|C| through the Cholesky factor, because
+  // |C| ~ 1e-25 underflows in float. A covariance that is not positive definite cannot be judged.
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE bool logDetCov5(const ::reco::TrackSoAConstView &tv, int32_t t, float &lnDet) {
+    constexpr int off[5] = {0, 4, 7, 9, 10};
+    float L[5][5] = {{0.f}};
+    float s = 0.f;
+    for (int a = 0; a < 5; ++a) {
+      for (int b = 0; b <= a; ++b) {
+        const int lo = b, hi = a;
+        float sum = tv[t].covariance()[off[lo] + hi];
+        for (int k = 0; k < b; ++k)
+          sum -= L[a][k] * L[b][k];
+        if (a == b) {
+          if (!(sum > 0.f))
+            return false;
+          L[a][a] = std::sqrt(sum);
+          s += std::log(L[a][a]);
+        } else {
+          L[a][b] = sum / L[b][b];
+        }
+      }
+    }
+    lnDet = 2.f * s;
+    return true;
+  }
+
+  // Which member of a duplicate pair carries more information, +1 = x, -1 = y, 0 = undecided (the
+  // caller then falls through to its length/quality tie-breaks). A fit past the chi2/ndof bound, or
+  // one whose covariance is not positive definite, cannot be judged and loses to one that can.
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE int dedupInfoOrder(const ::reco::TrackSoAConstView &tv, int32_t x, int32_t y) {
+    float lx = 0.f, ly = 0.f;
+    const bool okX = (tv[x].chi2() < kDedupMaxChi2Ndof) && logDetCov5(tv, x, lx);
+    const bool okY = (tv[y].chi2() < kDedupMaxChi2Ndof) && logDetCov5(tv, y, ly);
+    if (okX != okY)
+      return okX ? 1 : -1;
+    if (!okX)
+      return 0;
+    if (lx != ly)
+      return lx < ly ? 1 : -1;  // smaller error volume = more information
+    return 0;
+  }
+
+  // Strict cross-arm twin merge (PixelTracksSoAMerger twinMerge=true). The masking chain can reconstruct a
+  // particle twice, as a pixel-rich prompt-arm track and an OT-rich displaced-arm track, largely disjoint in
+  // hits; twin-merge pairs them by trajectory and shared-hit evidence and unites their hit lists onto the winner.
+  // Kernel_twinFindBest: for every track, the single best opposite-arm, same-charge partner passing the
+  // arm-invariant covariance compatibility at 5 sigma; best = largest shared-hit fraction, then smallest dR,
+  // then lowest index.
   class Kernel_twinFindBest {
   public:
     ALPAKA_FN_ACC void operator()(Acc1D const &acc,
@@ -1614,93 +1739,72 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
                                   const ::reco::TrackHitSoAConstView inpTrackHit_view,
                                   const int32_t *__restrict__ armOfTrack,
                                   const pixelTrack::Quality minQuality,
-                                  const float twinDEta,
-                                  const float twinDPhi,
-                                  const int twinMinShared,
-                                  const bool twinTier2,
-                                  const float twinDEta2,
-                                  const float twinDPhi2,
-                                  const float twinNSigma2,
-                                  const int twinMinSharedFwd,
-                                  // phi->track OneToManyAssoc over this same collection, plus its bin count.
-                                  // The whole-ring guard falls back to an exhaustive scan when the window
-                                  // spans the ring, so either way the same pairs are visited.
-                                  HitToTuple const *__restrict__ phiBinner,
+                                  const float qGate3,  // chi2_3 at the 5-sigma duplicate rejection
+                                  // (eta,phi)->track OneToManyAssoc over this same collection, plus its
+                                  // binning. A window wider than the ring wraps over every phi bin once;
+                                  // either way the swept set contains every pair the gate can accept.
+                                  HitToTuple const *__restrict__ etaPhiBinner,
                                   const int nPhiBins,
+                                  const int nEtaSlabs,
+                                  const float etaMax,
                                   int32_t *__restrict__ bestTwin) const {
-      // Region boundary for the stricter forward same-particle discrimination (mirrors the merger's
-      // finalDedup kDedupFwdEta): forward twins share fewer hits and start from worse parameters.
-      constexpr float kTwinFwdEta = 1.3f;
       const int32_t nT = inpTrack_view.metadata().size();
       for (int32_t i : cms::alpakatools::uniform_elements(acc, nT)) {
         bestTwin[i] = -1;
         if (inpTrack_view[i].quality() < minQuality)
           continue;
         const int32_t armI = armOfTrack[i];
-        const float etaI = inpTrack_view[i].eta();
         const float phiI = ::reco::phi(inpTrack_view, i);
+        const float etaI = inpTrack_view[i].eta();
         const float chgI = ::reco::charge(inpTrack_view, i);
         const uint32_t iBeg = (i == 0) ? 0u : inpTrack_view[i - 1].hitOffsets();
         const uint32_t iEnd = inpTrack_view[i].hitOffsets();
+        const int nHitsI = int(iEnd - iBeg);
 
-        int bestShared = 0;
-        // Sentinel init so a tier-2 candidate (shared == bestShared == 0) can be recorded on the tie-break
-        // arm; never consulted on the tier-1 path, where the first candidate wins via shared > bestShared.
+        const float vPhiI = inpTrack_view[i].covariance()[0];
+        const float vCotI = inpTrack_view[i].covariance()[kCovCotCot];
+        const float cotI = inpTrack_view[i].state()[3];
+        const float dPhiWin = std::sqrt(qGate3 * 4.f * (vPhiI > 0.f ? vPhiI : 0.f));
+        const float dCotWin = std::sqrt(qGate3 * 4.f * (vCotI > 0.f ? vCotI : 0.f));
+        const float cotEdge = std::abs(cotI) - dCotWin;
+        const float cotMin = cotEdge > 0.f ? cotEdge : 0.f;
+        const float dEtaWin = dCotWin / std::sqrt(1.f + cotMin * cotMin);
+
+        float bestFrac = -1.f;
         float bestDR2 = 1e30f;
         int32_t bestJ = -1;
 
-        // Per-candidate evaluation, shared by the exhaustive scan and the phi-binned pre-filter sweep. The
-        // winner update is a strict total order over (shared desc, dr2 asc, j asc), so bestJ does not depend
-        // on the order in which j is visited and the binned iteration reproduces the exhaustive scan's bestJ.
+        // Winner update is a strict total order over (fraction desc, dr2 asc, j asc), so bestJ does not
+        // depend on the order in which j is visited and the binned sweep reproduces an exhaustive scan.
         auto considerJ = [&](int32_t j) {
           if (j == i)
             return;
-          if (armOfTrack[j] == armI)  // (a) opposite arm only
+          if (armOfTrack[j] == armI)  // opposite arm only
             return;
           if (inpTrack_view[j].quality() < minQuality)
             return;
-          if (::reco::charge(inpTrack_view, j) != chgI)  // (b) same charge
+          if (::reco::charge(inpTrack_view, j) != chgI)  // same charge
             return;
-          const float dEta = etaI - inpTrack_view[j].eta();
-          if (dEta > twinDEta || dEta < -twinDEta)
-            return;
+          // Each component of a Mahalanobis distance is bounded by the distance itself, so these two
+          // one-line tests are implied by the gate and reject almost every binned candidate before the
+          // 3x3 factorisation runs.
           float dPhi = phiI - ::reco::phi(inpTrack_view, j);
           while (dPhi > kTwinPi)
             dPhi -= kTwinTwoPi;
           while (dPhi < -kTwinPi)
             dPhi += kTwinTwoPi;
-          if (dPhi > twinDPhi || dPhi < -twinDPhi)
+          if (dPhi * dPhi >= qGate3 * (vPhiI + inpTrack_view[j].covariance()[0]))
             return;
-          // (b') Covariance-scaled arm-invariant compatibility gate; twinNSigma2 <= 0 skips the block. The
-          // two halves must agree on the arm-invariant helix parameters phi (state 0), 1/pT (2) and cotTheta
-          // (3); tip (1) and zip (4) are beamline-referenced and differ across arms for displaced tracks.
-          // Reject the pair when any of the three has dp^2 > nSigma2 * (cov_i + cov_j), the post-GBL diagonal
-          // covariance being read at the iParam2iCov offsets {0,9,12}.
-          if (twinNSigma2 > 0.f) {
-            bool incompatible = false;
-            const int twParam[3] = {0, 2, 3};
-            const int twCov[3] = {0, 9, 12};
-            for (int t = 0; t < 3; ++t) {
-              float dp = inpTrack_view[i].state()[twParam[t]] - inpTrack_view[j].state()[twParam[t]];
-              if (t == 0) {  // phi: wrap the difference to [-pi,pi] (state 0 == reco::phi)
-                while (dp > kTwinPi)
-                  dp -= kTwinTwoPi;
-                while (dp < -kTwinPi)
-                  dp += kTwinTwoPi;
-              }
-              const float e2 =
-                  twinNSigma2 * (inpTrack_view[i].covariance()[twCov[t]] + inpTrack_view[j].covariance()[twCov[t]]);
-              if (dp * dp > e2) {
-                incompatible = true;
-                break;
-              }
-            }
-            if (incompatible)
-              return;
-          }
-          // (c) shared-hit evidence: count common hit ids between the two hit lists.
+          const float dCot = cotI - inpTrack_view[j].state()[3];
+          if (dCot * dCot >= qGate3 * (vCotI + inpTrack_view[j].covariance()[kCovCotCot]))
+            return;
+          if (!dedupCompatible(inpTrack_view, i, j, 3, qGate3))
+            return;
+          // Shared-hit evidence as a fraction of the SHORTER track's list: it does not decide the pair,
+          // it only orders the candidates when a track has more than one compatible partner.
           const uint32_t jBeg = (j == 0) ? 0u : inpTrack_view[j - 1].hitOffsets();
           const uint32_t jEnd = inpTrack_view[j].hitOffsets();
+          const int nHitsJ = int(jEnd - jBeg);
           int shared = 0;
           for (uint32_t a = iBeg; a < iEnd; ++a) {
             const uint32_t ida = inpTrackHit_view[a].id();
@@ -1711,47 +1815,44 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
               }
             }
           }
-          // Region-aware shared-hit requirement: forward pairs (either member |eta| > kTwinFwdEta) may be
-          // held to a stricter minimum (twinMinSharedFwd) against the forward over-merge of distinct
-          // displaced tracks crossing the same OT sensor.
-          const bool isFwd = (etaI > kTwinFwdEta || etaI < -kTwinFwdEta || inpTrack_view[j].eta() > kTwinFwdEta ||
-                              inpTrack_view[j].eta() < -kTwinFwdEta);
-          const bool fwdStricter = isFwd && twinMinSharedFwd > twinMinShared;
-          const int reqShared = fwdStricter ? twinMinSharedFwd : twinMinShared;
-          if (shared < reqShared) {
-            // tier 1 failed: only a tier-2 pair (no shared-hit evidence, but inside the tighter trajectory
-            // windows) may still qualify, and not in the forward region, where shared-hit evidence is required.
-            if (!twinTier2)
-              return;
-            if (fwdStricter)
-              return;
-            if (dEta > twinDEta2 || dEta < -twinDEta2 || dPhi > twinDPhi2 || dPhi < -twinDPhi2)
-              return;
-          }
+          const int nShort = nHitsI < nHitsJ ? nHitsI : nHitsJ;
+          if (nShort <= 0)
+            return;
+          // No shared-hit requirement: the two arms often rebuild the same particle from disjoint hit
+          // ids (a stub on one side, its two raw rechits on the other, or a different pixel subset), and
+          // those twins are exactly the pairs nothing downstream can pair either. The covariance gate
+          // above, on the opposite arm and the same charge, is the criterion.
+          const float frac = float(shared) / float(nShort);
+          const float dEta = etaI - inpTrack_view[j].eta();
           const float dr2 = dEta * dEta + dPhi * dPhi;
-          if (shared > bestShared || (shared == bestShared && (dr2 < bestDR2 || (dr2 == bestDR2 && j < bestJ)))) {
-            bestShared = shared;
+          if (frac > bestFrac || (frac == bestFrac && (dr2 < bestDR2 || (dr2 == bestDR2 && j < bestJ)))) {
+            bestFrac = frac;
             bestDR2 = dr2;
             bestJ = j;
           }
         };
 
-        // Phi pre-filter: sweep only the phi bins overlapping [phiI - twinDPhi, phiI + twinDPhi] (with
-        // wraparound); half = floor(twinDPhi/binW) + 1 covers the window, plus one bin of floating-point
-        // margin. If the window spans the whole ring, fall back to the exhaustive scan. Every j the |dPhi|
-        // gate could accept lies in a swept bin and each track sits in exactly one bin, so bestJ is the same
-        // as for an exhaustive scan.
+        // Both windows come from the gate itself, not from window parameters: the test can only accept
+        // |dphi| <= sqrt(qGate3 * (V_i + V_j)) and |dcot| <= sqrt(qGate3 * (V_i + V_j)), with V_j
+        // bounded by assuming a partner no more than 3x less well measured than this track. The cot
+        // window becomes an eta window through deta = dcot / sqrt(1 + cot^2), evaluated at the smallest
+        // |cot| the window reaches, where eta moves fastest per unit of cot -- so the eta span is an
+        // over-estimate and no accepted pair can fall outside it. Two phi bins of margin; a window
+        // wider than the ring wraps over every phi bin once instead of scanning the whole collection.
         const float binW = kTwinTwoPi / float(nPhiBins);
-        const int half = int(twinDPhi / binW) + 2;
-        const int nVisit = 2 * half + 1;
-        if (nVisit >= nPhiBins) {
-          for (int32_t j = 0; j < nT; ++j)
-            considerJ(j);
-        } else {
-          const int b0 = trackBinKey(0.f, phiI, nPhiBins, 1, 0.f);
-          for (int d = -half; d <= half; ++d) {
+        const int half = int(dPhiWin / binW) + 2;
+        const int spansRing = (2 * half + 1 >= nPhiBins);
+        const int dLo = spansRing ? 0 : -half;
+        const int dHi = spansRing ? nPhiBins - 1 : half;
+        const int b0 = trackBinKey(0.f, phiI, nPhiBins, 1, 0.f);
+        auto slabOf = [&](float eta) { return (trackBinKey(eta, phiI, nPhiBins, nEtaSlabs, etaMax) - b0) / nPhiBins; };
+        const int ebLo = slabOf(etaI - dEtaWin);  // trackBinKey clamps, so both ends are in range
+        const int ebHi = slabOf(etaI + dEtaWin);
+        for (int eb = ebLo; eb <= ebHi; ++eb) {
+          for (int d = dLo; d <= dHi; ++d) {
             const int b = (b0 + d + nPhiBins) % nPhiBins;
-            for (auto p = phiBinner->begin(b); p != phiBinner->end(b); ++p)
+            const uint32_t bin = uint32_t(eb * nPhiBins + b);
+            for (auto p = etaPhiBinner->begin(bin); p != etaPhiBinner->end(bin); ++p)
               considerJ(int32_t(*p));
           }
         }
@@ -1761,9 +1862,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
   };
 
   // Kernel_twinConfirm: keep only mutual-best pairs (bestTwin[i]==j && bestTwin[j]==i), so every track takes
-  // part in at most one merge with no atomics. The winner is chosen by the strict total ordering (max
-  // nLayers -> max total hits -> max quality -> min chi2 -> min index) and records loserOf[winner] and
-  // isLoser[loser]; isLoser must be zero-initialised by the caller.
+  // part in at most one merge with no atomics. The winner is chosen by the strict total ordering (most
+  // information -> max nLayers -> max total hits -> max quality -> min chi2 -> min index) and records
+  // loserOf[winner] and isLoser[loser]; isLoser must be zero-initialised by the caller.
   class Kernel_twinConfirm {
   public:
     ALPAKA_FN_ACC void operator()(Acc1D const &acc,
@@ -1779,7 +1880,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
           continue;
         if (bestTwin[j] != i)  // mutual-best match only
           continue;
-        // Winner ordering (mirrors Kernel_rejectDuplicate).
+        // Winner ordering: the more informative fit keeps the united hit list (same rule as the final
+        // dedup), with the length keys as tie-breaks.
+        const int o = dedupInfoOrder(inpTrack_view, i, j);
         const int nli = inpTrack_view[i].nLayers();
         const int nlj = inpTrack_view[j].nLayers();
         const int nhi = ::reco::nHits(inpTrack_view, i);
@@ -1789,7 +1892,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
         const float ci = inpTrack_view[i].chi2();
         const float cj = inpTrack_view[j].chi2();
         bool iWins;
-        if (nli != nlj)
+        if (o != 0)
+          iWins = o > 0;
+        else if (nli != nlj)
           iWins = nli > nlj;
         else if (nhi != nhj)
           iWins = nhi > nhj;
@@ -1818,7 +1923,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
                                   const ::reco::TrackSoAConstView inpTrack_view,
                                   const ::reco::TrackHitSoAConstView inpTrackHit_view,
                                   const pixelTrack::Quality minQuality,
-                                  [[maybe_unused]] const double matchFraction,
                                   const int32_t *__restrict__ loserOf,
                                   const int32_t *__restrict__ isLoser,
                                   int32_t *__restrict__ keep,
@@ -1895,11 +1999,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
                                   const int32_t *__restrict__ outHitCnt,
                                   const int32_t *__restrict__ tkOff,   // inclusive scan of keep[]
                                   const int32_t *__restrict__ hitOff,  // inclusive scan of outHitCnt[]
-                                  const int32_t nScanSize,
-                                  // pocket gate: input-order arm in, output-order arm out; both null unless
-                                  // the merger's arm-scoped pocket gate is on, and scattered like the tracks.
-                                  const uint8_t *__restrict__ pocketArmIn,
-                                  uint8_t *__restrict__ pocketArmIdOut) const {
+                                  const int32_t nScanSize) const {
       // authoritative output count = total kept = last inclusive-scan value.
       if (alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0] == 0)
         track_view.nTracks() = tkOff[nScanSize - 1];
@@ -1983,8 +2083,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
           unitedMaskOut[outTk] = int32_t(outTk);
         // pocket gate: scatter the per-track arm to the same compacted slot the track went to (outTk), so
         // launchMergerAttach reads armId in the merged-SoA order. Null leaves it untouched.
-        if (pocketArmIn && pocketArmIdOut)
-          pocketArmIdOut[outTk] = pocketArmIn[i];
       }
       // Tail hygiene: stamp the unused output capacity so the iteration column is never allocator garbage.
       // Index-disjoint from the kept slots written above (outTk = tkOff[i]-1 < nOut), so no barrier is needed.
@@ -2340,93 +2438,47 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
     }
   };
 
-  // Kernel_dedupCovMark: one thread per refined merged track i. i is the duplicate loser iff some better
-  // track j (by the strict total order below) is a covariance-compatible duplicate of it. Candidate j's are
-  // generated from the shared-hit co-occurrence histogram (hitAssoc): every j sharing a hit with i, with no
-  // window, relPt, minShared or charge veto (the signed q/pT folds the charge in). Compatibility is
-  // dp^2 <= kDedupNSigma2Default * (cov_i + cov_j) for all of {phi(0), q/pT(2), cotTheta(3)} at the cov
-  // offsets {0,9,12}, phi wrapped. The ranking is a strict total order, so exactly one of a matched pair is
-  // the loser and drop[loser]=1 is idempotent: no atomics, thread i being the sole writer of drop[i].
-  //
-  // 0-shared forward fallback: when etaPhiAssoc is non-null, tracks that are not already a shared-hit loser
-  // are also checked against cov-compatible, genuinely 0-shared neighbours from an eta-phi track binner.
-  // Drop authority is bounded to |eta| <= kDedupFbDropAbsEtaMax; out-of-bound candidates are only counted.
-  // The two paths are mutually exclusive per track, so each track increments at most one diagnostic bucket.
-  //
-  // diag (optional, may be null; 18 uint32): [region*3 + bucket] for region {0=central,1=forward} (split at
-  // kDedupFwdEta) x shared bucket {0=0-shared, 1, 2+}, [6+region] drop totals, [8+region] cov-gate-miss
-  // survivors, [10]=contested captured, [11]=pre-gate rejected, [12]=confirmed drop, [13]=keep-both,
-  // [14]=over-size union (nSel > kRefitMaxN), [15]=refit non-finite, [16]=finder-mode suppressed drops,
-  // [17]=cross-arm corner guard fires. drop[] must be zero-initialised by the caller.
+  // Kernel_dedupCovMark: one thread per refined merged track i. i is a duplicate loser iff a better
+  // track j (strict total order: most information first, hit count as tie-break) is its duplicate:
+  //   * pairs sharing a track-hit id: i loses when more than ShareFrac of its own published rechits
+  //     go to a better track (no covariance test needed);
+  //   * id-disjoint pairs (from an eta-phi neighbourhood sweep): full 5x5 covariance compatibility at
+  //     the 5-sigma rejection, after the common refit so tip and zip are comparable.
+  // Candidates come from the shared-hit co-occurrence histogram plus the sweep; the drop authority
+  // covers the |eta| range the extension walk reaches. The order is strict and total, so the best
+  // member of a group always survives in one pass.
+  // diag (optional, 18 uint32): [region*3 + bucket] for region {0=central,1=forward} (split at
+  // kDedupFwdEta) x shared bucket {0, 1, 2+}, [6+region] drop totals, [8+region] survivors whose
+  // better partners all stayed under the shared fraction. Must be zero-initialised by the caller.
   class Kernel_dedupCovMark {
   public:
-    ALPAKA_FN_ACC void operator()(
-        Acc1D const &acc,
-        const ::reco::TrackSoAConstView tracks_view,
-        const ::reco::TrackHitSoAConstView trackHit_view,
-        HitToTuple const *__restrict__ hitAssoc,
-        HitToTuple const *__restrict__ etaPhiAssoc,
-        const uint32_t nHits,
-        const uint32_t nKeys,
-        uint8_t *__restrict__ drop,
-        uint32_t *__restrict__ diag,
-        const float nSigma2,
-        const int fbEtaReach,
-        const int fbPhiReach,
-        const float fbNSigma2,
-        const float fbDropAbsEtaMax,
-        const int fbEnable,
-        // merge-or-keep-both confirm capture: with fbConfirm == 0 (or contestedPairs == nullptr) the
-        // fallback branch drops its loser outright; when on, a droppable (i, fbPartner) pair is deferred to
-        // the union-refit verdict and recorded into a capped device pair list by atomic append, subject to
-        // the pre-gates below.
-        const int fbConfirm,                       // 1 = capture for the refit verdict; 0 = drop here
-        const int fbSameCharge,                    // 1 = require same charge sign (state()[2]) to contest
-        const float fbAbsFloorDPhi,                // abs-floor box: max |dphi| (wrapped); large => off
-        const float fbAbsFloorDQoP,                // abs-floor box: max |d q/pT|;         large => off
-        const float fbAbsFloorDCotTheta,           // abs-floor box: max |d cotTheta|;     large => off
-        uint32_t *__restrict__ contestedPairs,     // capped list, 2 uint32/pair {i, j}; null => off
-        uint32_t *__restrict__ contestedCount,     // atomic append cursor (1 uint32); null => off
-        const uint32_t contestedCap,               // pair-list capacity in pairs (slots)
-        uint32_t *__restrict__ contestedOverflow,  // atomic overflow counter (nullable)
-        // ranking / drop-authority variants. With finder 0, rankClusters 0, rankNHits 0 and guardCrossArm 0
-        // the two ranking lambdas use the (nLayers, nHits) length key. hh is dereferenced only when
-        // rankClusters or guardCrossArm is on; the launcher passes an empty view otherwise.
-        const ::reco::TrackingRecHitConstView hh,  // for ::reco::isStub -> cluster count / pixel-core arm proxy
-        const int fbFinderOnly,                    // finder mode: scan+diag but NEVER drop (own bucket [16])
-        const int rankClusters,                    // length key = weighted CLUSTER count (stub=2) not nL/nH
-        const int rankNHits,                       // length key = nHits ONLY (skip the nLayers primary)
-        const int guardCrossArm,                   // cross-arm keep-longest corner guard (needs qual/chi2)
-        const float guardVertPosMin,               // guard: min |dxy| proxy (|state[1]|, cm) to engage
-        const float guardChi2Margin) const {       // guard: chi2/ndof margin the longer track must ALSO win by
-      // nSigma2 is the cov-gate width of the shared-hit path; fbEtaReach/fbPhiReach the bin reach of the
-      // fallback neighbourhood scan. The fb* parameters act only on the 0-shared fallback branch:
-      //   fbNSigma2       cov-gate width of the fallback's compatible() call
-      //   fbDropAbsEtaMax the fallback's drop-authority |eta| bound (image of kDedupFbDropAbsEtaMax);
-      //                   out-of-bound candidates are counted in diag, never dropped
-      //   fbEnable        master fallback-drop switch; 0 never drops but still scans and fills the diagnostics
-      //   fbFinderOnly    the fallback scans and diag-counts but sets drop[] for no candidate (bucket [16])
-      //   rankClusters    length key = weighted cluster count (raw-OT extra=1, core stub=2, pixel=1) instead
-      //                   of (nLayers, nHits), in both beats() and the loser test jBeatsI()
-      //   guardCrossArm   corner guard on keep-longest: for cross-arm pairs (pixel-core vs OT-only-core) at
-      //                   |dxy| proxy > guardVertPosMin a longer track wins only if it also wins the
-      //                   quality/chi2 tiebreak by guardChi2Margin
+    ALPAKA_FN_ACC void operator()(Acc1D const &acc,
+                                  const ::reco::TrackSoAConstView tracks_view,
+                                  const ::reco::TrackHitSoAConstView trackHit_view,
+                                  HitToTuple const *__restrict__ hitAssoc,
+                                  HitToTuple const *__restrict__ etaPhiAssoc,
+                                  const uint32_t nHits,
+                                  const uint32_t nKeys,
+                                  uint8_t *__restrict__ drop,  // 1 = this track is the duplicate loser
+                                  uint32_t *__restrict__ diag,
+                                  const float qGate5,         // chi2_5 at the 5-sigma duplicate rejection
+                                  const float dropAbsEtaMax,  // = the walk's own |eta| reach
+                                  const int fbEtaReach,
+                                  const int fbPhiReach,
+                                  const ::reco::TrackingRecHitConstView hh,     // for ::reco::isStub
+                                  const ::reco::StubsConstView sv,              // stub -> its two OT rows
+                                  const ::reco::OTRecHitsConstView ov) const {  // sensor kind and position
       const int32_t nT = tracks_view.nTracks();
-      const int cParam[3] = {0, 2, 3};  // phi, signed q/pT, cotTheta
-      const int cCov[3] = {0, 9, 12};   // their diagonal covariance offsets (iParam2iCov)
       for (int32_t i : cms::alpakatools::uniform_elements(acc, nT)) {
-        drop[i] = 0;
         const float etaI = tracks_view[i].eta();
-        const int nlI = tracks_view[i].nLayers();
-        const int nhI = ::reco::nHits(tracks_view, i);
         const auto qI = tracks_view[i].quality();
         const float c2I = tracks_view[i].chi2();
         const uint32_t iBeg = (i == 0) ? 0u : tracks_view[i - 1].hitOffsets();
         const uint32_t iEnd = tracks_view[i].hitOffsets();
 
-        // length / arm helpers, called only when rankClusters or guardCrossArm is on (the launcher gates
-        // that on a valid hit view hh). Weighted cluster count: raw-OT extra=1, core stub=2 (two rechits),
-        // pixel=1, the same weight the extension caps on.
+        // Length in PUBLISHED RECHITS, not in hit ids: the converter publishes a stub as the two
+        // rechits it was built from and a raw-OT extra or a pixel hit as one, and that is the unit the
+        // validation's 75 % matching fraction is a fraction of.
         auto lengthClusters = [&](int32_t t) -> int {
           const uint32_t b = (t == 0) ? 0u : tracks_view[t - 1].hitOffsets();
           const uint32_t e = tracks_view[t].hitOffsets();
@@ -2437,95 +2489,33 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
           }
           return c;
         };
-        // Arm proxy: a track has a pixel core iff it carries at least one plain pixel hit (not a bit30 OT
-        // tag and not a stub). pixel-core vs OT-only-core is the cross-arm split.
-        auto hasPixelCore = [&](int32_t t) -> bool {
-          const uint32_t b = (t == 0) ? 0u : tracks_view[t - 1].hitOffsets();
-          const uint32_t e = tracks_view[t].hitOffsets();
-          for (uint32_t a = b; a < e; ++a) {
-            const uint32_t id = trackHit_view[a].id();
-            if (!caExtension::isOTId(id) && !isStub(hh, int32_t(id)))
-              return true;
-          }
-          return false;
-        };
-        auto crossArm = [&](int32_t x, int32_t y) -> bool { return hasPixelCore(x) != hasPixelCore(y); };
-        auto vertPosMax = [&](int32_t x, int32_t y) -> float {
-          const float ax = std::abs(tracks_view[x].state()[1]);  // state[1] = tip (|dxyBS| proxy)
-          const float ay = std::abs(tracks_view[y].state()[1]);
-          return ax > ay ? ax : ay;
-        };
+        const int nClI = lengthClusters(i);
 
-        // Strict total order: is x a better member than y? (length -> quality -> chi2 -> index). Being
-        // total, it names a unique loser. The length key is (nLayers, nHits), a single cluster count when
-        // rankClusters is on, or nHits only when rankNHits is on, which takes precedence over rankClusters.
+        // Strict total order: is x a better member than y? The survivor of a duplicate pair is the
+        // track whose FIT knows more -- the smaller error volume |C| -- because that is what the pair
+        // is kept for; hit count only breaks a tie. Counting hits first hands every cross-arm pair to
+        // its longer stub-seeded member even when the shorter pixel-seeded one measures the particle
+        // better. Being total, the order names a unique loser, so drop[] needs no atomics.
         auto beats = [&](int32_t x, int32_t y) -> bool {
-          if (rankNHits != 0) {
-            const int nhx = ::reco::nHits(tracks_view, x), nhy = ::reco::nHits(tracks_view, y);
-            if (nhx != nhy)
-              return nhx > nhy;
-          } else if (rankClusters != 0) {
-            const int cx = lengthClusters(x), cy = lengthClusters(y);
-            if (cx != cy)
-              return cx > cy;
-          } else {
-            const int nlx = tracks_view[x].nLayers(), nly = tracks_view[y].nLayers();
-            if (nlx != nly)
-              return nlx > nly;
-            const int nhx = ::reco::nHits(tracks_view, x), nhy = ::reco::nHits(tracks_view, y);
-            if (nhx != nhy)
-              return nhx > nhy;
-          }
+          if (const int o = dedupInfoOrder(tracks_view, x, y); o != 0)
+            return o > 0;
+          const int cx = lengthClusters(x), cy = lengthClusters(y);
+          if (cx != cy)
+            return cx > cy;
           const auto qx = tracks_view[x].quality(), qy = tracks_view[y].quality();
           if (qx != qy)
             return qx > qy;
-          const float cx = tracks_view[x].chi2(), cy = tracks_view[y].chi2();
-          if (cx != cy)
-            return cx < cy;
+          const float c2x = tracks_view[x].chi2(), c2y = tracks_view[y].chi2();
+          if (c2x != c2y)
+            return c2x < c2y;
           return x < y;
         };
-        // does j beat i? Same order as beats(j, i), with the cross-arm corner guard spliced into the
-        // length-decided branch so a longer cross-arm track at large displacement cannot win on length alone.
         auto jBeatsI = [&](int32_t j) -> bool {
-          bool lenDiff = false, jLonger = false;
-          if (rankNHits != 0) {  // nHits-only length key; takes precedence over rankClusters
-            const int nhj = ::reco::nHits(tracks_view, j);
-            if (nhj != nhI) {
-              lenDiff = true;
-              jLonger = nhj > nhI;
-            }
-          } else if (rankClusters != 0) {
-            const int ci = lengthClusters(i), cj = lengthClusters(j);
-            if (ci != cj) {
-              lenDiff = true;
-              jLonger = cj > ci;
-            }
-          } else {
-            const int nlj = tracks_view[j].nLayers();
-            if (nlj != nlI) {
-              lenDiff = true;
-              jLonger = nlj > nlI;
-            } else {
-              const int nhj = ::reco::nHits(tracks_view, j);
-              if (nhj != nhI) {
-                lenDiff = true;
-                jLonger = nhj > nhI;
-              }
-            }
-          }
-          if (lenDiff) {
-            if (jLonger && guardCrossArm != 0 && crossArm(i, j) && vertPosMax(i, j) > guardVertPosMin) {
-              const auto qj = tracks_view[j].quality();
-              const float c2j = tracks_view[j].chi2();
-              const bool qualWins = (qj > qI) || (c2j + guardChi2Margin <= c2I);
-              if (!qualWins) {
-                if (diag)
-                  alpaka::atomicAdd(acc, &diag[17], 1u, alpaka::hierarchy::Blocks{});  // corner guard fired
-                return false;  // keep i: length alone does not win in the at-risk corner
-              }
-            }
-            return jLonger;
-          }
+          if (const int o = dedupInfoOrder(tracks_view, j, i); o != 0)
+            return o > 0;
+          const int cj = lengthClusters(j);
+          if (cj != nClI)
+            return cj > nClI;
           const auto qj = tracks_view[j].quality();
           if (qj != qI)
             return qj > qI;
@@ -2534,44 +2524,168 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
             return c2j < c2I;
           return j < i;
         };
-        // cov-scaled arm-invariant compatibility (all three parameters must pass). ns2 is the gate width:
-        // the shared-hit path passes nSigma2, the fallback path fbNSigma2; the arithmetic is identical.
-        auto compatible = [&](int32_t j, float ns2) -> bool {
-          for (int t = 0; t < 3; ++t) {
-            float dp = tracks_view[i].state()[cParam[t]] - tracks_view[j].state()[cParam[t]];
-            if (t == 0) {
-              while (dp > kTwinPi)
-                dp -= kTwinTwoPi;
-              while (dp < -kTwinPi)
-                dp += kTwinTwoPi;
-            }
-            const float e2 = ns2 * (tracks_view[i].covariance()[cCov[t]] + tracks_view[j].covariance()[cCov[t]]);
-            if (dp * dp > e2)
-              return false;
-          }
+        // The published rechits one track hit resolves to, in one key space: a pixel hit keys on its
+        // own id, an outer-tracker rechit on nPix + its row in the OT SoA. A stub publishes the two
+        // rechits it was built from, so it has two keys -- and that is why the shared count cannot be
+        // taken on track-hit ids: a stub and a raw-OT extra of the same cluster, or two stubs sharing
+        // a sensor hit, are different ids and the same published rechit, which is what the validation
+        // sees. k = 0, 1 selects the key; false means this hit has no k-th one. Without the stub view
+        // (the CA's own call) a stub keys on its id alone.
+        const uint32_t nPix = uint32_t(hh.metadata().size() > 0 ? hh.offsetStubs() : 0u);
+        const bool haveStubs = sv.metadata().size() > 0;
+        auto pubKey = [&](uint32_t id, int k, uint32_t &key) -> bool {
+          if (caExtension::isOTId(id))
+            return k == 0 && (key = nPix + caExtension::otIdx(id), true);
+          if (id < nPix || !haveStubs)
+            return k == 0 && (key = id, true);
+          const uint32_t st = id - nPix;
+          if (k == 0)
+            return (key = nPix + sv[int32_t(st)].lowerHitIdx(), true);
+          if (!isStub(sv, int32_t(st)))
+            return false;
+          key = nPix + sv[int32_t(st)].upperHitIdx();
           return true;
         };
-        // shared hit-id count between i and j (brute force; lists <= kTwinMaxMergedHits).
-        auto sharedCount = [&](int32_t j) -> int {
+        // Which of i's published rechits track j also holds, as a bit per rechit of i (brute force;
+        // lists <= kTwinMaxMergedHits, so at most 64 published rechits and one machine word). Bits are
+        // returned rather than a count so that several better tracks can be OR-ed together: the rule
+        // below is about the UNION of what i gives away, not about any single pair.
+        const bool haveOTHits = ov.metadata().size() > 0;
+        // Transverse radius of a published rechit, and whether it measures only one coordinate.
+        auto pubRadius2 = [&](uint32_t key) -> float {
+          float xg = 0.f, yg = 0.f;
+          if (key < nPix) {
+            xg = hh[int32_t(key)].xGlobal();
+            yg = hh[int32_t(key)].yGlobal();
+          } else if (haveOTHits && int32_t(key - nPix) < ov.metadata().size()) {
+            xg = ov[int32_t(key - nPix)].xGlobal();
+            yg = ov[int32_t(key - nPix)].yGlobal();
+          }
+          return xg * xg + yg * yg;
+        };
+        auto isStripRechit = [&](uint32_t key) -> bool {
+          return haveOTHits && key >= nPix && int32_t(key - nPix) < ov.metadata().size() &&
+                 ov[int32_t(key - nPix)].yerrLocal() > kStripYVarMin;
+        };
+        // The published rechit a track reaches first, by transverse radius, and its slot in i's own
+        // numbering. This is the hit the share convention forgives when two tracks have the same one.
+        auto innermostKey = [&](int32_t t, int &slotOut) -> uint32_t {
+          const uint32_t tBeg = (t == 0) ? 0u : tracks_view[t - 1].hitOffsets();
+          const uint32_t tEnd = tracks_view[t].hitOffsets();
+          uint32_t best = 0xffffffffu;
+          float bestR2 = 1e30f;
+          int slot = 0;
+          slotOut = -1;
+          for (uint32_t a = tBeg; a < tEnd; ++a)
+            for (int ka = 0; ka < 2; ++ka) {
+              uint32_t key;
+              if (!pubKey(trackHit_view[a].id(), ka, key))
+                continue;
+              const float r2 = pubRadius2(key);
+              if (r2 < bestR2) {
+                bestR2 = r2;
+                best = key;
+                slotOut = slot;
+              }
+              ++slot;
+            }
+          return best;
+        };
+        int innerSlotI = -1;
+        const uint32_t innerKeyI = innermostKey(i, innerSlotI);
+        // Where a track is along the beam line at a transverse radius, and how well that is known.
+        // z(r) = zip + r cot(theta) from the perigee state; the arc-length correction to r is second
+        // order in the curvature and is common to two tracks that could be the same particle, so it
+        // cancels from the difference this is used for. The variance is the (zip, cotTheta) block of
+        // the perigee covariance, correlation included.
+        constexpr int kCovZipZip = 14, kCovCotZip = 13;
+        auto zAtR = [&](int32_t t, float r, float &z, float &var) {
+          z = tracks_view[t].state()[4] + r * tracks_view[t].state()[3];
+          var = tracks_view[t].covariance()[kCovZipZip] + r * r * tracks_view[t].covariance()[kCovCotCot] +
+                2.f * r * tracks_view[t].covariance()[kCovCotZip];
+        };
+        // Two tracks holding the same strip rechit are not thereby placed together: the strip measures
+        // one coordinate and leaves the other free over its whole 5 cm support, which is wider than a
+        // jet core is at the outer tracker. The strip is evidence that they are one track only if they
+        // are also unresolved along it. When their own fits put them apart there at the same 5-sigma
+        // rejection the duplicate test uses -- one degree of freedom, because one coordinate is at
+        // stake -- the shared strip is one measurement handed to two trajectories, not two tracks of
+        // one particle. A covariance that cannot be read resolves nothing, so the rechit counts.
+        auto resolvedAlongStrip = [&](int32_t j, float r) -> bool {
+          float zi, vi, zj, vj;
+          zAtR(i, r, zi, vi);
+          zAtR(j, r, zj, vj);
+          const float v = vi + vj;
+          if (!(v > 0.f))
+            return false;
+          const float d = zi - zj;
+          return d * d > float(extDerivedTables::kDedupRejectChi2_1) * v;
+        };
+        auto sharedPublishedMask = [&](int32_t j) -> uint64_t {
           const uint32_t jBeg = (j == 0) ? 0u : tracks_view[j - 1].hitOffsets();
           const uint32_t jEnd = tracks_view[j].hitOffsets();
-          int s = 0;
-          for (uint32_t a = iBeg; a < iEnd; ++a) {
-            const uint32_t ida = trackHit_view[a].id();
-            for (uint32_t b = jBeg; b < jEnd; ++b)
-              if (trackHit_view[b].id() == ida) {
-                ++s;
-                break;
-              }
-          }
-          return s;
+          uint64_t m = 0;
+          int slot = 0;
+          for (uint32_t a = iBeg; a < iEnd; ++a)
+            for (int ka = 0; ka < 2; ++ka) {
+              uint32_t keyA;
+              if (!pubKey(trackHit_view[a].id(), ka, keyA))
+                continue;
+              if (slot >= 64)
+                return m;  // structurally unreachable at this cap; never write outside the word
+              for (uint32_t b = jBeg; b < jEnd; ++b)
+                for (int kb = 0; kb < 2; ++kb) {
+                  uint32_t keyB;
+                  if (pubKey(trackHit_view[b].id(), kb, keyB) && keyB == keyA) {
+                    if (!isStripRechit(keyA) || !resolvedAlongStrip(j, std::sqrt(pubRadius2(keyA))))
+                      m |= uint64_t(1) << slot;
+                    b = jEnd;  // this published rechit of i is matched; go to the next one
+                    break;
+                  }
+                }
+              ++slot;
+            }
+          return m;
         };
+        auto popcount64 = [](uint64_t m) -> int {
+          int c = 0;
+          while (m) {
+            m &= m - 1;
+            ++c;
+          }
+          return c;
+        };
+        // Do the two lists share a track-hit id? That is what the co-occurrence histogram pairs on, so
+        // it is the line between its candidates and the neighbourhood sweep's.
+        auto sharesAnId = [&](int32_t j) -> bool {
+          const uint32_t jBeg = (j == 0) ? 0u : tracks_view[j - 1].hitOffsets();
+          const uint32_t jEnd = tracks_view[j].hitOffsets();
+          for (uint32_t a = iBeg; a < iEnd; ++a)
+            for (uint32_t b = jBeg; b < jEnd; ++b)
+              if (trackHit_view[b].id() == trackHit_view[a].id())
+                return true;
+          return false;
+        };
+        // Gives too much away to be a track of its own: more than ShareFrac of i's own published
+        // rechits sit on SOME better track. The test is on the union over all better tracks and not
+        // pair by pair: a track that hands a fifth of itself to one better track and another fifth to
+        // a second is just as much a duplicate as one that hands two fifths to either alone.
+        // The rechit both tracks reach first is taken out of both sides, as the share convention does.
+        // In a jet core that is the one a pair of real tracks is most likely to share: they are closest
+        // to each other on the layer they are first seen on, and one cluster there serves both.
+        const float shareLimit = kDedupShareFrac * float(nClI);
+        const float shareLimitFirstShared = kDedupShareFrac * float(nClI - 1);
 
-        // shared-hit path: co-occurring candidates from the hit histogram
+        const bool inDropRegion = (etaI <= dropAbsEtaMax) && (etaI >= -dropAbsEtaMax);
         bool loser = false;
-        bool sawGateMiss = false;  // a better co-occurring partner exists but the cov gate rejected the pair
-        int32_t bestPartner = -1;  // highest-ranked matched-and-better partner, for the diagnostics
-        for (uint32_t a = iBeg; a < iEnd; ++a) {
+        bool firstShared = false;
+        bool sawShareMiss = false;
+        int32_t bestPartner = -1;
+
+        // shared-hit path: co-occurring candidates from the hit histogram. Every better co-occurring
+        // track contributes its bits to one union mask; i loses when that union passes the fraction.
+        uint64_t givenAway = 0;
+        for (uint32_t a = iBeg; a < iEnd && !loser; ++a) {
           const uint32_t key = hitToTupleKey(trackHit_view[a].id(), nHits);
           if (key >= nKeys)
             continue;  // guarded (already counted in overflow during the build)
@@ -2580,49 +2694,41 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
             if (j == i)
               continue;
             if (!jBeatsI(j))
-              continue;                     // only a better member can make i the loser
-            if (!compatible(j, nSigma2)) {  // shared-hit path: the shared cov-gate width
-              sawGateMiss = true;
               continue;
-            }
-            loser = true;
+            const uint64_t mj = sharedPublishedMask(j);
+            if (mj == 0)
+              continue;
+            givenAway |= mj;
             if (bestPartner < 0 || beats(j, bestPartner))
               bestPartner = j;
+            if (innerSlotI >= 0 && innerSlotI < 64 && innerKeyI != 0xffffffffu) {
+              int innerSlotJ = -1;
+              if (innermostKey(j, innerSlotJ) == innerKeyI)
+                firstShared = true;
+            }
+            const int nGiven =
+                popcount64(givenAway) - ((firstShared && ((givenAway >> innerSlotI) & uint64_t(1))) ? 1 : 0);
+            if (nClI > 0 && float(nGiven) > (firstShared ? shareLimitFirstShared : shareLimit)) {
+              loser = true;
+              break;
+            }
           }
         }
-        if (loser) {
-          drop[i] = 1;
-          if (diag) {
-            const int shared = sharedCount(bestPartner);  // >=1 by construction (co-occurrence)
-            const bool fwd =
-                (std::abs(etaI) > kDedupFwdEta) || (std::abs(tracks_view[bestPartner].eta()) > kDedupFwdEta);
-            const int region = fwd ? 1 : 0;
-            const int bucket = (shared <= 0) ? 0 : (shared == 1 ? 1 : 2);
-            alpaka::atomicAdd(acc, &diag[region * 3 + bucket], 1u, alpaka::hierarchy::Blocks{});
-            alpaka::atomicAdd(acc, &diag[6 + region], 1u, alpaka::hierarchy::Blocks{});
-          }
-          continue;  // shared path owns this track; skip the fallback
-        }
-        // Diagnostic: this track survived the shared path only because the cov gate rejected every better
-        // co-occurring partner. Counted per track, region by the track's own eta. Slots 8/9 = central/forward.
-        if (diag && sawGateMiss) {
-          const int missRegion = (std::abs(etaI) > kDedupFwdEta) ? 1 : 0;
-          alpaka::atomicAdd(acc, &diag[8 + missRegion], 1u, alpaka::hierarchy::Blocks{});
-        }
-
-        // 0-shared forward fallback, active when the eta-phi binner is present
-        if (etaPhiAssoc != nullptr) {
+        if (!loser && givenAway != 0)
+          sawShareMiss = true;  // better partners exist, their union stayed under the shared fraction
+        // 0-shared neighbourhood sweep: an id-disjoint twin co-occurs in no hit bucket at all, so the
+        // histogram above can never pair it. The two paths partition the candidates -- this one judges
+        // only pairs that share nothing -- so it runs whenever the binner is there.
+        if (!loser && etaPhiAssoc != nullptr) {
           const float phiI = ::reco::phi(tracks_view, i);
           const int pb = trackBinKey(0.f, phiI, kDedupFbPhiBins, 1, 0.f);
           const int eb =
               (trackBinKey(etaI, phiI, kDedupFbPhiBins, kDedupFbEtaSlabs, kDedupFbEtaMax) - pb) / kDedupFbPhiBins;
-          bool fbLoser = false;
-          int32_t fbPartner = -1;
-          for (int de = -fbEtaReach; de <= fbEtaReach; ++de) {
+          for (int de = -fbEtaReach; de <= fbEtaReach && !loser; ++de) {
             const int e = eb + de;
             if (e < 0 || e >= kDedupFbEtaSlabs)
               continue;
-            for (int dp2 = -fbPhiReach; dp2 <= fbPhiReach; ++dp2) {
+            for (int dp2 = -fbPhiReach; dp2 <= fbPhiReach && !loser; ++dp2) {
               const int b = (pb + dp2 + kDedupFbPhiBins) % kDedupFbPhiBins;
               const uint32_t bin = uint32_t(e * kDedupFbPhiBins + b);
               for (auto p = etaPhiAssoc->begin(bin); p != etaPhiAssoc->end(bin); ++p) {
@@ -2631,83 +2737,33 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
                   continue;
                 if (!jBeatsI(j))
                   continue;
-                if (!compatible(j, fbNSigma2))  // fallback path: fallback-only cov-gate width
+                if (!dedupCompatible(tracks_view, i, j, 5, qGate5))
                   continue;
-                if (sharedCount(j) != 0)
-                  continue;  // shared>=1 is the co-occurrence path's job; fallback is 0-shared only
-                fbLoser = true;
-                if (fbPartner < 0 || beats(j, fbPartner))
-                  fbPartner = j;
+                if (sharesAnId(j))
+                  continue;  // pairs the histogram already pairs belong to the path above
+                loser = true;
+                if (bestPartner < 0 || beats(j, bestPartner))
+                  bestPartner = j;
               }
             }
           }
-          if (fbLoser) {
-            // Drop authority bounded to |eta| <= fbDropAbsEtaMax (the runtime image of
-            // kDedupFbDropAbsEtaMax), which keeps the fallback out of the far-forward region where it costs
-            // efficiency. fbEnable == 0 disables the drop authority; in both cases the candidate is still
-            // counted in diag but never dropped.
-            const bool inDropRegion = (etaI <= fbDropAbsEtaMax) && (etaI >= -fbDropAbsEtaMax);
-            const bool legacyDrop = inDropRegion && (fbEnable != 0);
-            // capture-for-confirm: with fbConfirm on, a droppable pair is deferred to the union-refit
-            // verdict instead of dropped here, unless a pre-gate below rejects it outright (kept both,
-            // diag-counted). With fbConfirm == 0 the whole block is skipped.
-            bool captured = false;
-            if (fbConfirm != 0 && contestedPairs != nullptr && legacyDrop) {
-              bool preGateOk = true;
-              // (a) same-charge requirement (charge = sign of signed q/pT = state()[2]).
-              if (fbSameCharge != 0) {
-                const float qi = tracks_view[i].state()[2];
-                const float qj = tracks_view[fbPartner].state()[2];
-                if ((qi >= 0.f) != (qj >= 0.f))
-                  preGateOk = false;
-              }
-              // (b) absolute-floor box cuts on {|dphi| (wrapped), |d q/pT|, |d cotTheta|}; the sentinel
-              // defaults never fire. They catch a large absolute gap passing the shared-cov Mahalanobis gate.
-              if (preGateOk) {
-                float dphi = tracks_view[i].state()[0] - tracks_view[fbPartner].state()[0];
-                while (dphi > kTwinPi)
-                  dphi -= kTwinTwoPi;
-                while (dphi < -kTwinPi)
-                  dphi += kTwinTwoPi;
-                const float dqop = tracks_view[i].state()[2] - tracks_view[fbPartner].state()[2];
-                const float dcot = tracks_view[i].state()[3] - tracks_view[fbPartner].state()[3];
-                if (std::abs(dphi) > fbAbsFloorDPhi || std::abs(dqop) > fbAbsFloorDQoP ||
-                    std::abs(dcot) > fbAbsFloorDCotTheta)
-                  preGateOk = false;
-              }
-              if (preGateOk) {
-                const uint32_t slot = alpaka::atomicAdd(acc, contestedCount, 1u, alpaka::hierarchy::Blocks{});
-                if (slot < contestedCap) {
-                  contestedPairs[2u * slot + 0u] = uint32_t(i);
-                  contestedPairs[2u * slot + 1u] = uint32_t(fbPartner);
-                  captured = true;
-                  if (diag)
-                    alpaka::atomicAdd(acc, &diag[10], 1u, alpaka::hierarchy::Blocks{});  // contested captured
-                } else if (contestedOverflow != nullptr) {
-                  // list full: pair is kept both (safe) and surfaced via LogWarning by the launcher.
-                  alpaka::atomicAdd(acc, contestedOverflow, 1u, alpaka::hierarchy::Blocks{});
-                }
-              } else if (diag) {
-                alpaka::atomicAdd(acc, &diag[11], 1u, alpaka::hierarchy::Blocks{});  // pre-gate rejected (kept both)
-              }
-            }
-            // Immediate drop authority: with fbConfirm == 0 this is exactly legacyDrop; with fbConfirm != 0
-            // no pair drops here, confirmed drops being applied later by the verdict kernel.
-            (void)captured;
-            // Finder mode (fbFinderOnly) scans and diag-counts but drops nothing, with its own bucket [16].
-            const bool dropping = legacyDrop && (fbConfirm == 0) && (fbFinderOnly == 0);
-            if (dropping)
-              drop[i] = 1;  // out-of-bound / fallback-disabled / finder-mode candidates count but do not drop
-            if (diag) {
-              const bool fwd =
-                  (std::abs(etaI) > kDedupFwdEta) || (std::abs(tracks_view[fbPartner].eta()) > kDedupFwdEta);
-              const int region = fwd ? 1 : 0;
-              alpaka::atomicAdd(acc, &diag[region * 3 + 0], 1u, alpaka::hierarchy::Blocks{});  // bucket 0 = 0-shared
-              if (dropping)  // totals = ACTUAL drops only
-                alpaka::atomicAdd(acc, &diag[6 + region], 1u, alpaka::hierarchy::Blocks{});
-              if (fbFinderOnly != 0 && legacyDrop)  // finder mode suppressed a drop this pair would take
-                alpaka::atomicAdd(acc, &diag[16], 1u, alpaka::hierarchy::Blocks{});
-            }
+        }
+
+        const uint8_t now = (loser && inDropRegion) ? uint8_t(1) : uint8_t(0);
+        drop[i] = now;
+        if (diag) {
+          if (now) {
+            const bool fwd =
+                (std::abs(etaI) > kDedupFwdEta) || (std::abs(tracks_view[bestPartner].eta()) > kDedupFwdEta);
+            const int region = fwd ? 1 : 0;
+            const int shared = popcount64(givenAway);
+            const int bucket = (shared <= 0) ? 0 : (shared == 1 ? 1 : 2);
+            alpaka::atomicAdd(acc, &diag[region * 3 + bucket], 1u, alpaka::hierarchy::Blocks{});
+            alpaka::atomicAdd(acc, &diag[6 + region], 1u, alpaka::hierarchy::Blocks{});
+          } else if (sawShareMiss) {
+            // Survived only because every better co-occurring partner stayed under the shared fraction.
+            const int missRegion = (std::abs(etaI) > kDedupFwdEta) ? 1 : 0;
+            alpaka::atomicAdd(acc, &diag[8 + missRegion], 1u, alpaka::hierarchy::Blocks{});
           }
         }
       }
@@ -3151,9 +3207,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
 
           // For Phase2OTStubs: several stubs sharing a lowerHitIdx have different hit indices but stand for
           // the same physical measurement, so for cleaning purposes they count as the same shared hit.
-          // PS only: a 2S stub now carries its lower cluster id as well, but merging 2S stubs here kills
-          // short tracks whose long partner does not replace them -- measured, 4.5 points of prompt barrel
-          // efficiency on ttbar PU200. The rule stays where it was tuned until it is retuned.
+          // The merge is applied to PS stacks only: a 2S stub carries a lower cluster id as well, but
+          // merging 2S stubs here kills short tracks whose long partner does not replace them -- measured,
+          // 4.5 points of prompt barrel efficiency on ttbar PU200.
           if constexpr (std::is_same_v<pixelTopology::Phase2OTStubs, TrackerTraits>) {
             if (h < static_cast<uint32_t>(hh.size()) && isStub(hh, h) &&
                 ::reco::StubFlags::isPS(hh.stub(int32_t(h)).flags())) {
@@ -3582,6 +3638,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
 #include "CAFishbone.h"
 #include "CAHitNtupletGeneratorKernels.h"
 #include "HelixFit.h"
+#include "ExtDerivedTables.h"  // the analytic chi2 quantile the duplicate test is taken at
 
 //#define GPU_DEBUG
 // #define NTUPLE_DEBUG
@@ -5469,15 +5526,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                   const ::reco::TrackSoAConstView &inpTrack_view,
                                                   const ::reco::TrackHitSoAConstView &inpTrackHit_view,
                                                   const pixelTrack::Quality minQuality,
-                                                  const double matchFraction,
                                                   Queue &queue,
                                                   const int32_t *loserOf,
                                                   const int32_t *isLoser,
                                                   const bool twinMergeRefit,
                                                   const bool refitAllTracks,
-                                                  int32_t *unitedMaskOut,
-                                                  const uint8_t *pocketArmIn,
-                                                  uint8_t *pocketArmIdOut) {
+                                                  int32_t *unitedMaskOut) {
     using namespace caHitNtupletGeneratorKernels;
 
 #ifdef GPU_DEBUG
@@ -5507,7 +5561,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                           inpTrack_view,
                           inpTrackHit_view,
                           minQuality,
-                          matchFraction,
                           loserOf,
                           isLoser,
                           keep.data(),
@@ -5531,9 +5584,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                           outHitCnt.data(),
                           tkOff.data(),
                           hitOff.data(),
-                          nIn,
-                          pocketArmIn,
-                          pocketArmIdOut);
+                          nIn);
     }
 #ifdef GPU_DEBUG
     alpaka::wait(queue);
@@ -5544,14 +5595,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   void CAHitMaskingAndMergerKernels::twinMerge(const ::reco::TrackSoAConstView &inpTrack_view,
                                                const ::reco::TrackHitSoAConstView &inpTrackHit_view,
                                                const int32_t *armOfTrack,
-                                               const float twinDEta,
-                                               const float twinDPhi,
-                                               const int twinMinShared,
-                                               const bool twinTier2,
-                                               const float twinDEta2,
-                                               const float twinDPhi2,
-                                               const float twinNSigma2,
-                                               const int twinMinSharedFwd,
+                                               const float qGate3,
                                                const pixelTrack::Quality minQuality,
                                                int32_t *bestTwin,
                                                int32_t *loserOf,
@@ -5568,14 +5612,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     const int blocks = cms::alpakatools::divide_up_by(nTracks, threadsPerBlock);
     const auto workDiv1D = cms::alpakatools::make_workdiv<Acc1D>(blocks, threadsPerBlock);
 
-    // phi -> track pre-filter binner over this collection, so twinFindBest visits only the phi bins
-    // overlapping the twinDPhi window instead of all N tracks; the kernel's whole-ring guard makes it
-    // equivalent to an exhaustive scan, and the trackBinKey clamp keeps every key in [0,kTwinPhiBins)
-    // so the binner cannot overflow. nItems = -1 makes the binner iterate the device-side nTracks()
-    // instead of the capacity, so the tail, whose eta/phi are uninitialised, is never binned; a
-    // candidate there would be rejected at Kernel_twinFindBest's quality gate anyway.
+    // (eta, phi) -> track pre-filter binner over this collection, so twinFindBest visits only the bins
+    // overlapping the gate-derived phi AND eta windows instead of all N tracks; a twin has this track's
+    // eta to within its own sigma, which is the cheapest cut there is. The trackBinKey clamp keeps
+    // every key in range so the binner cannot overflow. nItems = -1 makes the binner iterate the
+    // device-side nTracks() instead of the capacity, so the tail, whose eta/phi are uninitialised, is
+    // never binned; a candidate there would be rejected at Kernel_twinFindBest's quality gate anyway.
     const int32_t nBin = int32_t(inpTrack_view.metadata().size());
-    const uint32_t nKeys = uint32_t(kTwinPhiBins);
+    const uint32_t nKeys = uint32_t(kTwinPhiBins * kTwinEtaSlabs);
     auto phiBinnerBuf = cms::alpakatools::make_device_buffer<GenericContainer>(queue);
     auto phiOffBuf = cms::alpakatools::make_device_buffer<GenericContainerOffsets[]>(queue, nKeys + 1);
     auto phiStoreBuf = cms::alpakatools::make_device_buffer<GenericContainerStorage[]>(queue, uint32_t(nBin));
@@ -5590,8 +5634,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         int32_t(-1),
                         phiBinnerBuf.data(),
                         kTwinPhiBins,
-                        1,
-                        0.f,
+                        kTwinEtaSlabs,
+                        kTwinEtaMax,
                         nKeys,
                         phiOvf.data());
     finalizeAssocOffsets(view, queue);
@@ -5602,8 +5646,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         int32_t(-1),
                         phiBinnerBuf.data(),
                         kTwinPhiBins,
-                        1,
-                        0.f,
+                        kTwinEtaSlabs,
+                        kTwinEtaMax,
                         nKeys,
                         phiOvf.data());
 
@@ -5614,16 +5658,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         inpTrackHit_view,
                         armOfTrack,
                         minQuality,
-                        twinDEta,
-                        twinDPhi,
-                        twinMinShared,
-                        twinTier2,
-                        twinDEta2,
-                        twinDPhi2,
-                        twinNSigma2,
-                        twinMinSharedFwd,
+                        qGate3,
                         phiBinnerBuf.data(),
                         kTwinPhiBins,
+                        kTwinEtaSlabs,
+                        kTwinEtaMax,
                         bestTwin);
     // twinFindBest and twinConfirm cannot be fused: twinConfirm thread i reads bestTwin[j] with
     // j = bestTwin[i], an arbitrary opposite-arm track index, so it needs the whole bestTwin[]
@@ -5719,20 +5758,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         nFbKeys,
                         ovf.data());
 
-    // Cov-gate width and fallback neighbourhood reach, as passed to the dedup kernels:
-    //   s_scanNSigma2     = kDedupNSigma2Default (25) -> shared-hit-path cov-gate width, and the
-    //                       default for the fallback gate unless mergerFbNSigma2 overrides it.
-    //   s_scanFbEtaReach  = 1 -> fallback eta-slab reach de in [-r, r]; the loop's own slab-range
-    //                       clamp is the real bound, so the guard below only rejects absurd values.
-    //   s_scanFbPhiReach  = 1 -> fallback phi-bin reach dp2 in [-r, r], wrap kept; 2r+1 <=
-    //                       kDedupFbPhiBins so the wrapped window visits each bin at most once.
-    // The three are held runtime-opaque on purpose: they reach the kernels as arguments, and
-    // constant-folding them on a single-TU backend would unroll the neighbourhood walk into
-    // compile-time bounds, changing the float accumulation order. Do not make them constexpr.
-    static const float s_scanNSigma2 = [] {
-      volatile float v = kDedupNSigma2Default;
-      return float(v);
-    }();
+    // Fallback neighbourhood reach, as passed to the dedup kernel: s_scanFbEtaReach = 1 (eta-slab reach de in
+    // [-r, r]) and s_scanFbPhiReach = 1 (phi-bin reach dp2 in [-r, r], wrap kept; 2r+1 <= kDedupFbPhiBins).
+    // Both are kept runtime-opaque on purpose: constant-folding them on a single-TU backend would unroll the
+    // neighbourhood walk and change the float accumulation order. Do not make them constexpr.
     static const int s_scanFbEtaReach = [] {
       volatile int v = 1;
       int r = v;
@@ -5751,58 +5780,23 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         r = kDedupFbPhiBins / 2;
       return r;
     }();
-    // Fallback-dedup parameters come straight from the merger's confirm struct (or the compile-time
-    // defaults when no struct is passed). Plain values only: no NaN/-1 sentinel selection, which is
-    // not portable across the backends' translation units.
-    const bool fbConfirmOn = (confirm != nullptr) && confirm->enable;
-    const int fbDelta = (confirm != nullptr) ? confirm->delta : 1;
-    const float fbNSigma2 = (confirm != nullptr && confirm->fbNSigma2 > 0.f) ? confirm->fbNSigma2 : s_scanNSigma2;
-    const float fbDropBound = (confirm != nullptr) ? confirm->fbDropBound : kDedupFbDropAbsEtaMax;
-    const int fbEnable = (confirm != nullptr) ? (confirm->fbEnable ? 1 : 0) : 1;
-    const int fbSameCharge = (confirm != nullptr) ? (confirm->fbSameCharge ? 1 : 0) : 0;
-    const float fbAbsFloorDPhi = (confirm != nullptr) ? confirm->fbAbsFloorDPhi : 1.e30f;
-    const float fbAbsFloorDQoP = (confirm != nullptr) ? confirm->fbAbsFloorDQoP : 1.e30f;
-    const float fbAbsFloorDCot = (confirm != nullptr) ? confirm->fbAbsFloorDCot : 1.e30f;
-    // finderOnly needs no hit view; rankClusters/guardCrossArm are force-off unless a valid hit view
-    // is available (confirm present).
-    const int fbFinderOnly = (confirm != nullptr && confirm->finderOnly) ? 1 : 0;
-    const int rankClustersReq = (confirm != nullptr && confirm->rankClusters) ? 1 : 0;
-    // nHits-only ranking. Gated like rankClusters (confirm-present) for a uniform pattern, though
-    // nHits reads only the track SoA (::reco::nHits) and never dereferences the hit view.
-    const int rankNHitsReq = (confirm != nullptr && confirm->rankNHits) ? 1 : 0;
-    const int guardCrossArmReq = (confirm != nullptr && confirm->guardCrossArm) ? 1 : 0;
-    const int fbRankClusters = (confirm != nullptr) ? rankClustersReq : 0;
-    const int fbRankNHits = (confirm != nullptr) ? rankNHitsReq : 0;
-    const int fbGuardCrossArm = (confirm != nullptr) ? guardCrossArmReq : 0;
-    const float fbGuardVertPosMin = (confirm != nullptr) ? confirm->guardVertPosMin : 1.0f;
-    const float fbGuardChi2Margin = (confirm != nullptr) ? confirm->guardChi2Margin : 0.0f;
-    // Hit view for the cluster count / pixel-core arm proxy: the confirm struct's hv (empty when absent;
-    // never dereferenced then, since rankClusters/guardCrossArm are forced off).
+    // The duplicate criterion and its |eta| reach come from the merger; without a confirm struct the
+    // compile-time defaults apply. The compatibility threshold is not a cfi number: two tracks are
+    // kept apart only when their five fitted parameters disagree at 5 sigma (ExtDerivedTables.h).
+    const float qGate5 = float(extDerivedTables::kDedupRejectChi2_5);
+    const float fbDropBound = (confirm != nullptr) ? confirm->dropAbsEtaMax : kDedupFbDropAbsEtaMax;
+    // Hit and stub views for the length and shared counts: the confirm struct's (empty when absent,
+    // which makes a stub count as one published rechit keyed on its own id).
     const ::reco::TrackingRecHitConstView dedupHitView =
         (confirm != nullptr) ? confirm->hv : ::reco::TrackingRecHitConstView{};
+    const ::reco::StubsConstView dedupStubView = (confirm != nullptr) ? confirm->sv : ::reco::StubsConstView{};
+    // The raw outer-tracker rechits, for the sensor kind and the position of a shared published rechit.
+    const ::reco::OTRecHitsConstView dedupOTView = (confirm != nullptr) ? confirm->ov : ::reco::OTRecHitsConstView{};
 
-    // Contested-pair list, allocated only when confirm is on. Two uint32 per slot {i,j}, slots default
-    // to 0xffffffff (unfilled); contestedCount is the atomic append cursor and contestedOverflow
-    // counts the pairs that did not fit, which are kept both.
-    std::optional<cms::alpakatools::device_buffer<Device, uint32_t[]>> contestedPairsBuf;
-    std::optional<cms::alpakatools::device_buffer<Device, uint32_t[]>> contestedCountBuf;
-    std::optional<cms::alpakatools::device_buffer<Device, uint32_t[]>> contestedOvfBuf;
-    uint32_t *contestedPairsPtr = nullptr;
-    uint32_t *contestedCountPtr = nullptr;
-    uint32_t *contestedOvfPtr = nullptr;
-    const uint32_t contestedCap = fbConfirmOn ? kDedupConfirmMaxPairs : 0u;
-    if (fbConfirmOn) {
-      contestedPairsBuf.emplace(cms::alpakatools::make_device_buffer<uint32_t[]>(queue, 2u * contestedCap));
-      contestedCountBuf.emplace(cms::alpakatools::make_device_buffer<uint32_t[]>(queue, 1));
-      contestedOvfBuf.emplace(cms::alpakatools::make_device_buffer<uint32_t[]>(queue, 1));
-      alpaka::memset(queue, *contestedPairsBuf, 0xff);  // 0xffffffff -> unfilled slot tag
-      alpaka::memset(queue, *contestedCountBuf, 0);
-      alpaka::memset(queue, *contestedOvfBuf, 0);
-      contestedPairsPtr = contestedPairsBuf->data();
-      contestedCountPtr = contestedCountBuf->data();
-      contestedOvfPtr = contestedOvfBuf->data();
-    }
-
+    // One pass: a track is a loser as soon as some better partner is compatible with it. That is a
+    // statement about the pair alone, so it needs no iteration and does not depend on whether the
+    // killer is itself someone else's loser. The order is a strict total order, so the best member of
+    // every duplicate group always survives.
     alpaka::exec<Acc1D>(queue,
                         markDiv,
                         Kernel_dedupCovMark{},
@@ -5814,59 +5808,20 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         nKeys,
                         drop.data(),
                         diagPtr,
-                        s_scanNSigma2,
+                        qGate5,
+                        fbDropBound,
                         s_scanFbEtaReach,
                         s_scanFbPhiReach,
-                        fbNSigma2,
-                        fbDropBound,
-                        fbEnable,
-                        // merge-or-keep-both capture; with these off the fallback drops directly:
-                        fbConfirmOn ? 1 : 0,
-                        fbSameCharge,
-                        fbAbsFloorDPhi,
-                        fbAbsFloorDQoP,
-                        fbAbsFloorDCot,
-                        contestedPairsPtr,
-                        contestedCountPtr,
-                        contestedCap,
-                        contestedOvfPtr,
-                        // Dedup ranking and guard parameters:
                         dedupHitView,
-                        fbFinderOnly,
-                        fbRankClusters,
-                        fbRankNHits,
-                        fbGuardCrossArm,
-                        fbGuardVertPosMin,
-                        fbGuardChi2Margin);
+                        dedupStubView,
+                        dedupOTView);
 
     // Surface any count-and-clamp overflow; never fatal, since clamped writes were skipped and
     // unregistered contested pairs are kept both. The two counters are consumed on device by a
     // one-thread reporter kernel: reading them back would serialize the host against everything
     // queued ahead of the copy, for a diagnostic.
     const auto reportDiv = cms::alpakatools::make_workdiv<Acc1D>(1, 1);
-    alpaka::exec<Acc1D>(queue, reportDiv, Kernel_dedupOverflowReport{}, ovf.data(), contestedOvfPtr);
-
-    // Union refit and verdict: build the de-duplicated unions of the captured contested pairs, GBL-refit
-    // them and adjust drop[] (keep-both leaves drop[i] == 0) before the compaction consumes drop[].
-    // Runs only when the confirm is on.
-    if (fbConfirmOn) {
-      HelixFit<pixelTopology::Phase2OTStubs> fitter(confirm->bfield);
-      fitter.setMaterialMap(confirm->rhoMap);
-      fitter.setBFieldMap(confirm->bFieldMap);  // (Bz,Br) r-z map; null => the scalar bfield
-      fitter.setBField(confirm->bfield);
-      fitter.setOutlierReject(true);  // observe the GBL single-hard outlier drop -> the delta measure
-      fitter.refitDedupUnions(confirm->hv,
-                              confirm->cm,
-                              tracks_view,
-                              trackHit_view,
-                              contestedPairsPtr,
-                              contestedCap,
-                              confirm->otSource,
-                              drop.data(),
-                              fbDelta,
-                              diagPtr,
-                              queue);
-    }
+    alpaka::exec<Acc1D>(queue, reportDiv, Kernel_dedupOverflowReport{}, ovf.data(), nullptr);
 
     // Parallel Counts -> prefix-sum -> Scatter compaction. WHICH tracks are dropped is decided in
     // Kernel_dedupCovMark.

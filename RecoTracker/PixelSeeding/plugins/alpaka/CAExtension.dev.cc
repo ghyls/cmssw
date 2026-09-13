@@ -26,11 +26,13 @@
 #include "HeterogeneousCore/AlpakaInterface/interface/workdivision.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/HistoContainer.h"
 #include "RecoTracker/PixelTrackFitting/interface/alpaka/BrokenLine.h"
+#include "RecoTracker/PixelTrackFitting/interface/BLBFieldMap.h"  // per-segment B_bend along the road
 
 #include "HeterogeneousCore/AlpakaInterface/interface/prefixScan.h"
 
 #include "CAExtensionKernels.h"
 #include "CAFitHitSelection.h"
+#include "ExtDerivedTables.h"  // the analytic chi2 quantiles of the gate
 #include "ExtenderHelixHelpers.h"
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
@@ -62,43 +64,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 "kExtFindLanes must be a power of two: the shared-memory reduces halve the stride");
   static_assert(kExtFindLanes <= 256u, "kExtFindLanes > 256 overflows the serial backend's 47 KiB block shared arena");
 
-  // Highland multiple-scattering variance over the (r0,z0)->(r1,z1) segment.
-  template <typename TAcc>
-  ALPAKA_FN_ACC ALPAKA_FN_INLINE float multScattVar(TAcc const& acc,
-                                                    float bf,
-                                                    HelixState const& h,
-                                                    float arcS,
-                                                    const float* rho,
-                                                    float r0,
-                                                    float z0,
-                                                    float r1,
-                                                    float z1) {
-    constexpr float kMeVToGeV = 13.6e-3f;
-    const float absRho = alpaka::math::abs(acc, h.rho);
-    float pT = bf * absRho;
-    pT = alpaka::math::min(acc, 20.f, pT);
-    const float pT2 = pT * pT;
-    const float slope2 = h.cotTheta * h.cotTheta;
-    float ll;
-    float factor;
-    if (rho != nullptr) {
-      ll = float(brokenline::segmentXX0(acc, rho, double(r0), double(z0), double(r1), double(z1)));
-      factor = kMeVToGeV * kMeVToGeV;  // full Highland (geometry factor 1)
-    } else {
-      constexpr float inv_X0 = 0.06f / 16.f;  // constant-density fallback when no material map is given
-      ll = alpaka::math::abs(acc, arcS) * inv_X0;
-      factor = 0.7f * kMeVToGeV * kMeVToGeV;
-    }
-    if (ll < 1e-9f)
-      return 0.f;
-    const float logTerm = 1.f + 0.038f * alpaka::math::log(acc, ll);
-    return factor / (pT2 * (1.f + slope2)) * ll * logTerm * logTerm;
-  }
-
-  // Derived road model, inert unless extDerivedSelection. The Highland coefficient per unit X/X0, in
-  // the same theta0 form the fast BL builds under useFitCorrections (full momentum, pion 1/beta, no
-  // momentum cap), so that road and fit charge scattering the same way; multScattVar above uses
-  // beta == 1 and clamps pT at 20 GeV and serves the fixed-cut gate.
+  // Highland multiple-scattering angle variance per unit X/X0, for a pion of total momentum pTot
+  // crossing radLen radiation lengths. The only MS coefficient in the walk: one function, full
+  // momentum, pion 1/beta, no momentum cap -- the same form the fast BL builds, so road and fit
+  // charge scattering the same way.
   //   c = (13.6 MeV / (p beta))^2 (1 + 0.038 ln W)^2      [rad^2 per unit X/X0]
   template <typename TAcc>
   ALPAKA_FN_ACC ALPAKA_FN_INLINE float extHighlandC(TAcc const& acc, float pTot, float radLen) {
@@ -112,14 +81,73 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     return kMeVToGeV * kMeVToGeV / p2beta2 * lg * lg;
   }
 
-  // Module class of a target hit, for the measured target-side additive variance dV.
-  // The endcap PS/2S split uses the standard geometric rule (TEDD r < 50 cm == PS).
-  ALPAKA_FN_ACC ALPAKA_FN_INLINE int extMatClass(int L, bool isBarrel, float rh) {
-    if (L < 28)
-      return isBarrel ? kExtMatClsPXB : kExtMatClsPXD;
-    if (L <= 33)
-      return (L <= 30) ? kExtMatClsTBPS : kExtMatClsTB2S;  // TOB1-3 = PS, TOB4-6 = 2S
-    return (rh < 50.f) ? kExtMatClsTEDDPS : kExtMatClsTEDD2S;
+  // The walk's gate statistic. S is the innovation covariance, packed symmetric n x n with n <= 3 in
+  // the order (00, 01, 02, 11, 12, 22); d the residual (pred - meas). Returns the chi2 and, in det,
+  // |S| -- which the hole hypothesis prices the candidate's window volume with. Returns -1 when S is
+  // not positive definite.
+  template <typename TAcc>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE float extChi2FromS(
+      TAcc const& acc, int n, const float S[6], const float d[3], float& det) {
+    if (n == 1) {
+      det = S[0];
+      if (!(det > 0.f) || !alpaka::math::isfinite(acc, det))
+        return -1.f;
+      return d[0] * d[0] / det;
+    }
+    if (n == 2) {
+      det = S[0] * S[3] - S[1] * S[1];
+      if (!(det > 0.f) || !alpaka::math::isfinite(acc, det))
+        return -1.f;
+      return (S[3] * d[0] * d[0] - 2.f * S[1] * d[0] * d[1] + S[0] * d[1] * d[1]) / det;
+    }
+    const float a0 = S[3] * S[5] - S[4] * S[4];
+    const float a1 = S[4] * S[2] - S[1] * S[5];
+    const float a2 = S[1] * S[4] - S[3] * S[2];
+    det = S[0] * a0 + S[1] * a1 + S[2] * a2;
+    if (!(det > 0.f) || !alpaka::math::isfinite(acc, det))
+      return -1.f;
+    const float b1 = S[0] * S[5] - S[2] * S[2];
+    const float b2 = S[1] * S[2] - S[0] * S[4];
+    const float c2 = S[0] * S[3] - S[1] * S[1];
+    const float q = a0 * d[0] * d[0] + b1 * d[1] * d[1] + c2 * d[2] * d[2] +
+                    2.f * (a1 * d[0] * d[1] + a2 * d[0] * d[2] + b2 * d[1] * d[2]);
+    return q / det;
+  }
+
+  // Tail probability of a chi2 with n dof, 1 - F_n(x): the quantity competing candidates are ranked
+  // by, so a 2-dof (position-only) and a 3-dof (position + stub bend) candidate compete fairly
+  // instead of the 2-dof one winning the argmin by its missing row. Closed form for n = 1, 2, 3.
+  template <typename TAcc>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE float extChi2Tail(TAcc const& acc, int n, float x) {
+    if (!(x > 0.f))
+      return 1.f;
+    const float e = alpaka::math::exp(acc, -0.5f * x);
+    if (n == 2)
+      return e;
+    const float sx = alpaka::math::sqrt(acc, x);
+    const float erfc = 1.f - alpaka::math::erf(acc, sx * 0.70710678f);  // erfc(sqrt(x/2))
+    if (n == 1)
+      return erfc;
+    constexpr float kSqrt2OverPi = 0.79788456f;  // sqrt(2/pi)
+    return erfc + kSqrt2OverPi * sx * e;
+  }
+
+  // How far the crossing may sit from a hit along the secondary row: a strip (and a pixel along its length)
+  // reports the centre of a segment the track crossed anywhere inside, so the reading is uniform over the
+  // segment and its support is exactly +-sqrt(3 V). On a 2S module the strip is centimetres long, and the
+  // Gaussian tail of the same variance would admit hits the sensor cannot have produced.
+  template <typename TAcc>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE float extSecSupport(TAcc const& acc, float Rss, float predVar, float qGate1) {
+    return alpaka::math::sqrt(acc, 3.f * Rss) + alpaka::math::sqrt(acc, qGate1 * alpaka::math::max(acc, predVar, 0.f));
+  }
+
+  // Does the secondary reading still separate candidates, or is it only a window? The reading is uniform over
+  // the strip with support +-sqrt(3 Rss); inside that support the likelihood is flat, and a chi2 row with a
+  // free residual would let a 2S strip outrank an honest candidate. The row stays a chi2 row while 3 Rss is
+  // below the road's own spread qGate1 * M_ss, and becomes the window extSecSupport otherwise (never on a PS
+  // module or a pixel).
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE bool extSecIsWindow(float Rss, float predVar, float qGate1) {
+    return 3.f * Rss > qGate1 * predVar;
   }
 
   // Maps a hit's CA module index to its extender layer via binary search over layerStarts.
@@ -160,18 +188,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     return chi2;
   }
 
-  // The walk's pre-gate predicate, as a per-tuple mask for the option-D prediction pass.
-  // A strict superset of what Kernel_extPreGate accepts: it applies the same quality, finiteness,
-  // chi2/ndof, pT and |eta| tests, but of the three host-quality predicates only extHostMaxChi2Ndof
-  // (Kernel_extPreGate also applies extHostMinHits and extHostMinPt). Benign -- the mask only selects
-  // which tracks get an ExtPredCoeff payload, and a payload nothing reads costs only its slot.
+  // The walk's pre-gate predicate, as a per-tuple mask for the prediction pass: exactly the quality,
+  // finiteness, pT and |eta| tests Kernel_extPreGate applies, so the two sets agree.
   struct Kernel_extHostMask {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   ::reco::TrackSoAConstView tracks,
-                                  const float preGateMaxChi2,
                                   const float preGateMinPt,
                                   const float maxAbsEta,
-                                  const float extHostMaxChi2Ndof,
                                   const uint32_t nTracksCap,
                                   int32_t* __restrict__ hostMask,
                                   // Optional smoothed-prediction payload. This sweep visits every slot of
@@ -194,13 +217,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
           finite = finite && alpaka::math::isfinite(acc, tracks[i].state()(a));
         if (!finite)
           continue;
-        if (!(tracks[i].chi2() <= preGateMaxChi2))
-          continue;
         if (!(tracks[i].pt() >= preGateMinPt))
           continue;
         if (!(alpaka::math::abs(acc, tracks[i].state()(3)) <= cotMax))
-          continue;
-        if (extHostMaxChi2Ndof > 0.f && !(tracks[i].chi2() < extHostMaxChi2Ndof))
           continue;
         hostMask[i] = 0;
       }
@@ -219,12 +238,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                                   ::reco::TrackSoAConstView tracks,
                                   const double* __restrict__ passBuf,
                                   uint32_t maxNumberOfTuples,
-                                  float preGateMaxChi2,
                                   float preGateMinPt,
                                   float maxAbsCotTheta,
-                                  float extHostMaxChi2Ndof,
-                                  int extHostMinHits,
-                                  float extHostMinPt,
                                   // nullptr => no candidate restriction; else a tuple enters
                                   // only if acceptedMask[tuple] >= 0 (a previous pass's extended set).
                                   const int32_t* __restrict__ acceptedMask,
@@ -246,8 +261,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
           finite = finite && alpaka::math::isfinite(acc, tracks[i].state()(a));
         if (!finite)
           continue;
-        if (tracks[i].chi2() > preGateMaxChi2)
-          continue;
         if (tracks[i].pt() < preGateMinPt)
           continue;
         // The |eta| pre-gate (|cotTheta| > sinh(maxAbsEta)). Counted, because nothing else in stats[]
@@ -257,26 +270,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
             alpaka::atomicAdd(acc, &stats[kStatPreGateEtaSkipped], 1u, alpaka::hierarchy::Grids{});
           continue;
         }
-        // host-quality pre-gate: skip hosts the HP selector will reject anyway -- they are both the
-        // dominant stray-hit source and most of the attach work. Each predicate is independently
-        // sentinel-gated; a host failing any active predicate is skipped and counted into
-        // kStatPreGateSkipped (count pass only, to match the kStatCandidates single-count convention).
-        // tracks[i].chi2() is already reduced chi2/ndof (BLFit stores gchi2/ndof) so it is compared to a
-        // chi2/ndof threshold directly, no re-norm.
-        {
-          bool preGateSkip = false;
-          if (extHostMaxChi2Ndof > 0.f && !(tracks[i].chi2() < extHostMaxChi2Ndof))
-            preGateSkip = true;
-          if (extHostMinHits > 0 && ::reco::nHits(tracks, i) < extHostMinHits)
-            preGateSkip = true;
-          if (extHostMinPt > 0.f && !(tracks[i].pt() >= extHostMinPt))
-            preGateSkip = true;
-          if (preGateSkip) {
-            if (countOnly)
-              alpaka::atomicAdd(acc, &stats[kStatPreGateSkipped], 1u, alpaka::hierarchy::Grids{});
-            continue;
-          }
-        }
         // Candidate restriction: only the caller-supplied set. A follow-on attach pass passes the
         // previous pass's acceptedByTuple (>=0 iff the tuple got an accepted extension). Null => the
         // predicate is never evaluated and every pre-gate survivor enters.
@@ -284,8 +277,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
           continue;
         const uint32_t pos = alpaka::atomicAdd(acc, nCands, 1u, alpaka::hierarchy::Grids{});
         if (pos >= cap) {
-          if (countOnly)
-            alpaka::atomicAdd(acc, &stats[kStatCandOverflow], 1u, alpaka::hierarchy::Grids{});
+          // Counted in BOTH passes: the fill pass is the one whose capacity can bind, and a silent
+          // drop there costs a run-dependent slice of the extension. The launcher surfaces it.
+          alpaka::atomicAdd(acc, &stats[kStatCandOverflow], 1u, alpaka::hierarchy::Grids{});
           continue;
         }
         if (countOnly)
@@ -334,69 +328,23 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     template <typename TAcc>
     ALPAKA_FN_ACC void operator()(
         TAcc const& acc,
-        const int maxExtraHitsPerTrack,
-        const int maxWalkLayers,
-        const float bf,
-        const float chi2Cut,
-        const float endcapChi2Cut,
-        const float typePriorityBiasCm,
-        const int pixHitsTarget,
-        const float maxRPhiResidCm,
-        const float maxSecResidCm,
-        const float endcapMaxSecResidCm,
-        const float alignSigmaPhiCm,
-        const float alignSigmaSecCm,
-        const float extChi2CutScaleTOB456,    // TOB4-6 barrel gate widen
-        const float extChi2CutScaleTID,       // TID endcap gate scale
-        const bool extRawOTVetoTOB456,        // skip raw-OT round on TOB4-6 (31-33)
-        const bool extRawOTVetoTID,           // skip raw-OT round on TID (34-53)
-        const bool extDisplacementAwareGate,  // dispgate: tighten TOB1-3 accept on displaced hosts
-        const float extDispGateSig2,          // dispgate: (|d0|/sigma_d0)^2 displaced-host threshold
-        const bool extForwardPocketGate,      // pocket gate: forward-eta TOB1-3 accept tightening
-        const bool extPocketGateArmScoped,    // pocket gate: displaced-arm-only when true (needs armId)
-        const float maxAbsCotTheta,           // sinh(maxAbsEta): the pre-gate ceiling, = the pocket band top
-        const bool extMtvAlignedExtraCap,     // MTV-aligned per-track extra-cluster cap (accept-time)
-        const float extRecallReachRelax,      // pixel-layer reachability envelope slack (cm)
-        const int extRecallPixelFirstBudget,  // reserve up to N K-seats for pixel-first
-        const float extCovScalePixel,         // pixel propagated-cov scale (merged L<28)
-        const float extCovScaleStub,          // stub propagated-cov scale (merged L>=28)
-        const float extCovScaleRawOT,         // raw-OT propagated-cov scale (round 1 + partner)
-        const float extPixelGateChi2Cut,      // pixel honest-calibration chi2 cut (<=0 = off)
-        const float extStubBendGate,          // 2S stub-bend nSigma veto (<=0 = off)
-        const bool extCapExemptAnchored,      // anchored (prior OT accept) tracks bypass the cap
-        const int extCapBudgetFloor,          // raise the per-track cluster budget to >= floor
-        const float extStateProcessNoise,     // per-gap Highland MS injected into P (direction)
-        const bool extRecallForcePixelVisit,  // prefer-pixel hosts visit pixel regardless of envelope
-        const bool extCapExemptTOB46Only,     // scope the anchored exemption to TOB4-6 (CA 31-33)
-        const float extCapExemptMaxChi2,      // exempt only if candidate gate chi2 < this (<=0 off)
-        const int extMaxWalkLayers,           // runtime visit budget (loop bound; sizing stays maxWalkLayers)
-        const bool extAttachFarFirst,         // far-first disc ordering on OT-less forward pixel hosts
-        const float extAttachFarMinAbsEta,    // its |eta| floor; below it the nearest-first order stands
-        const int extAttachFarMaxWin,         // its window-ambiguity condition: decline a far commit whose
-                                              // gate-passing candidate set exceeds this (<=0 => no condition)
-        // the derived-selection package (one switch; all inert when off)
-        const bool extDerivedSelection,            // master switch (OT layers only)
-        const float extDerivedEps,                 // the one free number: window == gate == rank == hole prior
-        const bool extDerivedHole,                 // the hole "attach nothing" hypothesis in the argmin
-        const bool extHoleDetectionPrior,          // the hole window-mass repair: numerator eta_L, not eta_L*eps
-        const ExtPredCoeff* __restrict__ extPred,  // per-slot option-D payload (null = package off)
-        const float* __restrict__ extQthr,         // [kExtQCells] Q-hat(eps) per (class x |eta| x visit) cell
+        const int maxExtraHitsPerTrack,  // per-track extra-slot budget (a compute cap)
+        const int maxWalkLayers,         // compile-time sizing of the dump strides
+        const int extMaxWalkLayers,      // runtime visit budget K (a compute cap)
+        const float bf,                  // Bz(0,0): the scale of the normalised (Bz,Br) map
+        const float maxAbsCotTheta,      // sinh(extMaxAbsEta): the |eta| reach of the walk
+        const float extGateEps,          // THE efficiency: gate, window, rank and hole prior
+        const float qGate1,              // chi2 quantiles of that eps at 1, 2 and 3 dof
+        const float qGate2,
+        const float qGate3,
+        const float* __restrict__ bMap,            // normalised (Bz,Br) r-z field lattice
+        const ExtPredCoeff* __restrict__ extPred,  // per-host anchor + exit kink + eloss centre
         const float* __restrict__ extEtaL,         // [kExtOTLayers] measured per-layer stub availability
         const float* __restrict__ extRho,          // [kExtOTLayers] measured per-layer stub areal density [cm^-2]
-        const bool extFwdEtaBin,                   // arm the 5th Q-hat |eta| bin
         const float* __restrict__ extEtaLRaw,      // [kExtOTLayers] raw round conditional availability (null=off)
-        const float* __restrict__ extRhoRaw,       // [kExtOTLayers] raw-cluster areal density [cm^-2] (null=off)
-        const float* __restrict__ extDV,           // [kExtMatClasses] measured target-side additive variance [cm^2]
-        const float extFmsBarrel,                  // measured material-dispersion scale (barrel)
-        const float extFmsEndcap,                  // measured material-dispersion scale (endcap)
-        // the stub-bend package (one switch; all inert when off)
-        const bool extBendPackage,                // the bend as the third chi2 row + the hole's basis
-        const float* __restrict__ extQhat3,       // [kExtQCells] Q-hat_3(eps): the 3-dof map, stubs only
-        const float* __restrict__ extSigBExcess,  // [kExtSigBClasses] measured honest/floor bend-error excess
-        const float* __restrict__ extRho3,        // [kExtOTLayers] measured 3-dof stub density [cm^-1 rad^-1]
+        const float* __restrict__ extRho3,         // [kExtOTLayers] measured 3-dof stub density [cm^-1 rad^-1]
         const ::reco::TrackSoAConstView tracks,
         const ::reco::TrackHitSoAConstView trackHits,
-        const uint8_t* __restrict__ armId,  // pocket gate: per-track arm (0=prompt,1=disp); null=off/arm-blind
         const ::reco::TrackingRecHitConstView hits,
         const ::reco::HitModuleSoAConstView hitModules,
         const ::reco::TrackingRecHitsMaskingConstView hitMask,
@@ -429,34 +377,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
       // Shared bound (reco::kMaxCALayers): the producers of the layers block throw above it, so the
       // walk's shared per-layer arrays and the uint64_t coveredMask can be sized from it here.
       constexpr int kMaxLayersList = ::reco::kMaxCALayers;
-      constexpr float kReachSlackCm = 1.0f;
-      // displacement-aware inner-OT gate constants (see AttachParams::extDisplacementAwareGate).
-      // A host is "genuinely displaced" when |d0|/sigma_d0 >= sqrt(extDispGateSig2), i.e.
-      // tip*tip >= extDispGateSig2 * V(tip). On such hosts the TOB1-3 (CA 28-30) per-hit accept window
-      // is scaled by kDispGateTOB13Scale (tightened) so the innermost-barrel stray attaches that
-      // dominate the displaced-tail impurity are rejected; prompt hosts and all outer layers keep
-      // scale 1. The (|d0|/sigma_d0)^2 threshold itself is the runtime extDispGateSig2 argument.
-      constexpr float kDispGateTOB13Scale = 0.4f;  // TOB1-3 accept-window scale on a displaced host
-      // Forward-eta TOB1-3 pocket gate constants (see AttachParams::extForwardPocketGate). A host is
-      // forward when its fitted |cotTheta| falls in [kPocketCotThetaLo, kPocketCotThetaHi), i.e.
-      // |eta| from 1.5 up to the pre-gate ceiling, expressed as sinh of the eta edges so that the hot
-      // setup path needs no asinh. On such hosts, when they are not already displacement-gated, the
-      // TOB1-3 (CA 28-30) per-hit accept window is scaled by kPocketTOB13Scale; every other host and
-      // outer layer keeps scale 1.
-      constexpr float kPocketCotThetaLo = 2.129279f;  // sinh(1.5)
-      // Upper edge of the pocket: the runtime |eta| pre-gate ceiling. Tying it to the ceiling is what
-      // keeps the band non-empty when the ceiling moves -- a literal sinh(2.4) here would put every host
-      // admitted above 2.4 outside the band and switch the TOB1-3 tightening off for exactly the hosts
-      // it exists to tighten.
-      const float kPocketCotThetaHi = maxAbsCotTheta;
-      constexpr float kPocketTOB13Scale = 0.4f;  // TOB1-3 accept-window scale on a forward-eta host
-      // MTV-aligned extra cap constants (see AttachParams::extMtvAlignedExtraCap). MTV
-      // efficiency/fake need n_core/(n_core+n_extra) > 0.75 (QuickTrackAssociatorByHitsImpl). With
-      // 0.75 == 1 - 1/kMtvSharedFracDen the worst case, every extra wrong, survives iff
-      // n_extra < n_core/kMtvSharedFracDen, i.e. the per-track cap on appended extra clusters is
-      // floor((n_core_clusters - 1)/kMtvSharedFracDen). kExtNoClusterCap is the no-cap sentinel.
-      constexpr int kMtvSharedFracDen = 3;          // == 1/(1-0.75); the only constant of the cap
-      constexpr int kExtNoClusterCap = 0x3fffffff;  // cap off => never binds
       // Per-(candidate,layer) linearization (see the coefficient block below): fall back to the exact
       // per-hit predict when the 2nd-order Taylor term 0.5*|d2phi/dr2|*W^2 (W = the layer half-extent)
       // exceeds this, or when the coefficient solve is near-tangential / has a vanishing denominator.
@@ -466,12 +386,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
 
       // shared per-block state (reused across grid-stride candidates)
       auto& sh = alpaka::declareSharedVar<RunningHelix, __COUNTER__>(acc);
-      // The per-host bending field the running helix's geometry is expressed in (see the setup).
-      auto& shBf = alpaka::declareSharedVar<float, __COUNTER__>(acc);
       auto& shCoveredMask = alpaka::declareSharedVar<uint64_t, __COUNTER__>(acc);
-      auto& shPreferPixel = alpaka::declareSharedVar<int, __COUNTER__>(acc);
-      auto& shHostDisplaced = alpaka::declareSharedVar<int, __COUNTER__>(acc);      // dispgate: displaced host flag
-      auto& shHostForwardPocket = alpaka::declareSharedVar<int, __COUNTER__>(acc);  // pocket: forward-eta host
       auto& shNOrigSafe = alpaka::declareSharedVar<int, __COUNTER__>(acc);
       auto& shOrigR = alpaka::declareSharedVar<float[kMaxOrigHits], __COUNTER__>(acc);
       auto& shOrigZ = alpaka::declareSharedVar<float[kMaxOrigHits], __COUNTER__>(acc);
@@ -479,31 +394,23 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
       auto& shReachDist = alpaka::declareSharedVar<float[kMaxLayersList], __COUNTER__>(acc);
       auto& shVisited = alpaka::declareSharedVar<int[kMaxLayersList], __COUNTER__>(acc);
       auto& shNExtra = alpaka::declareSharedVar<int, __COUNTER__>(acc);
-      // MTV-aligned extra cap (extMtvAlignedExtraCap): shExtraClusterCap = floor((n_core_cl-1)/den), computed
-      // once in setup; shNExtraClusters accumulates the appended extras' cluster count, seeded with any tagged
-      // extras already in the list so the cap bounds the total over successive attach passes. Cap off =>
-      // shExtraClusterCap is the no-cap sentinel.
+      // Extras budget in CLUSTERS. The validation matches a track to a particle when at least 75 % of
+      // its hits belong to it, so a core of n_core clusters keeps its match only while the extras stay
+      // under n_core/4 of the total, i.e. n_extra <= floor((n_core - 1)/3). Not a tuning knob: it is
+      // the same matching definition the duplicate removal reads. shNExtraClusters is seeded with the
+      // extras an earlier attach pass already appended, so the bound holds over passes.
       auto& shExtraClusterCap = alpaka::declareSharedVar<int, __COUNTER__>(acc);
       auto& shNExtraClusters = alpaka::declareSharedVar<int, __COUNTER__>(acc);
       auto& shLastArcS = alpaka::declareSharedVar<float, __COUNTER__>(acc);
       auto& shLastR = alpaka::declareSharedVar<float, __COUNTER__>(acc);
       auto& shLastZ = alpaka::declareSharedVar<float, __COUNTER__>(acc);
-      // the option-D band state and the per-visit derived road (all shared, no stack)
-      // shDerCloc is the symmetric 3x3 local covariance of (u [cm], u' [rad], kappa [1/cm]) at the
-      // current anchor -- seeded from the merger-side option-D payload at the last fitted node and
-      // re-anchored at every accept by an exact 3x3 KF fold (propagate with F(ds), add the traversed
-      // gap's process noise from its own material moments, update with the accepted r-phi measurement).
-      // Packed [c00, c01, c02, c11, c12, c22].
-      auto& shDerCloc = alpaka::declareSharedVar<float[6], __COUNTER__>(acc);
-      auto& shDerOn = alpaka::declareSharedVar<int, __COUNTER__>(acc);         // package usable for this host
-      auto& shDerAnchorS = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // transverse arc of the anchor
-      auto& shDerAnchorR = alpaka::declareSharedVar<float, __COUNTER__>(acc);
-      auto& shDerAnchorZ = alpaka::declareSharedVar<float, __COUNTER__>(acc);
+      // Per-host payload from the merger-side pre-attach pass, and the per-visit road built from it.
+      // shDerQgap is the last FITTED gap's exit-direction kink variance: structurally invisible to the
+      // fit (varBeta(n-1) == 0), so the walk carries it until the first accept folds it into P.
       auto& shDerQgap = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // last fitted gap kink var; 0 after
-      // Deterministic ionization energy-loss state, carried alongside the band: the band above is the
-      // road's width, these four are its centre. They are the analogue of shDerCloc, seeded from the
-      // same per-host payload at the same anchor (node n-1), propagated by the same F(ds) -- here a
-      // deterministic second-order polynomial rather than a covariance -- and re-anchored at every
+      // Deterministic ionization energy-loss state: the filter above gives the road its width, these
+      // four give it its centre. Seeded from the same per-host payload at the same anchor (node n-1),
+      // propagated by a deterministic second-order recursion and re-anchored at every
       // accept. The Kalman update does not reset them: the running helix estimates the
       // constant-kappa_0 reference trajectory, so the true track's offset from it keeps accumulating.
       // All four zero leaves every expression below adding an exact float 0.
@@ -512,27 +419,45 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
       auto& shEDk = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // dkappa at the anchor [1/cm]
       auto& shEK = alpaka::declareSharedVar<float, __COUNTER__>(acc);   // dkappa per column [1/(cm X0)]
       // Per-layer-visit derived road (written by lane 0 with the linearization, read by every lane).
-      auto& shDerLayOn = alpaka::declareSharedVar<int, __COUNTER__>(acc);       // 1 = derived gate active on this layer
-      auto& shDerSigR2 = alpaka::declareSharedVar<float, __COUNTER__>(acc);     // layer part of sigma_R^2 [cm^2]
-      auto& shDerSigS2 = alpaka::declareSharedVar<float, __COUNTER__>(acc);     // layer MS part of sigma_S^2 [cm^2]
-      auto& shDerQ = alpaka::declareSharedVar<float, __COUNTER__>(acc);         // Q-hat(eps) of this cell
-      auto& shDerWinR = alpaka::declareSharedVar<float, __COUNTER__>(acc);      // r-phi window half-width [cm]
-      auto& shDerCeilR = alpaka::declareSharedVar<float, __COUNTER__>(acc);     // r-phi runaway ceiling [cm], envelope
-      auto& shDerCeilS = alpaka::declareSharedVar<float, __COUNTER__>(acc);     // secondary runaway ceiling [cm]
+      auto& shDerLayOn = alpaka::declareSharedVar<int, __COUNTER__>(acc);    // 1 = derived gate active on this layer
+      auto& shDerWinR = alpaka::declareSharedVar<float, __COUNTER__>(acc);   // r-phi window half-width [cm]
+      auto& shDerCeilR = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // r-phi runaway ceiling [cm], envelope
+      auto& shDerCeilS = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // secondary runaway ceiling [cm]
+      // 1 / (the clusters this layer would put in that patch if it were uniform in this event):
+      // the local-occupancy contrast is the patch count times this.
+      auto& shOccNorm = alpaka::declareSharedVar<float, __COUNTER__>(acc);
       auto& shDerHoleK = alpaka::declareSharedVar<float, __COUNTER__>(acc);     // 2 dof, stub round
       auto& shDerHoleKRaw = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // 2 dof, raw-OT round
       auto& shDerHoleK3 = alpaka::declareSharedVar<float, __COUNTER__>(acc);    // 3 dof: rho_3, (2 pi)^{3/2}
       // The bend row's per-layer-visit constants. The track-side prediction and everything
       // in R_bb except the hit's own sigma_b are properties of the layer crossing, so they are formed
       // once here, exactly like the r-phi/secondary road above.
-      auto& shDerBendOn = alpaka::declareSharedVar<int, __COUNTER__>(acc);    // 1 = the third row is live
-      auto& shDerPredB = alpaka::declareSharedVar<float, __COUNTER__>(acc);   // dphi/dr of the track [1/cm]
-      auto& shDerRbbTrk = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // H_b C H_b^T + Q_MS,bb [1/cm^2]
-      auto& shDerQ3 = alpaka::declareSharedVar<float, __COUNTER__>(acc);      // Q-hat_3(eps) of this cell
-      auto& shDerC = alpaka::declareSharedVar<float, __COUNTER__>(acc);       // Highland c of this gap
-      auto& shDerW = alpaka::declareSharedVar<float, __COUNTER__>(acc);       // gap moments to the crossing
-      auto& shDerS1 = alpaka::declareSharedVar<float, __COUNTER__>(acc);
-      auto& shDerS2 = alpaka::declareSharedVar<float, __COUNTER__>(acc);
+      auto& shDerBendOn = alpaka::declareSharedVar<int, __COUNTER__>(acc);   // 1 = the third row is live
+      auto& shDerPredB = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // dphi/dr of the track [1/cm]
+      // The prediction block of the innovation covariance, M = H (P+Q) H^T, packed symmetric 3x3 in
+      // the order (00, 01, 02, 11, 12, 22) over the rows (r*dphi, secondary, bend). Formed once per
+      // visit; the per-hit path only adds the hit's own R to it.
+      auto& shM = alpaka::declareSharedVar<float[6], __COUNTER__>(acc);
+      // The measurement rows of this layer crossing, from the dual-number crossing code, and the
+      // prediction covariance they are evaluated against: P plus the traversed gap's process noise Q.
+      // Built once per visit at the reference crossing (the scan is linearised there anyway), so the
+      // per-hit path only adds the hit's own R. shHb is the stub-bend row, live when shDerBendOn.
+      auto& shHphi = alpaka::declareSharedVar<float[5], __COUNTER__>(acc);    // d(r*phi)/dparams [cm]
+      auto& shHsec = alpaka::declareSharedVar<float[5], __COUNTER__>(acc);    // d(sec)/dparams [cm]
+      auto& shHb = alpaka::declareSharedVar<float[5], __COUNTER__>(acc);      // d(dPhiDr)/dparams [1/cm]
+      auto& shPgate = alpaka::declareSharedVar<float[15], __COUNTER__>(acc);  // P + Q of this gap
+      // The gap's Highland coefficients and its material moments about the PERIGEE reference point,
+      // kept so the accept site injects exactly the Q the gate was computed with.
+      auto& shQcPhi = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // c*(1+cot^2) [rad^2 per X/X0]
+      auto& shQcCot = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // c*(1+cot^2)^2
+      auto& shGapW = alpaka::declareSharedVar<float, __COUNTER__>(acc);   // W  = sum rho dl
+      auto& shGapS1 = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // S1 = sum rho dl s_k
+      auto& shGapS2 = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // S2 = sum rho dl s_k^2
+      // The same gap's moments about the ARRIVAL end (transverse lever), which is the frame the
+      // energy-loss recursion is written in.
+      auto& shElS1 = alpaka::declareSharedVar<float, __COUNTER__>(acc);
+      auto& shElS2 = alpaka::declareSharedVar<float, __COUNTER__>(acc);
+      auto& shSegBf = alpaka::declareSharedVar<float, __COUNTER__>(acc);  // this segment's bending field
       // The energy-loss road centre of this layer visit, already projected onto the two gate rows:
       // a phi shift [rad] and a secondary shift [cm], both added to the prediction (never to a
       // width). Zero whenever the payload carries no eloss constants or the material march did not
@@ -541,44 +466,40 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
       auto& shDerElossSec = alpaka::declareSharedVar<float, __COUNTER__>(acc);
       auto& shCurrentL = alpaka::declareSharedVar<int, __COUNTER__>(acc);
       auto& shWalkDone = alpaka::declareSharedVar<int, __COUNTER__>(acc);
-      auto& shWalkSteps = alpaka::declareSharedVar<int, __COUNTER__>(acc);     // reachable layers walked so far
-      auto& shOTDiskVisits = alpaka::declareSharedVar<int, __COUNTER__>(acc);  // OT-disk layers walked so far
-      auto& shPixVisits = alpaka::declareSharedVar<int, __COUNTER__>(acc);     // pixel layers walked so far
-      auto& shConfirmDone = alpaka::declareSharedVar<int, __COUNTER__>(acc);   // 1 once all candidate layers confirmed
-      auto& shMergedHit = alpaka::declareSharedVar<int, __COUNTER__>(acc);     // round 0 (merged) attached here?
+      auto& shWalkSteps = alpaka::declareSharedVar<int, __COUNTER__>(acc);    // reachable layers walked so far
+      auto& shConfirmDone = alpaka::declareSharedVar<int, __COUNTER__>(acc);  // 1 once all candidate layers confirmed
+      auto& shMergedHit = alpaka::declareSharedVar<int, __COUNTER__>(acc);    // round 0 (merged) attached here?
       auto& shHasOT = alpaka::declareSharedVar<int, __COUNTER__>(acc);  // >=1 OT extra committed on this candidate
       // Count of accepted OT-layer (CA >= 28) extras so far this walk, seeded with any tagged OT extras
       // already in the hit list. shNOTExtraAcc >= 1 == the track is "anchored" (a prior OT accept exists),
       // which is the class-aware condition for the cluster-cap exemption. Written unconditionally; read
-      // only under extCapExemptAnchored.
       auto& shNOTExtraAcc = alpaka::declareSharedVar<int, __COUNTER__>(acc);
-      // Exact full-5x5 shadow covariance (verbose-gated) carried alongside the block-diagonal
-      // RunningHelix; updated at each accept with the same measurement rows the walk uses (a covariance
-      // update is state/innovation-independent). Diagnostic only -- it never feeds any gate.
-      auto& shC = alpaka::declareSharedVar<float[15], __COUNTER__>(acc);
-      auto& shNDiskAcc = alpaka::declareSharedVar<int, __COUNTER__>(acc);  // prior disk (endcap) accepts on this cand
       auto& laneChi2 = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
       auto& laneHit = alpaka::declareSharedVar<int32_t[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneDPhi = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneDSec = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneSigPhi2 = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneSigSec2 = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      // The winning candidate's measurement, staged per lane for the post-reduce commit: the residual
+      // rows d (r*dphi [cm], secondary [cm], bend [1/cm]), the hit's own noise block R (the position
+      // 2x2 plus the uncorrelated bend variance), the number of live rows, and |S| -- which the hole
+      // hypothesis prices the candidate's window volume with. The measurement rows themselves are
+      // per-visit shared state (shHphi/shHsec/shHb), so no lane copy of them is needed.
+      auto& laneD0 = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneD1 = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneD2 = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneRpp = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneRps = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneRss = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneRbb = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneDet = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      // Full width of the secondary window when that row is not in the chi2 (0 when it is): the hole
+      // hypothesis prices the winner's acceptance volume with it.
+      auto& laneSecWin = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      // Clusters this lane saw inside the scan's own (eta, phi) patch around the crossing: the local
+      // occupancy the hole hypothesis is priced with. Summed by the same tree reduce as the argmin.
+      auto& laneOcc = alpaka::declareSharedVar<uint32_t[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneChi2Val = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
+      auto& laneNRows = alpaka::declareSharedVar<int[kExtFindLanes], __COUNTER__>(acc);
       auto& laneRh = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
       auto& laneZh = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
       auto& laneArcS = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      // The full derived gate variances [cm^2] of each lane's best hit, so the hole hypothesis can price
-      // the winner's own window volume |R| = sigma_R^2 sigma_S^2 after the reduce. (The endcap line-block
-      // Jacobian row H = (dr/dcot, dr/dzip) of the same winner is staged in laneJrCot/laneJrZip below.)
-      auto& laneDerSigR2 = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneDerSigS2 = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      // The winner's R_bb, so the hole hypothesis can price the 3-dof window volume |R|.
-      auto& laneDerRbb = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneJrCot = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneJrZip = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      // Region-balanced select staging -- per-lane best OT-disk layer + OT-disk tally.
-      auto& laneChi2Disk = alpaka::declareSharedVar<float[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneHitDisk = alpaka::declareSharedVar<int32_t[kExtFindLanes], __COUNTER__>(acc);
-      auto& laneNDisk = alpaka::declareSharedVar<int[kExtFindLanes], __COUNTER__>(acc);
       // Winning original-lane index, carried through the hit-scan argmin tree reduce so lane 0 can index
       // the winner's KF payload (laneDPhi / laneSigPhi2 / ...) after the reduction.
       auto& laneWin = alpaka::declareSharedVar<int32_t[kExtFindLanes], __COUNTER__>(acc);
@@ -598,7 +519,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
       auto& shUseLin = alpaka::declareSharedVar<int, __COUNTER__>(acc);
       // 1 iff the per-layer reference predict p0 was valid, so shLinDphi1 (the track's local
       // dphi/dr) is a real derivative and the 2S stub-bend term has a track curvature expectation to compare
-      // against. Written by lane 0 in the linearization block; read only under extStubBendGate > 0.
+      // against. Written by lane 0 in the linearization block.
       auto& shLinValid = alpaka::declareSharedVar<int, __COUNTER__>(acc);
       // Candidate-dump per-(candidate,layer) accumulators, always declared but written only under the
       // runtime candDump_ guard: reset at layer select, accumulated by the scan lanes via block
@@ -633,18 +554,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
       auto& shHoleRun = alpaka::declareSharedVar<int, __COUNTER__>(acc);
       auto& shHoleConsec = alpaka::declareSharedVar<int, __COUNTER__>(acc);
       auto& shHoleOcc = alpaka::declareSharedVar<uint32_t, __COUNTER__>(acc);
-      // Far-first window-ambiguity state; each stays at its setup value unless extAttachFarFirst arms
-      // the host.
-      //   shFarArmed  = 1 iff this host's disc ordering was re-keyed far-first (A1 & A2 & A3 below).
-      //   shFarZFloor = the largest |z| among the host's own core hits, read off the hits the reach
-      //                 proxy already cached. A visited endcap pixel layer is a far crossing iff
-      //                 |Z_L| exceeds it, i.e. iff the crossing lengthens the track.
-      //   shFarLayer  = 1 iff the layer being scanned is such a far crossing and the condition is on.
-      //   shFarPass   = the count of gate-passing merged candidates on it, the set the argmin sees.
-      auto& shFarArmed = alpaka::declareSharedVar<int, __COUNTER__>(acc);
-      auto& shFarZFloor = alpaka::declareSharedVar<float, __COUNTER__>(acc);
-      auto& shFarLayer = alpaka::declareSharedVar<int, __COUNTER__>(acc);
-      auto& shFarPass = alpaka::declareSharedVar<uint32_t, __COUNTER__>(acc);
       // Per-lane best (min-gate-chi2) road candidate over all considered hits of both rounds; it
       // supplies the id and the base-gate-pass flag that accompany bestFailChi2. Same lane-array
       // reduction as the walk argmin: each lane keeps its slot's running min-chi2 (tie by min id) and
@@ -665,32 +574,19 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
         for (auto element : cms::alpakatools::uniform_group_elements(acc, j, nC * nLanes)) {
           if (element.local != 0u)
             continue;
-          // The field this walk's geometry is built in. makeRunningHelix inverts the fit's
-          // curvature->pT conversion, rho_geom = 1/(q/pT * B), and every crossing, Taylor coefficient
-          // and the d(phi)/d(q/pT) Jacobian below use that rho. The fit publishes q/pT as (geometric
-          // curvature)/bFieldEff, with bFieldEff = blEffectiveBField over the fitted hits, so only
-          // that same bFieldEff returns the fitted circle: the origin scalar would rescale the radius
-          // by B_eff/B(0,0), applying to the road the forward field bias the fit removes. The
-          // pre-attach pass publishes it per host; an invalid payload falls back to the scalar.
-          shBf = bf;
-          if (extPred != nullptr) {
-            const ExtPredCoeff pcB = extPred[i];
-            if (pcB.valid > 0.5f && pcB.bFieldEff > 0.f)
-              shBf = pcB.bFieldEff;
-          }
-          sh = makeRunningHelix(acc, tracks, int(i), shBf);
+          // The walk starts in the origin field; every layer visit then re-evaluates the bending
+          // field on its own road segment from the (Bz,Br) map and rebuilds the state geometry in it.
+          shSegBf = bf;
+          sh = makeRunningHelix(acc, tracks, int(i), shSegBf);
           const auto hitBegin = (i == 0) ? 0u : tracks[i - 1].hitOffsets();
           const auto hitEnd = tracks[i].hitOffsets();
           const int nOrig = int(hitEnd - hitBegin);
           uint64_t coveredMask = 0;
           int nPixHitsOrig = 0;
-          // MTV-aligned extra cap: count the host's genuine-core clusters (pixel + P-hit-only stub = 1, a
-          // full 2-hit stub = 2 via reco::isStub -- matching the converter's cluster expansion) and,
-          // separately, the tagged OT extras already in the list (each 1 cluster). Excluding those extras
-          // from n_core and seeding shNExtraClusters with them makes the cap bound the total appended
-          // clusters over successive attach passes. Cap off => neither accumulator is ever read.
-          int nCoreClusters = 0;
+          // Tagged OT extras already on the list (from an earlier attach pass): each one is a prior
+          // OT accept, so the walk starts anchored.
           int nPriorExtraClusters = 0;
+          int nCoreClusters = 0;
           for (auto idx = hitBegin; idx < hitEnd; ++idx) {
             const auto hitId = trackHits[idx].id();
             // A hit list that a previous attach pass extended already contains tagged OT extras (bit30)
@@ -706,63 +602,20 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 ++nPixHitsOrig;
             }
             if (ot)
-              ++nPriorExtraClusters;  // already-appended extra: 1 cluster, and not part of the core
+              ++nPriorExtraClusters;  // an appended extra: one cluster, and not part of the core
             else
-              nCoreClusters += ::reco::isStub(hits, int32_t(hitId)) ? 2 : 1;  // 2-hit stub -> 2 clusters
+              nCoreClusters += ::reco::isStub(hits, int32_t(hitId)) ? 2 : 1;  // a 2-hit stub = 2 clusters
           }
           shCoveredMask = coveredMask;
-          shPreferPixel = (nPixHitsOrig < pixHitsTarget) ? 1 : 0;
-          // displacement-aware inner-OT gate: flag a "genuinely displaced" host from its fitted transverse
-          // impact-parameter significance |d0|/sigma_d0 = |state(1)|/sqrt(V(tip)), V(tip) = covariance(5).
-          // Computed once per candidate from the original (pre-walk) host params; broadcast to every lane by
-          // the existing post-setup syncBlockThreads. Gate off or prompt host => 0 => TOB1-3 scale stays 1.
-          {
-            const float d0 = tracks[i].state()(1);
-            const float vTip = tracks[i].covariance()(5);
-            shHostDisplaced = (extDisplacementAwareGate && vTip > 0.f && d0 * d0 >= extDispGateSig2 * vTip) ? 1 : 0;
-          }
-          // forward-eta TOB1-3 pocket gate: flag a "forward" host from its fitted |cotTheta| = |state(3)| in
-          // the band [kPocketCotThetaLo, kPocketCotThetaHi). Made exclusive with the displacement gate above
-          // (&& !shHostDisplaced) so a host already tightened by dispgate does not also fold in the pocket
-          // scale (no 0.4*0.4 stacking on hosts that are both). Arm-scoped additionally requires the merged-
-          // track arm armId[i]==1 (displaced); arm-blind (or null armId) drops that term. Broadcast to every
-          // lane by the existing post-setup syncBlockThreads. Gate off => 0 => TOB1-3 scale stays 1.
-          {
-            const float absCot = alpaka::math::abs(acc, tracks[i].state()(3));
-            const bool inBand = (absCot >= kPocketCotThetaLo && absCot < kPocketCotThetaHi);
-            const bool armOk = (!extPocketGateArmScoped) || (armId != nullptr && armId[i] == uint8_t(1));
-            shHostForwardPocket = (extForwardPocketGate && inBand && !shHostDisplaced && armOk) ? 1 : 0;
-          }
           const int nOrigSafe = nOrig < kMaxOrigHits ? nOrig : kMaxOrigHits;
           shNOrigSafe = nOrigSafe;
           // The original (r,z) hit array is cached cooperatively across all lanes (below), so the
           // lane-0 setup does not fill it here.
           shNExtra = 0;
-          // MTV-aligned extra cap: form the per-track cluster budget (cap off => sentinel => never binds)
-          // and seed the appended-cluster counter with the extras already in the list so it caps the total
-          // over successive passes. extCapBudgetFloor raises the budget to at least that value, which is
-          // what keeps a short OT-only core from getting a budget of 0. Applied only inside the cap-on
-          // branch, so the no-cap sentinel is never lowered; floor 0 leaves the budget unchanged.
-          int capBudget = (nCoreClusters - 1) / kMtvSharedFracDen;
-          if (extCapBudgetFloor > 0 && capBudget < extCapBudgetFloor)
-            capBudget = extCapBudgetFloor;
-          shExtraClusterCap = extMtvAlignedExtraCap ? capBudget : kExtNoClusterCap;
-          shNExtraClusters = extMtvAlignedExtraCap ? nPriorExtraClusters : 0;
+          shExtraClusterCap = (nCoreClusters - 1) / 3;
+          shNExtraClusters = nPriorExtraClusters;
           shWalkSteps = 0;
-          shNDiskAcc = 0;  // prior endcap accepts, for the shadow-covariance decomposition
-          if (secFracDiag_) {
-            // Seed the exact shadow cov from the fitted 5x5 (BL guarantees the circle<->line cross
-            // entries 3,4,7,8,10,11 are exactly zero, matching the RunningHelix block-diagonal start),
-            for (int m = 0; m < 15; ++m)
-              shC[m] = tracks[i].covariance()(m);
-          }
-          shOTDiskVisits = 0;
-          shPixVisits = 0;  // reset the per-candidate pixel-layer visit tally
           // Far-first window-ambiguity state: unarmed until the eager-confirm round says otherwise.
-          shFarArmed = 0;
-          shFarZFloor = 0.f;
-          shFarLayer = 0;
-          shFarPass = 0u;
           // Hole counter: reset the per-candidate cumulative/consecutive occupancy-gated hole run.
           // Written and read only under candDump_, and never read into track output.
           if (candDump_) {
@@ -775,54 +628,38 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
           // so a track anchored by an earlier attach pass stays anchored -- consistent with the cap
           // seeding shNExtraClusters from the same extras. On a first pass nPriorExtraClusters == 0.
           shNOTExtraAcc = nPriorExtraClusters;
-          shLastArcS = 0.f;
-          shLastR = alpaka::math::abs(acc, sh.helix().tip);
-          shLastZ = sh.helix().zip;
-          // Seed the band state for this host. The merger-side pre-attach pass published, per
-          // candidate slot, the 3x3 local covariance of (u, u', kappa) at the host's last fitted node
-          // plus that node's arc and (r,z) and the last fitted gap's exit-direction kink variance:
-          // everything the derived road needs is anchored there, not at the PCA. The fixed-cut road
-          // instead anchors every material integral at the perigee (shLastArcS = 0 above), which
-          // mis-places the integral and, carrying a 3-D scattering angle on a transverse lever,
-          // makes it too narrow by cosh(eta).
-          shDerOn = 0;
-          shDerAnchorS = 0.f;
-          shDerAnchorR = shLastR;
-          shDerAnchorZ = shLastZ;
+          // Seed the walk's anchor and its energy-loss centre from the merger-side pre-attach pass.
+          // The anchor is the host's LAST FITTED NODE, not the PCA: the material inward of it is
+          // already in the fit's covariance, and starting the march at the perigee would count it
+          // twice. Without a valid payload the anchor falls back to the PCA.
           shDerQgap = 0.f;
           shEU = 0.f;
           shEUp = 0.f;
           shEDk = 0.f;
           shEK = 0.f;
-          for (int q = 0; q < 6; ++q)
-            shDerCloc[q] = 0.f;
-          if (extDerivedSelection && extPred != nullptr && extQthr != nullptr && extEtaL != nullptr &&
-              extRho != nullptr && extDV != nullptr) {
+          shLastArcS = 0.f;
+          shLastR = alpaka::math::abs(acc, sh.helix().tip);
+          shLastZ = sh.helix().zip;
+          int derOn = 0;
+          if (extPred != nullptr) {
             const ExtPredCoeff pc = extPred[i];  // indexed by tuple id (the producer's own indexing)
-            if (pc.valid > 0.5f && pc.c00 > 0.f && pc.c11 > 0.f) {
-              shDerCloc[0] = pc.c00;
-              shDerCloc[1] = pc.c01;
-              shDerCloc[2] = pc.c02;
-              shDerCloc[3] = pc.c11;
-              shDerCloc[4] = pc.c12;
-              shDerCloc[5] = pc.c22;
-              shDerAnchorS = pc.anchorS;
-              shDerAnchorR = pc.anchorR;
-              shDerAnchorZ = pc.anchorZ;
+            if (pc.valid > 0.5f) {
+              shLastArcS = pc.anchorS;
+              shLastR = pc.anchorR;
+              shLastZ = pc.anchorZ;
               shDerQgap = pc.qgapCoef > 0.f ? pc.qgapCoef : 0.f;
-              // The deterministic energy-loss centre, at the same anchor as the band. Guarded on a
-              // strictly positive growth rate, which is what the fit's own gate produces: with
-              // fitCorrections off, or a degenerate column/momentum, the producer leaves all four at
-              // 0 and every expression below reduces to the uncorrected form.
+              // Guarded on a strictly positive growth rate, which is what the fit's own gate produces:
+              // with the fit corrections off, or a degenerate column/momentum, the producer leaves all
+              // four at 0 and every expression below reduces to the uncorrected form.
               if (pc.elossK > 0.f) {
                 shEU = pc.elossU;
                 shEUp = pc.elossUp;
                 shEDk = pc.elossDkAnchor;
                 shEK = pc.elossK;
               }
-              shDerOn = 1;
+              derOn = 1;
             }
-            alpaka::atomicAdd(acc, &stats[shDerOn ? kStatDerHostOn : kStatDerHostOff], 1u, alpaka::hierarchy::Grids{});
+            alpaka::atomicAdd(acc, &stats[derOn ? kStatDerHostOn : kStatDerHostOff], 1u, alpaka::hierarchy::Grids{});
           }
         }
         // Warp-coop cache of the original (r,z) hit array: each lane owns k = lane, lane+nLanes, ...
@@ -893,10 +730,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 if (dd < d)
                   d = dd;
               }
-              const bool isPixelLayer = (L < 28);
-              const float typeBias = (isPixelLayer == (shPreferPixel != 0)) ? -typePriorityBiasCm : 0.f;
               cand = 1;
-              dist = d + typeBias;
+              dist = d;  // provisional; the confirm round replaces it by the information-gain key
             }
             shReachable[L] = cand;
             shReachDist[L] = dist;
@@ -918,35 +753,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
             const uint32_t lane = element.local;
             int bestL = -1;
             float bestD = 0.f;
-            // Also stage the per-lane best OT-disk layer (L >= 28, i.e. not a pixel layer, and
-            // !isBarrel) and the per-lane OT-disk tally, so the reduction can enforce the
-            // region-balanced budget without a second layer sweep. Pixel layers (barrel and disks) are
-            // deliberately excluded from both the reserve accounting and the forced selection: the
-            // crowding this fixes is strictly the OT TOB-vs-TID contention, and counting pixel layers
-            // here starves the pixel attach on stub tracks instead.
-            int bestLD = -1;
-            float bestDD = 0.f;
-            int nDiskLane = 0;
             for (int L = int(lane); L < nLayers; L += int(nLanes)) {
               if (shReachable[L] == 2 && !shVisited[L]) {
                 if (bestL < 0 || shReachDist[L] < bestD) {
                   bestD = shReachDist[L];
                   bestL = L;
                 }
-                if (L >= 28 && !caLayers.isBarrel()[L]) {  // OT disk (28 = first OT CA layer)
-                  ++nDiskLane;
-                  if (bestLD < 0 || shReachDist[L] < bestDD) {
-                    bestDD = shReachDist[L];
-                    bestLD = L;
-                  }
-                }
               }
             }
             laneHit[lane] = bestL;
             laneChi2[lane] = bestD;
-            laneHitDisk[lane] = bestLD;
-            laneChi2Disk[lane] = bestDD;
-            laneNDisk[lane] = nDiskLane;
           }
           alpaka::syncBlockThreads(acc);
 
@@ -968,15 +784,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                   laneChi2[lane] = laneChi2[o];
                   laneHit[lane] = laneHit[o];
                 }
-                const bool takeD = (laneHitDisk[lane] < 0) ||
-                                   (laneHitDisk[o] >= 0 &&
-                                    (laneChi2Disk[o] < laneChi2Disk[lane] ||
-                                     (laneChi2Disk[o] == laneChi2Disk[lane] && laneHitDisk[o] < laneHitDisk[lane])));
-                if (takeD) {
-                  laneChi2Disk[lane] = laneChi2Disk[o];
-                  laneHitDisk[lane] = laneHitDisk[o];
-                }
-                laneNDisk[lane] += laneNDisk[o];
               }
             }
             alpaka::syncBlockThreads(acc);
@@ -987,52 +794,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
           for (auto element : cms::alpakatools::uniform_group_elements(acc, j, nC * nLanes)) {
             if (element.local != 0u)
               continue;
-            const int gL = laneHit[0];       // -1 when no confirmed-reachable unvisited layer
-            const int gLD = laneHitDisk[0];  // -1 when no unvisited OT disk
-            const int nDiskUnvis = laneNDisk[0];
-            // Region-balanced walk budget, reserved-seats form: up to ceil(K/2) of the
-            // K = maxWalkLayers visit budget is reserved for OT disks. With
-            //   nDiskReach = confirmed-reachable OT disks, constant after the eager-confirm round,
-            //   reserve    = min(nDiskReach, ceil(K/2)),
-            //   owed       = reserve - (OT disks already visited), clamped at 0,
-            //   remaining  = K - shWalkSteps,
-            // the selection is forced to the nearest unvisited OT disk as soon as remaining is no
-            // larger than owed. The reachDist ordering places all reachable barrel before any disk,
-            // so on transition tracks the free budget goes to the near barrel layers and the owed
-            // tail recovers the disks, trading the outermost TOB visits. Since accepted extras follow
-            // visit order, this also avoids spending every maxExtraHitsPerTrack slot on barrel.
-            // OT-barrel-only and OT-disk-only tracks are unaffected, and pixel-layer visits spend
-            // only the free budget.
-            const int diskVisits = shOTDiskVisits;
-            const int nDiskReach = nDiskUnvis + diskVisits;
-            const int halfBudget = (extWalkBudget + 1) / 2;  // loop-bound uses the runtime budget
-            const int diskReserve = (nDiskReach < halfBudget) ? nDiskReach : halfBudget;
-            const int owed = (diskReserve > diskVisits) ? (diskReserve - diskVisits) : 0;
-            const int remaining = extWalkBudget - shWalkSteps;  // loop-bound uses the runtime budget
-            // Pixel-first visit budget: on prefer-pixel (OT-only-core) hosts, reserve up to
-            // extRecallPixelFirstBudget of the K seats for pixel by suppressing OT-disk forcing while the
-            // nearest unvisited-reachable layer is a pixel layer (gL < 28, already the -typePriorityBiasCm
-            // winner) and fewer than the reserve many pixel layers have been visited. This keeps the
-            // reserved OT-disk seats from crowding out reachable pixel layers the walk would otherwise
-            // skip. Scoped to shPreferPixel so stub tracks (the population the pixel exclusion at
-            // select-staging protects) are untouched. Budget 0 => never suppresses.
-            const bool pixReserveActive = (extRecallPixelFirstBudget > 0) && (shPreferPixel != 0) &&
-                                          (gL >= 0 && gL < 28) && (shPixVisits < extRecallPixelFirstBudget);
-            const bool forceDisk = (gLD >= 0) && (remaining <= owed) && !pixReserveActive;
-            const int selL = forceDisk ? gLD : gL;
-            // MTV-aligned extra cap: stop once the cluster budget is exhausted, since not even a
-            // one-cluster extra could be appended. With the cap off shExtraClusterCap is the sentinel
-            // and this term is never true. An anchored track (>=1 accepted OT extra on a prior walk
-            // layer) is exempt from the cluster-budget term, since a short OT-only core reaches the
-            // cap right after its first anchor and would terminate before reaching TOB5/6; the
-            // maxExtraHitsPerTrack and maxWalkLayers caps still bind. With extCapExemptTOB46Only the
-            // exemption fires only when the next selected layer is itself TOB4-6 (CA 31-33). No
-            // candidate gate chi2 exists at this decision, so extCapExemptMaxChi2 applies at the
-            // per-accept site below instead.
-            const bool capStopExempt =
-                extCapExemptAnchored && shNOTExtraAcc >= 1 && (!extCapExemptTOB46Only || (selL >= 31 && selL <= 33));
+            const int gL = laneHit[0];  // -1 when no confirmed-reachable unvisited layer
+            // The visit order is the information-gain key alone: most informative reachable
+            // uncovered layer first, within the K budget. The OT-disk seat reserve, the pixel-first
+            // reserve and the far-first re-key all existed to correct a nearest-first proxy that no
+            // longer decides anything.
+            const int selL = gL;
+            // The walk stops on its two compute budgets -- extra slots and layer visits -- and on the
+            // matching bound, once not even a one-cluster extra would fit under it.
             if (shNExtra >= maxExtraHitsPerTrack || shWalkSteps >= extWalkBudget ||
-                (!capStopExempt && shNExtraClusters >= shExtraClusterCap)) {
+                shNExtraClusters >= shExtraClusterCap) {
               shWalkDone = 1;
               if (shNExtra >= maxExtraHitsPerTrack) {  // this walk ended on the extras-slot budget
                 alpaka::atomicAdd(acc, &stats[kDiagSlotExhaust], 1u, alpaka::hierarchy::Grids{});
@@ -1049,11 +820,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
               // ordering is off, so both the scan-side count and the commit-side decline below are then
               // unreachable. Lane-0 store; the syncBlockThreads after this block publishes it to the
               // scan lanes.
-              shFarPass = 0u;
-              shFarLayer = (shFarArmed && extAttachFarMaxWin > 0 && selL < 28 && !caLayers.isBarrel()[selL] &&
-                            alpaka::math::abs(acc, caLayers.layerZ()[selL]) > shFarZFloor)
-                               ? 1
-                               : 0;
               if (candDump_) {  // dump: reset this layer's per-(candidate,layer) accumulators
                 shDumpOccM = 0u;
                 shDumpOccO = 0u;
@@ -1084,10 +850,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
               }
               shWalkDone = 0;
               ++shWalkSteps;  // only reachable-visited layers count toward the K budget
-              if (selL >= 28 && !caLayers.isBarrel()[selL])
-                ++shOTDiskVisits;  // OT-disk visits consumed from the reserve
-              if (selL < 28)
-                ++shPixVisits;  // pixel visits consumed from the pixel-first reserve
             } else if (!shConfirmDone) {
               shWalkDone = 2;     // confirmed set dry, candidates still unexamined -> eager-confirm all
               shConfirmDone = 1;  // one round leaves no state-1 layer; the walk never stages again
@@ -1101,7 +863,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
           if (shWalkDone == 2) {
             // eager batch confirm (parallel over lanes): confirm every state-1 (candidate) layer in
             // <=2 strided rounds, each lane owning L = lane, lane+nLanes, ... one on-demand full
-            // predict per layer, tested against the envelope/arc criteria (kReachSlackCm) and
+            // predict per layer, tested against the module-surface envelope widened by the
             // evaluated on the current running helix -- which at this first dry point is still the
             // initial fitted helix, no hit having been attached yet. Sets state 2 (reachable) or 0
             // (consumed, never counted against K).
@@ -1117,27 +879,48 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     isBarrel ? predictOnBarrel(acc, sh.helix(), R) : predictOnEndcap(acc, sh.helix(), Z);
                 bool ok = pr.valid;
                 if (ok) {
-                  // Pixel/inward recall: add extRecallReachRelax cm of extra envelope slack on
-                  // pixel layers (CA L<28) for prefer-pixel (OT-only-core) hosts only, so the in-road pixel
-                  // layers whose OT-only inward extrapolation drifts just past the strict kReachSlackCm=1.0cm
-                  // envelope become reachable (their hits sit well inside the road). Non-pixel layers
-                  // and non-prefer-pixel hosts keep kReachSlackCm exactly. 0 => no extra slack.
-                  const float reachSlack =
-                      kReachSlackCm +
-                      ((extRecallReachRelax > 0.f && shPreferPixel != 0 && L < 28) ? extRecallReachRelax : 0.f);
-                  // Force-pixel-visit: for prefer-pixel hosts, a pixel layer (CA L<28) with a valid
-                  // crossing (ok == pr.valid here) is confirmed reachable regardless of the envelope test --
-                  // the fragile OT-only inward extrapolation only mis-centers such a crossing, and the
-                  // per-layer road/gate scan then decides. A valid crossing is still required: a host
-                  // whose predict is invalid is state-limited and not recoverable here.
-                  // Off / non-pixel / non-prefer-pixel => the envelope test runs.
-                  const bool forcePixJ3 = (extRecallForcePixelVisit && shPreferPixel != 0 && L < 28);
-                  if (!forcePixJ3) {
-                    if (isBarrel)
-                      ok = !(alpaka::math::abs(acc, pr.secondary - Z) > caLayers.halfExtentZ()[L] + reachSlack);
-                    else
-                      ok = !(alpaka::math::abs(acc, pr.secondary - R) > caLayers.halfExtentR()[L] + reachSlack);
+                  // Reachability from geometry: the layer's module-SURFACE envelope (built from the
+                  // module plane corners, not from centres) widened by the prediction's own 1-sigma
+                  // at this eps. Nothing tuned is left -- the slack constant, the pixel-only relax and
+                  // the force-visit bypass that compensated a centre-only envelope are all gone.
+                  const float hEnv = isBarrel ? caLayers.halfExtentZ()[L] : caLayers.halfExtentR()[L];
+                  const float nom = isBarrel ? Z : R;
+                  float Hp[5], Hs[5];
+                  float slack = 0.f;
+                  if (crossWithGrad5(acc,
+                                     sh.phi0,
+                                     sh.tip,
+                                     sh.invPt,
+                                     sh.cotTheta,
+                                     sh.zip,
+                                     isBarrel,
+                                     isBarrel ? R : Z,
+                                     shSegBf,
+                                     pr.branch,
+                                     Hp,
+                                     Hs)) {
+                    const float vSec = sh.predVar(Hs);
+                    if (vSec > 0.f && alpaka::math::isfinite(acc, vSec))
+                      slack = alpaka::math::sqrt(acc, qGate1 * vSec);
+                    // Ordering key: the expected Gaussian information this crossing carries about the
+                    // state, ln det(S) - ln det(R), weighted by the layer's own probability of having
+                    // produced a usable hit. R is taken at the geometric bound on any sensor's sigma,
+                    // which is enough for a monotone comparison between layers and adds no parameter.
+                    // The key is formed once, on the state at the first dry point, like the proxy it
+                    // replaces; it is not re-derived after each accept.
+                    constexpr float kSigRef2 = 0.1f * 0.1f;  // (1 mm)^2, the sensor-sigma upper bound
+                    const float vPhi = alpaka::math::max(acc, sh.predVar(Hp), 0.f);
+                    const float etaLw =
+                        (L >= 28 && extEtaL != nullptr)
+                            ? alpaka::math::min(acc, 1.f, alpaka::math::max(acc, 1e-3f, extEtaL[L - 28]))
+                            : 1.f;
+                    const float info =
+                        etaLw * (alpaka::math::log(acc, 1.f + vPhi / kSigRef2) +
+                                 alpaka::math::log(acc, 1.f + alpaka::math::max(acc, vSec, 0.f) / kSigRef2));
+                    if (alpaka::math::isfinite(acc, info))
+                      shReachDist[L] = -info;  // select-min == most informative first
                   }
+                  ok = !(alpaka::math::abs(acc, pr.secondary - nom) > hEnv + slack);
                 }
                 // A near-tangential crossing is not rejected here: with dc = |circle centre|, a
                 // crossing at radius r_x has c = (r_x^2 + dc^2 - rho^2)/(2 dc r_x), and as |c| -> 1 the
@@ -1148,64 +931,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
               }
             }
             alpaka::syncBlockThreads(acc);
-            // Far-first disc ordering (see AttachParams::extAttachFarFirst). The select-min below
-            // ranks layers by shReachDist[], a nearest-first proxy; on a forward pixel-only host that
-            // is min_k |Z_L - z_k|, so the walk takes the next disc out and spends its budgets inward,
-            // where the transverse lever arm does not grow. Re-keying the endcap pixel layers to
-            // -|layerZ[L]| visits the farthest reachable crossing first: the crossing radius is
-            // monotone in |z| along a single-sided trajectory, so this prefers the outermost crossing
-            // without a predicted radius, which does not exist yet at ordering time. This is the only
-            // point at which shReachable[] is final, so the no-OT-opportunity test A3 is evaluated
-            // once with no extra sync. shReachDist[] feeds no road, gate, covariance or output, so
-            // re-keying it changes the visit order only; barrel and OT layers keep the nearest-first
-            // key, leaving the OT-disk reserve untouched.
-            if (extAttachFarFirst) {
-              for (auto element : cms::alpakatools::uniform_group_elements(acc, j, nC * nLanes)) {
-                if (element.local != 0u)
-                  continue;
-                // A1: the host's own fitted |cotTheta|, the same object the host mask and the pre-gate
-                // compare against sinh(maxAbsEta). Everything below the floor keeps the nearest-first
-                // order untouched.
-                const float absCot = alpaka::math::abs(acc, tracks[i].state()(3));
-                const bool a1 = absCot >= alpaka::math::sinh(acc, extAttachFarMinAbsEta);
-                // A2: the host core carries no OT/stub hit. Stub-carrying forward tracks lose from a
-                // re-ordered pixel visit, so they are excluded by construction rather than by tuning.
-                const bool a2 = (shCoveredMask >> 28) == 0;
-                // A3: no OT layer is confirmed reachable. Where TEDD content is still in reach it
-                // carries a longer lever arm than any pixel disc and the nearest-first order collects it
-                // already.
-                bool otReach = false;
-                for (int L = 28; L < nLayers; ++L) {
-                  if (shReachable[L] == 2) {
-                    otReach = true;
-                    break;
-                  }
-                }
-                if (a1 && a2 && !otReach) {
-                  for (int L = 0; L < nLayers && L < 28; ++L) {
-                    if (shReachable[L] == 2 && !caLayers.isBarrel()[L])
-                      shReachDist[L] = -alpaka::math::abs(acc, caLayers.layerZ()[L]);
-                  }
-                  // The far-crossing floor for the window-ambiguity condition: the outermost |z| the host
-                  // already occupies. A disc beyond it extends the track (this is the "extends?" property
-                  // the ordering exists to buy); a disc inside it is an interior hole and keeps the
-                  // unconditioned commit rule, so it can still take the budget seat a declined far
-                  // crossing gives back. Read from the same cached original hits the reach proxy used, so it costs
-                  // one lane-0 sweep over at most kMaxOrigHits floats and no new state.
-                  float zFloor = 0.f;
-                  for (int k = 0; k < shNOrigSafe; ++k) {
-                    const float az = alpaka::math::abs(acc, shOrigZ[k]);
-                    if (az > zFloor)
-                      zFloor = az;
-                  }
-                  shFarZFloor = zFloor;
-                  shFarArmed = 1;
-                  alpaka::atomicAdd(acc, &stats[kStatAttachFarArmed], 1u, alpaka::hierarchy::Grids{});
-                }
-              }
-              alpaka::syncBlockThreads(acc);  // publish the re-keyed order to every selecting lane
-            }
-            continue;  // re-select among the newly confirmed layers
+            alpaka::syncBlockThreads(acc);  // publish the confirmed set + its ordering key
+            continue;                       // re-select among the newly confirmed layers
           }
 
           // Per-(candidate,layer) linearization of the crossing quantities. The per-hit scan crosses the
@@ -1231,6 +958,47 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
             const bool isBarrel = caLayers.isBarrel()[L];
             const float R0 = isBarrel ? caLayers.layerR()[L] : caLayers.layerZ()[L];
             const float W = isBarrel ? caLayers.halfExtentR()[L] : caLayers.halfExtentZ()[L];
+            // The bending field to cross this layer in, from the same (Bz,Br) map the fits use: over a 60 cm forward
+            // gap the field falls by a few percent and the road centre moves by O(cm). The walk rebuilds the helix from
+            // the PCA in one constant field, and the constant that reproduces the crossing position is the
+            // (s_end - s)-weighted average of B_bend along the path (x(s_end) = int_0^s_end kappa(s) (s_end - s) ds):
+            // three samples with the weights exact for a quadratic profile, two fixed-point steps. B_bend is normalised
+            // to Bz(0,0), so the scale factor is bf.
+            {
+              constexpr float kBSampU[3] = {0.f, 1.f / 3.f, 2.f / 3.f};
+              constexpr float kBSampW[3] = {0.25f, 0.5f, 0.25f};
+              float bSeg = shSegBf;
+              for (int it = 0; it < 2; ++it) {
+                sh.recomputeHelix(acc, bSeg);
+                const HelixState hf = sh.helix();
+                const Prediction pf = isBarrel ? predictOnBarrel(acc, hf, R0) : predictOnEndcap(acc, hf, R0);
+                if (!pf.valid)
+                  break;
+                const float sEnd = pf.arcS;
+                const float absRhoF = alpaka::math::abs(acc, hf.rho);
+                float bSum = 0.f;
+                for (int k = 0; k < 3; ++k) {
+                  const float sK = kBSampU[k] * sEnd;
+                  const float aK = hf.alphaOrigin - sK / hf.rho;
+                  const float xK = hf.xc + absRhoF * alpaka::math::cos(acc, aK);
+                  const float yK = hf.yc + absRhoF * alpaka::math::sin(acc, aK);
+                  const float rK = alpaka::math::sqrt(acc, xK * xK + yK * yK);
+                  const float zK = hf.zip + sK * hf.cotTheta;
+                  // tanLambda cos(alpha), the track-radial cosine of blEffectiveBField, at this
+                  // sample: cos(alpha) = -sign(rho) (xc*y - yc*x)/(|rho| r), so the charge cancels
+                  // against the signed rho and what multiplies it is tanLambda = cotTheta.
+                  const float den = (hf.cotTheta != 0.f) ? (-hf.rho * rK / hf.cotTheta) : 0.f;
+                  const float tlca = (den != 0.f) ? -(hf.xc * yK - hf.yc * xK) / den : 0.f;
+                  bSum += kBSampW[k] * float(blBFieldMap::bBendAt(bMap, double(rK), double(zK), double(tlca)));
+                }
+                const float bNew = bf * bSum;
+                if (!(alpaka::math::abs(acc, bNew) > 1e-3f) || !alpaka::math::isfinite(acc, bNew))
+                  break;
+                bSeg = bNew;
+              }
+              shSegBf = bSeg;
+              sh.recomputeHelix(acc, shSegBf);
+            }
             const HelixState hh = sh.helix();
             const Prediction p0 = isBarrel ? predictOnBarrel(acc, hh, R0) : predictOnEndcap(acc, hh, R0);
             shLinRef = R0;
@@ -1314,151 +1082,168 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
             shUseLin = useLin;
             shLinValid = p0.valid ? 1 : 0;  // shLinDphi1 is a real derivative iff p0 was valid
 
-            // the derived road, once per layer visit
-            // Everything expensive in the derived road model is a property of the layer crossing, not
-            // of the individual candidate hit: the band prediction, the incidence brackets, the material
-            // integral and the quantile threshold. Computing them here -- once, on the reference
-            // crossing p0 -- instead of per hit is what makes the derived window cheaper than the
-            // fixed-cut one: the per-hit `segmentXX0` material march, which dominates the walk's cost,
-            // collapses to one march per visit.
+            // The road of this layer visit, built once on the reference crossing p0.
+            // Everything here is a property of the crossing, not of an individual candidate hit: the
+            // measurement rows, the prediction covariance including the traversed gap's scattering,
+            // the material integral, the energy-loss road centre and the gate threshold. The per-hit
+            // path then only adds the hit's own R. The one material march per visit is the walk's
+            // dominant cost and is not repeated per candidate.
             shDerLayOn = 0;
-            shDerSigR2 = 0.f;
-            shDerSigS2 = 0.f;
-            shDerQ = 0.f;
+            for (int q = 0; q < 6; ++q)
+              shM[q] = 0.f;
+            for (int q = 0; q < 5; ++q) {
+              shHphi[q] = 0.f;
+              shHsec[q] = 0.f;
+              shHb[q] = 0.f;
+            }
             shDerWinR = 0.f;
             shDerCeilR = 0.f;
             shDerCeilS = 0.f;
+            shOccNorm = 0.f;
             shDerHoleK = -1e30f;
             shDerHoleKRaw = -1e30f;
             shDerHoleK3 = -1e30f;
             shDerBendOn = 0;
             shDerPredB = 0.f;
-            shDerRbbTrk = 0.f;
-            shDerQ3 = 0.f;
-            shDerC = 0.f;
-            shDerW = 0.f;
-            shDerS1 = 0.f;
-            shDerS2 = 0.f;
+            shQcPhi = 0.f;
+            shQcCot = 0.f;
+            shGapW = 0.f;
+            shGapS1 = 0.f;
+            shGapS2 = 0.f;
+            shElS1 = 0.f;
+            shElS2 = 0.f;
             shDerElossPhi = 0.f;
             shDerElossSec = 0.f;
-            // The derived road covers the OT layers. On the pixel discs the walk enumerates, reaches
-            // and searches as before, but there is no measured Q-hat class and no eta_L/rho row for
-            // them, so the derived road stays off there and the fixed-cut gate is used.
-            if (shDerOn && L >= 28 && p0.valid) {
-              // Runaway ceilings, derived from this layer's module envelope. On the derived path an
-              // absolute cm cap is only a ceiling on pathological states, set from geometry rather
-              // than resolution and far outside the eps-window of a healthy road; the fixed cm caps
-              // used off this path would bind most roads here and act as the selector. Both ceilings
-              // come from the layer's module-envelope half-extents plus the same kReachSlackCm the
-              // reachability test grants the prediction: for the secondary (barrel z, endcap r)
-              // prediction and hit both lie within h_sec of nominal, so |dSec| <= 2 h_sec + slack is a
-              // hard geometric bound; in R-phi the envelope bounds nothing azimuthally and the only
-              // transverse scale it supplies is the crossing surface's thickness 2 h_prop, so
-              // ceilR = 2 h_prop + slack, which still caps the phi-bin scan. Both binding rates are
-              // counted (kStatDerCapR / kStatDerCapS): well under 1 % means the ceiling is a guard,
-              // more means it is doing the selection and the delivered efficiency is not eps.
+            if (p0.valid) {
+              // Runaway ceilings from this layer's module envelope: a geometric bound on a pathological
+              // state, never the selector. The secondary prediction and the hit both lie inside the
+              // envelope, so |dSec| <= 2 h_sec is a hard bound; in r-phi the envelope bounds nothing
+              // azimuthally and the only transverse scale it supplies is the crossing surface's
+              // thickness. Both binding rates are counted (kStatDerCapR / kStatDerCapS).
               const float hSecEnv = isBarrel ? caLayers.halfExtentZ()[L] : caLayers.halfExtentR()[L];
               const float hPropEnv = isBarrel ? caLayers.halfExtentR()[L] : caLayers.halfExtentZ()[L];
-              shDerCeilS = 2.f * hSecEnv + kReachSlackCm;
-              shDerCeilR = 2.f * hPropEnv + kReachSlackCm;
-              const float ds = p0.arcS - shDerAnchorS;  // transverse arc from the anchor to the crossing
-              // the band prediction: V_u(ds) = g^T C_loc g, g = [1, ds, -ds^2/2]
-              const float g1 = ds;
-              const float g2 = -0.5f * ds * ds;
-              const float Vband = shDerCloc[0] + g1 * g1 * shDerCloc[3] + g2 * g2 * shDerCloc[5] +
-                                  2.f * (g1 * shDerCloc[1] + g2 * shDerCloc[2] + g1 * g2 * shDerCloc[4]);
-              // the crossing geometry: transverse incidence psi and dip lambda
+              shDerCeilS = 2.f * hSecEnv;
+              shDerCeilR = 2.f * hPropEnv;
               const float rCross = isBarrel ? R0 : p0.secondary;
               const float zCross = isBarrel ? p0.secondary : R0;
               const float rSafe = alpaka::math::max(acc, rCross, 1.f);
-              const float xCr = rSafe * alpaka::math::cos(acc, p0.phi);
-              const float yCr = rSafe * alpaka::math::sin(acc, p0.phi);
-              // cos(psi) = |P x C| / (|rho| r): the transverse track direction against the radial one.
-              // Clamped away from 0 so the barrel 1/cos^2 bracket stays finite on a grazing crossing
-              // (those layers are already guarded by the reachability test).
-              float cpsi = alpaka::math::abs(acc, xCr * hh.yc - yCr * hh.xc) /
-                           alpaka::math::max(acc, alpaka::math::abs(acc, hh.rho) * rSafe, 1e-6f);
-              cpsi = alpaka::math::min(acc, 1.f, alpaka::math::max(acc, 1e-3f, cpsi));
-              const float c2 = cpsi * cpsi;
-              const float s2 = 1.f - c2;
               const float cot = hh.cotTheta;
               const float cot2 = cot * cot;
-              const float sinlam2 = alpaka::math::max(acc, cot2 / (1.f + cot2), 1e-9f);
               const float coslam2 = 1.f / (1.f + cot2);
-              // conv^2 converts the trajectory's lateral offset to the target surface; G_rphi/G_sec are
-              // the exact transverse-plane projection brackets -- zero free parameters, and >= 1
-              // identically, so the exact projection can only widen the road.
-              const float conv2 = isBarrel ? (1.f / c2) : c2;
-              const float Grphi = isBarrel ? (1.f / c2) : (c2 + s2 / sinlam2);
-              const float Gsec = isBarrel ? (1.f / coslam2 + cot2 * s2 / c2) : (s2 + c2 / sinlam2);
-              // the material moments of the gap anchor -> crossing (one map march per visit)
+              const float coslam = alpaka::math::sqrt(acc, coslam2);
+
+              // --- the traversed gap: one material march, anchor -> crossing -------------------------
+              // segmentXX0Moments publishes the Kleinwort two-thin-scatterer pair, i.e. the moments of
+              // rho*dl about the ARRIVAL end with a 3-D lever: S1_arr = w1 W d1, S2_arr = S1_arr d1.
+              // The perigee state needs them about the PERIGEE reference point and on the TRANSVERSE
+              // arc the state's levers are measured in, so convert: one cos(lambda) per lever power,
+              // then shift the origin from the arrival end (at transverse arc s_a) to the perigee.
               double d1 = 0., w1 = 0.;
+              // The map holds X/X0 per cm of 3-D path, and the (r,z) chord the walk marches is shorter
+              // than the helix arc between the same two points: hand the march the gap's real 3-D path
+              // so the total and the lever come out in path units, the same rescaling the fit's own
+              // marchers apply.
+              const float sGapT = alpaka::math::abs(acc, p0.arcS - shLastArcS);
+              const double path3D = double(sGapT) / double(alpaka::math::max(acc, coslam, 1e-3f));
               const float Wm = float(brokenline::segmentXX0Moments(
-                  acc, rhoMap_, double(shDerAnchorR), double(shDerAnchorZ), double(rSafe), double(zCross), d1, w1));
-              // segmentXX0Moments publishes the Kleinwort two-thin-scatterer pair; the raw moments come
-              // back exactly: S1 = w1 W d1, S2 = w1 W d1^2 (d measured from the arrival end = the target).
-              const float S1m = float(w1) * Wm * float(d1);
-              const float S2m = S1m * float(d1);
-              const float pT = alpaka::math::abs(acc, shBf * hh.rho);
+                  acc, rhoMap_, double(shLastR), double(shLastZ), double(rSafe), double(zCross), d1, w1, path3D));
+              const float S1arr = float(w1) * Wm * float(d1) * coslam;
+              const float S2arr = float(w1) * Wm * float(d1) * float(d1) * coslam2;
+              const float sA = p0.arcS;  // transverse arc of the crossing from the perigee
+              const float S1pca = Wm * sA - S1arr;
+              const float S2pca = Wm * sA * sA - 2.f * sA * S1arr + S2arr;
+              const float pT = alpaka::math::abs(acc, shSegBf * hh.rho);
               const float pTot = pT * alpaka::math::sqrt(acc, 1.f + cot2);
               const float cH = extHighlandC(acc, pTot, Wm);
-              const float Qa = cH * S2m;                                 // 3-D lever
-              const float Qgap = shDerQgap * ds * ds;                    // last fitted gap
-              const float fms = isBarrel ? extFmsBarrel : extFmsEndcap;  // material-dispersion scale
-              // --- the endcap line rows (a sizeable share of the forward variance; exactly 0 in the
-              // barrel by the closed form). At fixed z the crossing arc carries the (z0, cot) variance,
-              // s_T = (z - z0)/cot, and an arc shift moves the crossing azimuthally by sin(psi) per unit
-              // arc, so Var_line(u) = (sin psi / cot)^2 * Var_z(s_T) -- and Var_z(s_T) is exactly the
-              // propagated barrel secondary variance the walk already forms.
-              float Vline = 0.f;
-              if (!isBarrel) {
-                const float sArc = p0.arcS;
-                const float varZ = sh.vZip + sArc * sArc * sh.vCot + 2.f * sArc * sh.cCotZip;
-                const float sp =
-                    alpaka::math::sqrt(acc, s2) / alpaka::math::max(acc, alpaka::math::abs(acc, cot), 1e-3f);
-                Vline = alpaka::math::max(acc, sp * sp * varZ, 0.f);
+              // Azimuthal deflection: variance theta0^2/sin^2(theta) = theta0^2 (1+cot^2). Polar:
+              // d(cot)/d(lambda) = -(1+cot^2), so its variance carries that Jacobian squared.
+              shQcPhi = cH * (1.f + cot2);
+              shQcCot = cH * (1.f + cot2) * (1.f + cot2);
+              shGapW = Wm;
+              shGapS1 = S1pca;
+              shGapS2 = S2pca;
+              shElS1 = S1arr;
+              shElS2 = S2arr;
+              // The last fitted gap's exit-direction kink is structurally invisible to the fit
+              // (varBeta(n-1) == 0), so it is injected here as an extra kink at the anchor arc.
+              const float qGapExit = shDerQgap;
+
+              // --- P + Q of this gap, and the measurement rows ---------------------------------------
+              for (int q = 0; q < 15; ++q)
+                shPgate[q] = sh.C[q];
+              {
+                RunningHelix tmp;  // a covariance-only scratch: addKinkNoise touches C alone
+                for (int q = 0; q < 15; ++q)
+                  tmp.C[q] = shPgate[q];
+                tmp.addKinkNoise(shQcPhi, shQcCot, shGapW, shGapS1, shGapS2);
+                if (qGapExit > 0.f) {
+                  const float sk = shLastArcS;
+                  tmp.addKinkNoise(qGapExit * (1.f + cot2), qGapExit * (1.f + cot2) * (1.f + cot2), 1.f, sk, sk * sk);
+                }
+                for (int q = 0; q < 15; ++q)
+                  shPgate[q] = tmp.C[q];
               }
-              shDerSigR2 = alpaka::math::max(acc, Vband * conv2 + (Qa + Qgap) * Grphi * fms + Vline, 0.f);
-              shDerSigS2 = alpaka::math::max(acc, Qa * Gsec * fms, 0.f);
-              shDerC = cH;
-              shDerW = Wm;
-              shDerS1 = S1m;
-              shDerS2 = S2m;
-              // Ionization energy-loss road centre: everything above sizes the road, this moves it.
-              // The walk propagates a circle of the curvature the fast fit published, kappa_0 at the
-              // production vertex, while the real track's unsigned curvature grows along the path, so
-              // at an OT layer it sits inside that circle by the double integral of the growth.
-              // Nothing downstream absorbs that offset: the fit subtracts its own dE/dx term, and the
-              // road's width cannot, a centre offset delta inflating the empirical 2-dof quantile by
-              // ~1 + (delta/sigma)^2. In the band's local frame (u = radial offset from the reference
-              // circle, outward positive; u'' = -dkappa) the offset at this crossing is exactly
-              //     uE = shEU + shEUp*ds - 0.5*( shEDk*ds^2 + shEK*S2m )
-              // the last term being int_0^ds (ds-s') dkappa_material(s') ds' = S2/2 with S2 the second
-              // moment of the traversed material about the arrival end -- the march that just ran. No
-              // linearity assumption on the material profile is made.
-              // Projection onto the two gate rows, first order, with the crossing geometry the width
-              // brackets use: n = (P - C)/|rho| is the outward normal, b = n.phihat (|b| = cos psi),
-              // a = n.rhat and a^2 + b^2 = 1.
-              //   barrel (fixed r): the displacement u*n plus the slide along the track back to the
-              //     cylinder give r*dphi = u/b exactly; the slide moves z by dz = -u*a*(ds/dr)*cotTheta,
-              //     and (ds/dr)*cotTheta is shLinDsec1.
-              //   endcap (fixed z): no slide, so r*dphi = u*b and dr = u*a directly.
-              // Both shifts are added to the prediction, never to a variance. The phi shift is stored
-              // in radians at the reference crossing rather than per hit.
-              if (shEK > 0.f) {
-                // Metric: `ds` and u' are transverse (ds = p0.arcS - shDerAnchorS) while
-                // segmentXX0Moments returns S1/S2 with a 3-D lever. The eloss recursion needs the
-                // lever in the same transverse metric as ds, since dkappa is a transverse curvature
-                // and u a transverse offset, so one cos(lambda) per lever power survives and S2
-                // carries lever^2 -> coslam2. The MS process noise below instead takes S2 with no
-                // conversion, the scattering angle converting too and the two cos(lambda) cancelling.
-                const float uE = shEU + shEUp * ds - 0.5f * (shEDk * ds * ds + shEK * S2m * coslam2);
+              float Hphi[5], Hsec[5];
+              const bool rowsOk = crossWithGrad5(
+                  acc, sh.phi0, sh.tip, sh.invPt, sh.cotTheta, sh.zip, isBarrel, R0, shSegBf, p0.branch, Hphi, Hsec);
+              if (rowsOk) {
+                for (int q = 0; q < 5; ++q) {
+                  shHphi[q] = Hphi[q];
+                  shHsec[q] = Hsec[q];
+                }
+                auto proj = [&](const float* Ha, const float* Hb2) {
+                  float v = 0.f;
+                  for (int x = 0; x < 5; ++x)
+                    for (int y = 0; y < 5; ++y)
+                      v += Ha[x] * shPgate[RunningHelix::cIdx(x, y)] * Hb2[y];
+                  return v;
+                };
+                shM[0] = proj(Hphi, Hphi);
+                shM[1] = proj(Hphi, Hsec);
+                shM[3] = proj(Hsec, Hsec);
+                shDerLayOn = (alpaka::math::isfinite(acc, shM[0]) && alpaka::math::isfinite(acc, shM[3]) &&
+                              shM[0] > 0.f && shM[3] > 0.f)
+                                 ? 1
+                                 : 0;
+
+                // --- the stub-bend row -------------------------------------------------------------
+                // The track side is the closed-form dphi/dr of the same crossing; its state Jacobian is
+                // the analytic gradient of that expression (the only row not produced by the crossing's
+                // own dual-number pass: it is a derivative OF a derivative). Q enters through shPgate,
+                // so the row shares the state's scattering with the position rows.
+                if (shDerLayOn) {
+                  const float predB = extBendPredDPhiDr(acc, hh, isBarrel, R0);
+                  float Hb1 = 0.f, Hb2c = 0.f, Hb3 = 0.f, Hb4 = 0.f;
+                  if (predB != 0.f &&
+                      extBendPredDPhiDrGrad(acc, hh, isBarrel, R0, shSegBf, predB, Hb1, Hb2c, Hb3, Hb4)) {
+                    const float Hbv[5] = {0.f, Hb1, Hb2c, Hb3, Hb4};  // the phi0 partial is exactly 0
+                    const float m22 = proj(Hbv, Hbv);
+                    if (alpaka::math::isfinite(acc, m22) && m22 >= 0.f) {
+                      for (int q = 0; q < 5; ++q)
+                        shHb[q] = Hbv[q];
+                      shM[2] = proj(Hphi, Hbv);
+                      shM[4] = proj(Hsec, Hbv);
+                      shM[5] = m22;
+                      shDerPredB = predB;
+                      shDerBendOn = 1;
+                    }
+                  }
+                }
+              }
+
+              // --- the energy-loss road centre ------------------------------------------------------
+              // The walk propagates the curvature published at the vertex while the real curvature grows along the path,
+              // so at the layer the track sits inside that circle. In the band's local frame (u = radial offset, outward
+              // positive) the offset is uE = shEU + shEUp*ds - 0.5*(shEDk*ds^2 + shEK*S2_arr), S2_arr the second moment
+              // about the arrival end; projected on the two rows with the crossing geometry (a bias, never a variance).
+              if (shDerLayOn && shEK > 0.f) {
+                const float ds = sA - shLastArcS;
+                const float xCr = rSafe * alpaka::math::cos(acc, p0.phi);
+                const float yCr = rSafe * alpaka::math::sin(acc, p0.phi);
+                const float uE = shEU + shEUp * ds - 0.5f * (shEDk * ds * ds + shEK * S2arr);
                 const float absRhoS = alpaka::math::max(acc, alpaka::math::abs(acc, hh.rho), 1e-6f);
                 const float bN = (hh.xc * yCr - hh.yc * xCr) / (rSafe * absRhoS);          // n.phihat, signed cos(psi)
                 const float aN = (rSafe - (hh.xc * xCr + hh.yc * yCr) / rSafe) / absRhoS;  // n.rhat
-                // Guard the grazing crossing the same way the width does (cpsi is clamped at 1e-3):
-                // 1/b is the barrel amplification and diverges there, and those layers are already
-                // outside the reachability test's healthy region.
                 const float bSgn = (bN >= 0.f) ? 1.f : -1.f;
                 const float bSafe = bSgn * alpaka::math::max(acc, alpaka::math::abs(acc, bN), 1e-3f);
                 const float dRPhiE = isBarrel ? (uE / bSafe) : (uE * bN);
@@ -1468,141 +1253,57 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                   shDerElossSec = dSecE;
                 }
               }
-              // the single-eps threshold: one measured quantile, spent once
-              const float absCotHost = alpaka::math::abs(acc, cot);
-              const int cell = extQhatCell(L, absCotHost, shWalkSteps - 1, extFwdEtaBin);
-              const float Q = (cell >= 0) ? extQthr[cell] : 0.f;
-              if (Q > 0.f && alpaka::math::isfinite(acc, shDerSigR2) && alpaka::math::isfinite(acc, shDerSigS2)) {
-                shDerQ = Q;
-                // The r-phi window is the bounding half-width of the same chi2 ball -- a derived
-                // consequence of the one eps, not a second one. The per-hit term is bounded by the
-                // safe sensor upper bound so the window can be sized before the hits are read.
+
+              // --- the window, from the gate itself --------------------------------------------------
+              // The r-phi half-window is the bounding half-width of the same chi2 ball the gate cuts on:
+              // a derived consequence of the one eps, not a second choice. The hit term is taken at a
+              // safe sensor upper bound, since the window is sized before the hits are read.
+              if (shDerLayOn) {
                 constexpr float kMaxSigPhiHitCmW = 0.1f;
-                // The window is sized before the hits are read, so the target-side additive variance is
-                // taken at its safe upper bound: TB2S, the largest of the classes on the OT layers this
-                // block covers. The bound is safe in the direction that matters: it can only admit hits
-                // the per-hit gate then judges, never reject one.
-                const float dvMax = extDV[kExtMatClsTB2S];
-                const float sHi =
-                    shDerSigR2 + kMaxSigPhiHitCmW * kMaxSigPhiHitCmW + alignSigmaPhiCm * alignSigmaPhiCm + dvMax;
-                shDerWinR = alpaka::math::sqrt(acc, Q * sHi);
-                shDerLayOn = 1;
+                const float qWin = shDerBendOn ? alpaka::math::max(acc, qGate2, qGate3) : qGate2;
+                shDerWinR = alpaka::math::sqrt(acc, qWin * (shM[0] + kMaxSigPhiHitCmW * kMaxSigPhiHitCmW));
                 alpaka::atomicAdd(acc, &stats[kStatDerLayers], 1u, alpaka::hierarchy::Grids{});
-                // The hole hypothesis's constant part:
-                // chi2_hole = 2 ln[ P / ((1 - eta_L eps) nu) ],  nu = rho (2 pi)^{d/2} |R|^{1/2},
-                // with the numerator P = eta_L (the detection prior, extHoleDetectionPrior on) or
-                // eta_L*eps (the plain form, off -- see just below and the params header)
-                // at d = 2 (the two-row statistic (r-phi, secondary), i.e. without the bend row),
-                // so |R|^{1/2} = sigma_R sigma_S and the per-candidate part is -ln(sigma_R^2 sigma_S^2).
-                // eta_L / rho: the layer-keyed rows are [L - 28], with no |eta| axis, so a TID row is
-                // dominated by whichever |eta| population supplies most of its residuals (see
-                // AttachParams::extEtaL).
-                const float etaL = extEtaL[L - 28];
+              }
+
+              // --- the hole hypothesis ---------------------------------------------------------------
+              // "This layer produced no usable hit" competes in the same currency as a candidate: the PDA no-detection
+              // weight chi2_hole = 2 ln[ eta_L / ((1 - eta_L eps) nu) ] with nu = rho_d (2 pi)^{d/2} |S|^{1/2}; the |S|
+              // half is per-candidate and is added at the commit site with the local/layer density ratio the scan
+              // measures. eta_L and rho are measured detector properties per layer.
+              if (shDerLayOn && L >= 28 && extEtaL != nullptr && extRho != nullptr) {
+                const float etaLc = alpaka::math::min(acc, 0.9999f, alpaka::math::max(acc, 1e-4f, extEtaL[L - 28]));
                 const float rhoL = extRho[L - 28];
-                const float etaLc = alpaka::math::min(acc, 0.9999f, alpaka::math::max(acc, 1e-4f, etaL));
-                const float ne = etaLc * extDerivedEps;
-                // the hit hypothesis's prior. The plain form eta_L*eps double-counts the window,
-                // because the Gaussian density this prior multiplies already integrates to eps over that
-                // same window (see AttachParams::extHoleDetectionPrior for the derivation and the pda
-                // reference). The corrected form is the detection probability eta_L alone; the gate mass
-                // belongs only in the no-detection term (1 - eta_L*eps), which is unchanged either way.
-                // The correction is exactly + 2 ln(1/eps) of chi2_hole and introduces no new number.
-                const float pdNum = extHoleDetectionPrior ? etaLc : ne;
-                // Armed at d >= 3 only (kExtDerHoleMinDim): the hole's price is set by the window
-                // volume, and at d = 2 that volume is an order of magnitude larger than the d = 3
-                // one, dropping chi2_hole below the median gate threshold. Without extBendPackage
-                // the hole is therefore compiled but inert and extDerivedHole has no effect.
-                // The bend row's per-layer constants:
-                // p_b = (dPhiDr_hit - dPhiDr_track) / sqrt(R_bb),
-                //     R_bb = sigma_b^2 + H_b C H_b^T + Q_MS,bb.
-                // track side: the closed-form dphi/dr of the fitted helix at this surface -- the same
-                // derivative the walk already linearises, in analytic rather than finite-difference
-                // form (see extBendPredDPhiDr).
-                // H_b: its partials wrt (phi0, d0, 1/pT, cot, z0), from the same crossing expression
-                // (ExtenderHelixHelpers.h::extBendPredDPhiDrGrad). Only four are computed: dphi/dr at
-                // the crossing is a rotation invariant, so its phi0 partial vanishes in both regions,
-                // and in the barrel it depends on neither cot nor z0.
-                // Q_MS,bb: the MS angular variance at the crossing converted to dPhiDr units,
-                // tan(alpha) = r dPhiDr => d(dPhiDr)/d(alpha) = (1 + tan^2 alpha)/r.
-                if (extBendPackage) {
-                  const float predB = extBendPredDPhiDr(acc, hh, isBarrel, R0);
-                  if (predB != 0.f) {
-                    float Hb1 = 0.f, Hb2 = 0.f, Hb3 = 0.f, Hb4 = 0.f;
-                    const bool hbOk = extBendPredDPhiDrGrad(acc, hh, isBarrel, R0, shBf, predB, Hb1, Hb2, Hb3, Hb4);
-                    if (hbOk) {
-                      // H_b0 (the phi0 partial) is identically zero, so every cross term it appears in
-                      // drops out of H_b C H_b^T analytically and the quadratic form runs over the four
-                      // surviving partials only.
-                      const float HCH = Hb1 * Hb1 * sh.vTip + Hb2 * Hb2 * sh.vPt + 2.f * Hb1 * Hb2 * sh.cTipPt +
-                                        Hb3 * Hb3 * sh.vCot + Hb4 * Hb4 * sh.vZip + 2.f * Hb3 * Hb4 * sh.cCotZip;
-                      const float varAng = cH * Wm;  // theta_0^2 accumulated to the crossing [rad^2]
-                      const float tana = rSafe * predB;
-                      const float jAng = (1.f + tana * tana) / rSafe;
-                      const float Qmsb = varAng * jAng * jAng * fms;
-                      const float rbbTrk = alpaka::math::max(acc, HCH, 0.f) + alpaka::math::max(acc, Qmsb, 0.f);
-                      // The third row is the stub bend. The enclosing block is OT-only and extQhatCell
-                      // returns -1 off it, so the `L >= 28` conjunct below is implied; it is kept as an
-                      // explicit guard.
-                      const float Q3 = (cell >= 0 && L >= 28 && extQhat3 != nullptr) ? extQhat3[cell] : 0.f;
-                      if (alpaka::math::isfinite(acc, rbbTrk) && Q3 > 0.f) {
-                        shDerBendOn = 1;
-                        shDerPredB = predB;
-                        shDerRbbTrk = rbbTrk;
-                        shDerQ3 = Q3;
-                        // The phi-scan is sized before the hits are read, so it must cover the wider
-                        // of the two statistics; the per-candidate gate then uses its own.
-                        if (Q3 > Q)
-                          shDerWinR = alpaka::math::sqrt(acc, Q3 * sHi);
-                      }
-                    }
-                  }
-                }
-                // The hole arms when the statistic reaches 3 dof (see kExtDerMeasDim*):
-                // nu = rho_d (2 pi)^{d/2} sqrt(|R_d|), and the density must live in the measurement
-                // space the volume is taken in. |R_3| = sigma_R^2 sigma_S^2 R_bb has units cm^2 rad^2,
-                // so its square root is a cm x rad and the density that makes nu dimensionless is a
-                // per-area-per-bend one: rho_3 = rho_A / (2 b99), with b99 the per-layer 99th-percentile
-                // bend half-range [rad/cm]. Using the areal rho_A against a 3-dof volume is dimensionally
-                // wrong and shifts chi2_hole by 2 ln(2 b99), several units. Both constants are formed here
-                // and the commit site picks the one matching the winner's own dimension: a stub winner
-                // carries a bend row (d = 3), a raw-OT winner does not (d = 2).
-                if (shDerBendOn && L >= 28 && extDerivedHole && ne > 0.f && ne < 1.f) {
-                  constexpr float kTwoPi32 = 15.7496099f;  // (2 pi)^{3/2}
-                  const float rho3L = (L >= 28) ? extRho3[L - 28] : 0.f;
-                  if (rho3L > 0.f)
-                    shDerHoleK3 = 2.f * alpaka::math::log(acc, pdNum / ((1.f - ne) * rho3L * kTwoPi32));
-                }
-                // The d = 2 branch is for a raw-OT winner inside the bend package, never a mode of its
-                // own: without extBendPackage the hole must stay fully inert. The guard is explicit here
-                // because the dimension is a runtime quantity, and a missing guard silently arms the
-                // 2-dof hole -- which, priced against a 3-dof volume, declines a large fraction of the
-                // argmin winners and costs hit content.
-                if (extBendPackage && extDerivedHole && rhoL > 0.f && ne > 0.f && ne < 1.f) {
+                const float ne = etaLc * extGateEps;
+                if (ne > 0.f && ne < 1.f) {
                   constexpr float kTwoPi = 6.2831853f;
-                  shDerHoleK = 2.f * alpaka::math::log(acc, pdNum / ((1.f - ne) * rhoL * kTwoPi));
-                  // The raw-OT round's own price (extHoleRawRoundPrior). Round 1 runs only where
-                  // round 0 attached nothing, so the hypothesis it arbitrates is not stub
-                  // availability but the conditional availability of a usable raw cluster given that
-                  // no stub was formed, eta_cond = (eta_rawOT - eta_stub)/(1 - eta_stub), and the
-                  // background it competes against is raw clusters rather than stubs. Pricing a raw
-                  // winner with the stub rows would make the hole several chi2 units too expensive.
-                  // Both replacement rows are measured like eta_L; no new free parameter, same eps.
+                  constexpr float kTwoPi32 = 15.7496099f;  // (2 pi)^{3/2}
+                  if (rhoL > 0.f)
+                    shDerHoleK = 2.f * alpaka::math::log(acc, etaLc / ((1.f - ne) * rhoL * kTwoPi));
+                  const float rho3L = (extRho3 != nullptr) ? extRho3[L - 28] : 0.f;
+                  if (shDerBendOn && rho3L > 0.f)
+                    shDerHoleK3 = 2.f * alpaka::math::log(acc, etaLc / ((1.f - ne) * rho3L * kTwoPi32));
+                  // The raw-OT round runs only where the stub round attached nothing, so it arbitrates
+                  // the conditional availability of a raw cluster given that no stub formed, against a
+                  // background of raw clusters. Its density is the event's own: the OT layer occupancy
+                  // over the layer's envelope area, not a frozen multiple of the stub density.
                   const float etaLR =
-                      (extEtaLRaw != nullptr && L >= 28)
+                      (extEtaLRaw != nullptr)
                           ? alpaka::math::min(acc, 0.9999f, alpaka::math::max(acc, 1e-4f, extEtaLRaw[L - 28]))
                           : etaLc;
-                  const float rhoR = (extRhoRaw != nullptr && L >= 28) ? extRhoRaw[L - 28] : rhoL;
-                  const float neR = etaLR * extDerivedEps;
-                  const float pdNumR = extHoleDetectionPrior ? etaLR : neR;
+                  float rhoR = rhoL;
+                  if (otSource_.nOTHits > 0u && otSource_.layerStart != nullptr) {
+                    const float nOTL = float(otSource_.layerStart[L + 1] - otSource_.layerStart[L]);
+                    const float rEnv = alpaka::math::max(acc, caLayers.layerR()[L], 1.f);
+                    const float hEnv = isBarrel ? caLayers.halfExtentZ()[L] : caLayers.halfExtentR()[L];
+                    const float area = 2.f * kExtenderPi * rEnv * 2.f * alpaka::math::max(acc, hEnv, 0.1f);
+                    if (nOTL > 0.f && area > 0.f)
+                      rhoR = nOTL / area;
+                  }
+                  const float neR = etaLR * extGateEps;
                   if (rhoR > 0.f && neR > 0.f && neR < 1.f)
-                    shDerHoleKRaw = 2.f * alpaka::math::log(acc, pdNumR / ((1.f - neR) * rhoR * kTwoPi));
+                    shDerHoleKRaw = 2.f * alpaka::math::log(acc, etaLR / ((1.f - neR) * rhoR * kTwoPi));
                 }
               }
-              // The road-centre shift is computed above, before the Q-hat lookup that arms shDerLayOn,
-              // so a layer whose derived road fails to arm (Q <= 0 or a non-finite sigma, the
-              // pathological state the fallback exists for) would otherwise carry a shifted prediction
-              // into the fixed-cut fallback. Keep the two paths cleanly separated: derived road on =>
-              // corrected prediction + derived gate; off => uncorrected prediction + fixed-cut gate.
               if (!shDerLayOn) {
                 shDerElossPhi = 0.f;
                 shDerElossSec = 0.f;
@@ -1624,12 +1325,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
             // source-scoped raw-OT veto: skip the raw-OT round on the impure layer classes (TOB4-6
             // CA 31-33 / TID CA 34-53). The merged-stub round 0 already ran on this layer and is
             // untouched; only the low-purity raw-OT source is withheld here.
-            if (round == 1 && ((extRawOTVetoTOB456 && shCurrentL >= 31 && shCurrentL <= 33) ||
-                               (extRawOTVetoTID && shCurrentL >= 34 && shCurrentL <= 53))) {
-              if (candDump_)  // dump: record that the raw-OT round was withheld on this layer
-                shDumpVeto = 1;
-              break;
-            }
 
             // parallel hit scan on shCurrentL: each lane scans a round-robin subset of the phi window
             // and keeps its local best (min chi2, ties by min hitId). Round 0 reads the merged binner /
@@ -1641,67 +1336,34 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
               const float R = caLayers.layerR()[L];
               const float Z = caLayers.layerZ()[L];
 
-              // Scale the TOB4-6 (CA 31-33) barrel chi2 cut by extChi2CutScaleTOB456. Multiplied into
-              // baseChi2Cut, so it governs both the merged round (the bestChi2 seed) and the raw-OT
-              // round (hitCut). Scale 1.0 leaves the cut at its base value.
-              const float scaleTOB456 = (L >= 31 && L <= 33) ? extChi2CutScaleTOB456 : 1.f;
-              // Independent TID endcap (CA 34-53) scale, on a layer range disjoint from TOB4-6.
-              const float scaleTID = (L >= 34 && L <= 53) ? extChi2CutScaleTID : 1.f;
-              // displacement-aware inner-OT gate: on a genuinely-displaced host (shHostDisplaced, computed
-              // in setup), tighten the TOB1-3 (CA 28-30) accept window by kDispGateTOB13Scale. Multiplied
-              // into baseChi2Cut so it governs both the merged round and the raw-OT round on those layers.
-              // Prompt hosts / gate off => shHostDisplaced == 0 => scale 1. Outer layers (31-53) and
-              // pixel layers are never affected.
-              const float scaleTOB13 = (shHostDisplaced && L >= 28 && L <= 30) ? kDispGateTOB13Scale : 1.f;
-              // forward-eta pocket gate: independent TOB1-3 tightening on a forward-eta host (shHostForwardPocket,
-              // computed in setup). Mutually exclusive with dispgate by construction (shHostForwardPocket requires
-              // !shHostDisplaced), so at most one of scaleTOB13/scalePocket is < 1 -- the product folds in
-              // exactly one. Gate off / non-forward host / L outside 28-30 => scale 1.
-              const float scalePocket = (shHostForwardPocket && L >= 28 && L <= 30) ? kPocketTOB13Scale : 1.f;
-              // On pixel layers (CA L<28) extPixelGateChi2Cut replaces the base cut: a 2-dof gate at
-              // chi2 = 2.0 is the 1-e^-1 = 63 % efficiency quantile, while the 95 % quantile is
-              // -2*ln(0.05) ~= 6.0. OT layers keep chi2Cut/endcapChi2Cut; the OT-scoped scales are all
-              // 1 on L<28, so on pixel this is exactly the override. <= 0 (sentinel) => pixel keeps
-              // chi2Cut/endcapChi2Cut.
-              const float pixBaseCut =
-                  (extPixelGateChi2Cut > 0.f && L < 28) ? extPixelGateChi2Cut : (isBarrel ? chi2Cut : endcapChi2Cut);
-              const float baseChi2Cut = pixBaseCut * scaleTOB456 * scaleTID * scaleTOB13 * scalePocket;
-
-              // On the derived path the admission threshold is the measured quantile -- one number
-              // replacing chi2Cut/endcapChi2Cut, the TOB4-6/TID region scales, the pixel gate cut and
-              // the three covariance scales. (Pixel layers keep baseChi2Cut: every table is measured on
-              // OT roads.) With two statistics live on the same layer -- 3-dof for stubs, 2-dof for
-              // raw-OT and non-stub merged hits -- the argmin seed cannot double as the cut, so it seeds
-              // at the wider map, no gate-passing candidate is pre-empted, and each round applies its
-              // own threshold explicitly (the raw-OT round does so via hitCut).
-              float bestChi2 =
-                  shDerLayOn ? (shDerBendOn ? alpaka::math::max(acc, shDerQ, shDerQ3) : shDerQ) : baseChi2Cut;
-              float bestDPhi = 0.f, bestDSec = 0.f;
-              float bestSigPhi2Hit = 0.f, bestSigSec2Hit = 0.f;
-              float bestDerSigR2 = 0.f, bestDerSigS2 = 0.f;  // full gate variances [cm^2]
-              float bestDerRbb = 0.f;                        // the winner's R_bb (0 = no bend row)
+              // One statistic, one threshold, one ranking key. The argmin runs on the tail probability
+              // -ln(1 - F_d(chi2)) so candidates of different dof compete fairly; the seed is +inf and
+              // each candidate applies the quantile of its own dof explicitly.
+              float bestScore = 3.4e38f;
+              float bestChi2 = 3.4e38f;
+              float bestD0 = 0.f, bestD1 = 0.f, bestD2 = 0.f;
+              float bestRpp = 0.f, bestRps = 0.f, bestRss = 0.f, bestRbb = 0.f;
+              float bestDet = 0.f;
+              float bestSecWin = 0.f;
+              int bestNRows = 0;
               float bestRh = 0.f, bestZh = 0.f, bestArcS = 0.f;
-              float bestJrCot = 0.f, bestJrZip = 0.f;  // endcap line-block H of the winner
               int32_t bestHit = -1;
               // candDump_ only: per-lane, per-round best over all considered road candidates
-              // (passers and failers), min chi2 then min id. Combined into laneBestAny* after the scan.
+              // (passers and failers), min score then min id. Combined into laneBestAny* after the scan.
               float bestAnyChi2 = 3.4e38f;
               int32_t bestAnyId = -1;
               int bestAnyPass = 0;
 
+              uint32_t nOccSeen = 0;  // clusters this lane sees in the local-occupancy patch below
               const Prediction pred =
                   isBarrel ? predictOnBarrel(acc, sh.helix(), R) : predictOnEndcap(acc, sh.helix(), Z);
               if (pred.valid) {
                 // Phi window over the CA per-layer phi histogram (identical derivation to the serial
                 // version; every lane computes it redundantly from the shared helix + layer, so all
-                // lanes agree on the bin range and hit-counter partition).
-                constexpr float kMaxSigPhiHitCm = 0.1f;  // safe upper bound on any sensor's r-phi sigma (cm)
-                // The derived window half-width sizes the phi-bin scan, which is also where its compute
-                // saving comes from: the fixed-cut scan is always the 0.5 cm cap wide, while the derived
-                // road is narrower on most visits and wider only where it must be. Bounded above by the
-                // runaway ceiling so a pathological road cannot hold the launch.
-                const float capRPhiEffMax = shDerLayOn ? alpaka::math::min(acc, shDerWinR, shDerCeilR)
-                                                       : alpaka::math::max(acc, maxRPhiResidCm, 5.f * kMaxSigPhiHitCm);
+                // lanes agree on the bin range and hit-counter partition). The half-width is the
+                // gate's own sigma at eps -- the bounding box of the same chi2 ball -- so there is no
+                // window multiplier and no cm cap: one eps sizes window, gate, rank and hole together.
+                const float capRPhiEffMax = alpaka::math::min(acc, shDerWinR, shDerCeilR);
                 const float rMinLayer = alpaka::math::max(acc, R - caLayers.halfExtentR()[L], 1.f);
                 float phiExtA = pred.phi, phiExtB = pred.phi;
                 if (isBarrel) {
@@ -1733,6 +1395,33 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 const auto kl = ExtPhiBinner::bin(int16_t(mep - iphicut));
                 auto khh = ExtPhiBinner::bin(int16_t(mep + iphicut));
                 khh = (khh + 1) % ExtPhiBinner::nbins();
+                // The occupancy the scan itself sees: the hole is priced with the number of random clusters expected where
+                // this candidate is, and a layer average understates that inside a jet. The patch is the phi bins the scan
+                // traverses times the same angular span in pseudorapidity; the count is compared with this layer's own
+                // occupancy in this event spread uniformly over the patch (shOccNorm), a dimensionless contrast. The
+                // counting is one compare per hit the scan reads anyway; the sum comes out of the argmin's tree reduce.
+                const uint32_t nBinsScan =
+                    uint32_t((int(khh) - int(kl) + int(ExtPhiBinner::nbins())) % int(ExtPhiBinner::nbins()));
+                const float spanPhi = float(nBinsScan) * (2.f * kExtenderPi / float(ExtPhiBinner::nbins()));
+                const float cotOcc = sh.helix().cotTheta;
+                const float coshEtaOcc = alpaka::math::sqrt(acc, 1.f + cotOcc * cotOcc);
+                const float rCrossOcc = alpaka::math::max(acc, isBarrel ? R : pred.secondary, 1.f);
+                // z = r sinh(eta) at fixed r, r = z / sinh(eta) at fixed z.
+                const float dSecPerEta =
+                    isBarrel ? rCrossOcc * coshEtaOcc
+                             : rCrossOcc * coshEtaOcc / alpaka::math::max(acc, alpaka::math::abs(acc, cotOcc), 1e-3f);
+                const float hSecOcc = isBarrel ? caLayers.halfExtentZ()[L] : caLayers.halfExtentR()[L];
+                const float wSecOcc = alpaka::math::min(acc, 0.5f * spanPhi * dSecPerEta, hSecOcc);
+                const float secPredOcc = pred.secondary + shDerElossSec;
+                if (lane == 0u) {
+                  const auto* __restrict__ binL = (round == 0) ? phiBinner_ : otSource_.phiBinner;
+                  const float nLayerHits = float(binL->end(hoff + ExtPhiBinner::nbins() - 1u) - binL->begin(hoff));
+                  const float patchArea = spanPhi * rCrossOcc * 2.f * wSecOcc;
+                  const float layerArea = 2.f * kExtenderPi * rCrossOcc * 2.f * hSecOcc;
+                  shOccNorm = (nLayerHits > 0.f && patchArea > 0.f && layerArea > 0.f)
+                                  ? layerArea / (nLayerHits * patchArea)
+                                  : 0.f;
+                }
                 uint32_t hitCounter = 0;  // running window-hit index; hit g is owned by lane (g % nLanes)
                 // Round 0 only: the merged-source scan. In round 1 the loop condition is false at entry
                 // (body never runs) so hitCounter stays 0 for the fresh OT pass below; a different lane
@@ -1752,6 +1441,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                   hitCounter += nBin;
                   for (uint32_t o = o0; o < nBin; o += nLanes) {
                     const uint32_t hitId = pbeg[o];
+                    // Local occupancy, counted BEFORE the mask: the denominator it is compared against
+                    // is this layer's whole content, so the numerator has to be the same population.
+                    if (alpaka::math::abs(
+                            acc, (isBarrel ? hits[hitId].zGlobal() : hits[hitId].rGlobal()) - secPredOcc) <= wSecOcc)
+                      ++nOccSeen;
                     if (hitMaskArmed && hitMask[hitId].recHitMask() != 0u)
                       continue;
                     if (candDump_)  // dump: genuine (post-mask) merged candidate in the phi window
@@ -1786,34 +1480,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                         continue;
                     }
 
-                    // Cheap residual pre-filter: skip the full gate for hits that provably fail the
-                    // r-phi absolute-residual cap |dPhi*rh| < capRPhiEff, with
-                    // capRPhiEff = max(maxRPhiResidCm, 5*sigPhiHit*rh). sigPhiHit would need the
-                    // module-frame projection, not computed yet here, so sigPhiHit*rh is bounded from
-                    // cheap inputs: with v=(yh,-xh) the tangential direction and G the global (x,y)
-                    // hit covariance, frame.toGlobal is an orthonormal rotation of diag(xerr, yerr)
-                    // (both variances), so v^T G v <= max(xerr, yerr)*rh^2 and
-                    // sigPhiHit*rh <= sqrt(max(|xerr|,|yerr|)) plus the 1e-6 variance floor's
-                    // sqrt(1e-6)*rh. Hence capRPhiEffUpperPF >= capRPhiEff for every hit and skipping
-                    // a hit past this bound can never remove one the full gate would have accepted.
-                    // The 1.001 guards against frame-projection float roundoff, and the per-hit
-                    // prediction p2.phi is used, not the layer-nominal pred.phi.
+                    // Cheap pre-filter: a hit beyond the window's own half-width can only fail the gate.
                     const float dPhiPF = foldPi(p2.phi + shDerElossPhi - phiH);
-                    const float xerrPF = hits[hitId].xerrLocal();
-                    const float yerrPF = hits[hitId].yerrLocal();
-                    const float sigPhiHitRhUB =
-                        1.001f *
-                        alpaka::math::max(
-                            acc,
-                            alpaka::math::sqrt(
-                                acc,
-                                alpaka::math::max(acc, alpaka::math::abs(acc, xerrPF), alpaka::math::abs(acc, yerrPF))),
-                            alpaka::math::sqrt(acc, 1e-6f) * rh);
-                    const float capRPhiEffUpperPF = shDerLayOn
-                                                        ? alpaka::math::min(acc, shDerWinR, shDerCeilR)
-                                                        : alpaka::math::max(acc, maxRPhiResidCm, 5.f * sigPhiHitRhUB);
-                    if (alpaka::math::abs(acc, dPhiPF) * rh > capRPhiEffUpperPF)
-                      continue;  // provably fails absResidualOk
+                    if (alpaka::math::abs(acc, dPhiPF) * rh > capRPhiEffMax)
+                      continue;
 
                     const float secH = isBarrel ? zh : rh;
                     // road centre: the deterministic dE/dx offset of this crossing, formed once per
@@ -1824,7 +1494,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     const float dSec = p2.secondary + shDerElossSec - secH;
                     const float rh_safe = alpaka::math::max(acc, rh, 1.f);
 
-                    // Hit resolution projected to (r*dphi, sec) through the module frame.
+                    // The hit's own noise R: the local errors rotated through the module frame and
+                    // projected onto the two position rows, as a full 2x2, the cross term being free.
+                    // No variance floor and no alignment floor: a real sensor frame cannot project to
+                    // zero, and a floor of the size one would reach for here (1e-6 rad^2 = 1 mm at
+                    // r = 1 m, or 1e-4 cm^2) exceeds the intrinsic variance by up to three orders of
+                    // magnitude and stops an accepted OT hit from ever sharpening the state.
                     const float xerr = hits[hitId].xerrLocal();
                     const float yerr = hits[hitId].yerrLocal();
                     const auto detIdx = hits[hitId].detectorIndex();
@@ -1832,226 +1507,88 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     float ge[6];
                     frame.toGlobal(xerr, 0.f, yerr, ge);
                     const float rh2 = rh_safe * rh_safe;
-                    const float gxx = ge[0], gxy = ge[1], gyy = ge[2], gzz = ge[5];
-                    const float sigPhi2HitRaw = (yh * yh * gxx - 2.f * xh * yh * gxy + xh * xh * gyy) / (rh2 * rh2);
-                    const float sigSec2HitRaw =
-                        isBarrel ? gzz : (xh * xh * gxx + 2.f * xh * yh * gxy + yh * yh * gyy) / rh2;
-                    const float sigPhi2Hit = alpaka::math::max(acc, sigPhi2HitRaw, 1e-6f);
-                    const float sigSec2Hit = alpaka::math::max(acc, sigSec2HitRaw, 1e-4f);
-                    const float sigPhiHit = alpaka::math::sqrt(acc, sigPhi2Hit);
-                    const float sigSecHit = alpaka::math::sqrt(acc, sigSec2Hit);
+                    const float gxx = ge[0], gxy = ge[1], gyy = ge[2], gxz = ge[3], gyz = ge[4], gzz = ge[5];
+                    // (r*dphi) direction = (-y, x)/r ; secondary = z (barrel) or (x, y)/r (endcap).
+                    const float Rpp = (yh * yh * gxx - 2.f * xh * yh * gxy + xh * xh * gyy) / rh2;
+                    const float Rss = isBarrel ? gzz : (xh * xh * gxx + 2.f * xh * yh * gxy + yh * yh * gyy) / rh2;
+                    const float Rps = isBarrel ? ((-yh * gxz + xh * gyz) / rh_safe)
+                                               : ((-yh * xh * gxx + (xh * xh - yh * yh) * gxy + xh * yh * gyy) / rh2);
+                    if (!(Rpp > 0.f) || !(Rss > 0.f))
+                      continue;
 
-                    // Incremental multiple scattering since the last accepted point.
-                    const HelixState hForMs = sh.helix();
-                    const float dArcSinceLast = alpaka::math::max(acc, p2.arcS - shLastArcS, 0.f);
-                    const float msVar =
-                        multScattVar(acc, shBf, hForMs, dArcSinceLast, rhoMap_, shLastR, shLastZ, rh_safe, zh);
-
-                    // Propagated fit covariance at the prediction.
-                    const float s = p2.arcS;
-                    const float Jtip = -1.f / rh_safe;
-                    const float JinvPt = -shBf * s * s / (2.f * rh_safe);
-                    const float Jcot = s;
-                    const float predPhiDiag = sh.vPhi + Jtip * Jtip * sh.vTip + JinvPt * JinvPt * sh.vPt;
-                    const float predSecDiag_barrel = sh.vZip + Jcot * Jcot * sh.vCot;
-                    const float predPhiCross =
-                        2.f * Jtip * sh.cPhiTip + 2.f * JinvPt * sh.cPhiPt + 2.f * Jtip * JinvPt * sh.cTipPt;
-                    const float predSecCross_barrel = 2.f * Jcot * sh.cCotZip;
-                    const float predPhiVar = alpaka::math::max(acc, predPhiDiag + predPhiCross, 1e-12f);
-
-                    float predSecVar;
-                    float selJrCot = 0.f, selJrZip = 0.f;  // endcap dr/dcot, dr/dzip (barrel: unused)
-                    if (isBarrel) {
-                      predSecVar = alpaka::math::max(acc, predSecDiag_barrel + predSecCross_barrel, 1e-12f);
-                    } else {
-                      // Exact r-Jacobian at fixed z via forward-mode ad: rWithGrad5 runs the same
-                      // closed-form predictOnEndcap r(params) in vector-dual arithmetic once, carrying
-                      // all five partials dr/dparam simultaneously (transcendentals evaluated once, not
-                      // five times). Analytic differentiation also avoids the 1/eps amplification a
-                      // finite-difference Jacobian would apply to FMA-fusion roundoff.
-                      float Jr[5];
-                      rWithGrad5(acc, sh.phi0, sh.tip, sh.invPt, sh.cotTheta, sh.zip, zh, shBf, Jr);
-                      const float Jr_phi = Jr[0];
-                      const float Jr_tip = Jr[1];
-                      const float Jr_pt = Jr[2];
-                      const float Jr_cot = Jr[3];
-                      const float Jr_zip = Jr[4];
-                      selJrCot = Jr_cot;  // line-block H row for an r-at-fixed-z measurement
-                      selJrZip = Jr_zip;
-                      const float predSecCircleDiag =
-                          Jr_phi * Jr_phi * sh.vPhi + Jr_tip * Jr_tip * sh.vTip + Jr_pt * Jr_pt * sh.vPt;
-                      const float predSecCircleCross = 2.f * Jr_phi * Jr_tip * sh.cPhiTip +
-                                                       2.f * Jr_phi * Jr_pt * sh.cPhiPt +
-                                                       2.f * Jr_tip * Jr_pt * sh.cTipPt;
-                      const float predSecLineDiag = Jr_cot * Jr_cot * sh.vCot + Jr_zip * Jr_zip * sh.vZip;
-                      const float predSecLineCross = 2.f * Jr_cot * Jr_zip * sh.cCotZip;
-                      predSecVar = alpaka::math::max(
-                          acc, predSecCircleDiag + predSecCircleCross + predSecLineDiag + predSecLineCross, 1e-12f);
-                    }
-
-                    const float alignSigmaPhi2 = (alignSigmaPhiCm * alignSigmaPhiCm) / (rh_safe * rh_safe);
-                    const float alignSigmaSec2 = alignSigmaSecCm * alignSigmaSecCm;
-                    const float msPhi2 = msVar * dArcSinceLast * dArcSinceLast / (rh_safe * rh_safe);
-                    // Covariance recalibration: scale the propagated fit covariance (predPhiVar,
-                    // predSecVar) entering the 2-dof gate by the per-layer-class factor -- pixel (merged
-                    // round, CA L<28) vs stub (merged round, CA L>=28). The pixel propagated covariance
-                    // under-estimates the tail, so an unscaled gate rejects a large share of the pixel
-                    // hits the CKF keeps. Applied only to the propagated part; the intrinsic hit + MS +
-                    // align terms are untouched, and bestSigPhi2Hit below stays the raw hit+MS sigma.
-                    const float covScale = (L < 28) ? extCovScalePixel : extCovScaleStub;
-                    const float sigPhi2 = sigPhi2Hit + msPhi2 + predPhiVar * covScale + alignSigmaPhi2;
-                    const float sigSec2 =
-                        sigSec2Hit + msVar * dArcSinceLast * dArcSinceLast + predSecVar * covScale + alignSigmaSec2;
-                    // The derived variances are their own consts and are never assigned into
-                    // sigPhi2 / sigSec2: making those mutable would cost the compiler the FMA
-                    // contraction it takes on the expressions above, moving the fixed-cut arm's
-                    // arithmetic at the 1e-6 level even on hits the derived arm never scores.
-                    // sigma_R and sigma_S are built in centimetres, the frame the tables are measured
-                    // in; the r-phi one is converted back to rad^2 so it is consumed like sigPhi2.
-                    float sigPhi2Der = 0.f, sigSec2Der = 0.f;
-                    if (shDerLayOn) {
-                      const float dVc = extDV[extMatClass(L, isBarrel, rh_safe)];
-                      const float sR2cm = shDerSigR2 + sigPhi2Hit * rh2 + alignSigmaPhiCm * alignSigmaPhiCm + dVc;
-                      const float sS2cm = shDerSigS2 + predSecVar + sigSec2Hit + alignSigmaSec2 + dVc;
-                      sigPhi2Der = alpaka::math::max(acc, sR2cm / rh2, 1e-12f);
-                      sigSec2Der = alpaka::math::max(acc, sS2cm, 1e-12f);
-                    }
-                    // Third row: a stub carries an independent local direction measurement, entered
-                    // here as a row of the same chi2 with the track-side prediction uncertainty and
-                    // the scattering in the denominator, cut and ranked at the same eps, unlike the
-                    // standalone nsigma veto of extStubBendGate whose denominator is the measurement
-                    // error alone. sigma_b is the two-cluster precision error times the per-class
-                    // excess (extSigBExcess), the two being inseparable since in endcap PS the coarser
-                    // dPhiDrError is only right because its inflation cancels that excess. Non-stub
-                    // candidates keep the 2-dof statistic. The position<->bend correlation is not
-                    // carried: the rows entered here are dominated by their propagated and MS shares,
-                    // so it is small, and neglecting it leaves E[X^2] at d.
-                    float pb2 = 0.f;
-                    float rbbCand = 0.f;
+                    // The stub's local bend is an independent third row of the same statistic, with the
+                    // track-side prediction uncertainty already inside S through shM. sigma_b is the
+                    // leak-free formation error; non-stub candidates keep the 2-row statistic.
+                    float dBend = 0.f, Rbb = 0.f;
                     bool bendRow = false;
                     if (shDerBendOn && ::reco::isStub(hits, int32_t(hitId))) {
                       const float sPrec = hits[hitId].dPhiDrErrorPrec();
                       if (sPrec > 0.f) {
-                        const float sb = sPrec * extSigBExcess[extSigBClass(hits[hitId].stubFlags())];
-                        const float rbb = sb * sb + shDerRbbTrk;
-                        if (rbb > 0.f) {
-                          const float pb = (hits[hitId].dPhiDr() - shDerPredB) / alpaka::math::sqrt(acc, rbb);
-                          pb2 = pb * pb;
-                          rbbCand = rbb;
-                          bendRow = true;
-                        }
+                        dBend = shDerPredB - hits[hitId].dPhiDr();
+                        Rbb = sPrec * sPrec;
+                        bendRow = true;
                       }
                     }
-                    const float qDer = bendRow ? shDerQ3 : shDerQ;
-
-                    const float chi2 = shDerLayOn ? ((dPhi * dPhi) / sigPhi2Der + (dSec * dSec) / sigSec2Der + pb2)
-                                                  : ((dPhi * dPhi) / sigPhi2 + (dSec * dSec) / sigSec2);
+                    const float dR0 = dPhi * rh_safe;  // the r-phi residual in cm, the row's own metric
+                    // A secondary reading whose support is wider than the road is a window, not a
+                    // measurement: it leaves the chi2 and the candidate loses that degree of freedom.
+                    const bool secWin = extSecIsWindow(Rss, shM[3], qGate1);
+                    const float secHalf = extSecSupport(acc, Rss, shM[3], qGate1);
+                    const int nRows = (secWin ? 1 : 2) + (bendRow ? 1 : 0);
+                    float Sm[6] = {shM[0] + Rpp, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    float dv[3] = {dR0, 0.f, 0.f};
+                    if (secWin) {
+                      if (bendRow) {
+                        Sm[1] = shM[2];
+                        Sm[3] = shM[5] + Rbb;
+                        dv[1] = dBend;
+                      }
+                    } else {
+                      Sm[1] = shM[1] + Rps;
+                      Sm[2] = shM[2];
+                      Sm[3] = shM[3] + Rss;
+                      Sm[4] = shM[4];
+                      Sm[5] = shM[5] + Rbb;
+                      dv[1] = dSec;
+                      dv[2] = dBend;
+                    }
+                    float detS = 0.f;
+                    const float chi2 = extChi2FromS(acc, nRows, Sm, dv, detS);
+                    if (!(chi2 >= 0.f))
+                      continue;  // S not positive definite: no usable statistic for this candidate
+                    // One gate, one eps: the chi2 quantile of this candidate's own dof. Ranking is by
+                    // the tail probability, so a 2-row and a 3-row candidate compete on equal terms
+                    // instead of the row-poorer one winning the argmin by its missing row.
+                    const float qGate = (nRows == 1) ? qGate1 : (nRows == 2 ? qGate2 : qGate3);
+                    const float score =
+                        -alpaka::math::log(acc, alpaka::math::max(acc, extChi2Tail(acc, nRows, chi2), 1e-30f));
                     if (candDump_)  // dump: min gate chi2 over considered merged hits (best fail)
                       alpaka::atomicMin(acc,
                                         &shDumpBestM,
                                         chi2 >= 4.29e6f ? 0xFFFFFFFEu : uint32_t(chi2 * 1000.f + 0.5f),
                                         alpaka::hierarchy::Blocks{});
-                    // Permil decomposition of the endcap gate variance (merged round).
-                    if (secFracDiag_ && !isBarrel) {
-                      const float pml = 1000.f / sigSec2;
-                      const float msSec = msVar * dArcSinceLast * dArcSinceLast;
-                      alpaka::atomicAdd(
-                          acc, &stats[kDiagSecFracHitM], uint32_t(sigSec2Hit * pml + 0.5f), alpaka::hierarchy::Grids{});
-                      alpaka::atomicAdd(
-                          acc, &stats[kDiagSecFracMsM], uint32_t(msSec * pml + 0.5f), alpaka::hierarchy::Grids{});
-                      alpaka::atomicAdd(acc,
-                                        &stats[kDiagSecFracPredM],
-                                        uint32_t(predSecVar * pml + 0.5f),
-                                        alpaka::hierarchy::Grids{});
-                      alpaka::atomicAdd(acc,
-                                        &stats[kDiagSecFracAlignM],
-                                        uint32_t(alignSigmaSec2 * pml + 0.5f),
-                                        alpaka::hierarchy::Grids{});
-                      alpaka::atomicAdd(acc, &stats[kDiagSecNM], 1u, alpaka::hierarchy::Grids{});
-                      // Split the block-diagonal predSecVar into circle/line blocks and project the
-                      // exact full-5x5 shadow covariance -> predSecVar_full (same sigSec2 denominator, so
-                      // the two are directly comparable), bucketed by whether a prior disk hit was
-                      // already folded in.
-                      float JrF[5];
-                      rWithGrad5(acc, sh.phi0, sh.tip, sh.invPt, sh.cotTheta, sh.zip, zh, shBf, JrF);
-                      const float circP = JrF[0] * JrF[0] * sh.vPhi + JrF[1] * JrF[1] * sh.vTip +
-                                          JrF[2] * JrF[2] * sh.vPt + 2.f * JrF[0] * JrF[1] * sh.cPhiTip +
-                                          2.f * JrF[0] * JrF[2] * sh.cPhiPt + 2.f * JrF[1] * JrF[2] * sh.cTipPt;
-                      const float lineP =
-                          JrF[3] * JrF[3] * sh.vCot + JrF[4] * JrF[4] * sh.vZip + 2.f * JrF[3] * JrF[4] * sh.cCotZip;
-                      const float predFull = alpaka::math::max(acc, projectCov(shC, JrF), 0.f);
-                      alpaka::atomicAdd(acc,
-                                        &stats[kDiagPredCircleM],
-                                        uint32_t(alpaka::math::max(acc, circP, 0.f) * pml + 0.5f),
-                                        alpaka::hierarchy::Grids{});
-                      alpaka::atomicAdd(acc,
-                                        &stats[kDiagPredLineM],
-                                        uint32_t(alpaka::math::max(acc, lineP, 0.f) * pml + 0.5f),
-                                        alpaka::hierarchy::Grids{});
-                      alpaka::atomicAdd(
-                          acc, &stats[kDiagPredFullM], uint32_t(predFull * pml + 0.5f), alpaka::hierarchy::Grids{});
-                      const int slN = (shNDiskAcc == 0) ? kDiagNDisk0M : kDiagNDisk1M;
-                      const int slBd = (shNDiskAcc == 0) ? kDiagPredBd0M : kDiagPredBd1M;
-                      const int slFull = (shNDiskAcc == 0) ? kDiagPredFull0M : kDiagPredFull1M;
-                      alpaka::atomicAdd(acc, &stats[slN], 1u, alpaka::hierarchy::Grids{});
-                      alpaka::atomicAdd(
-                          acc, &stats[slBd], uint32_t(predSecVar * pml + 0.5f), alpaka::hierarchy::Grids{});
-                      alpaka::atomicAdd(
-                          acc, &stats[slFull], uint32_t(predFull * pml + 0.5f), alpaka::hierarchy::Grids{});
-                    }
+                    // Runaway ceilings from the layer's module envelope: a guard on a pathological
+                    // state, never the selector. Each time one rejects a hit the gate admitted, it is
+                    // counted -- if that happens often the delivered efficiency is not the stated eps.
+                    const bool gatePass = (chi2 < qGate);
+                    const bool okR = alpaka::math::abs(acc, dR0) < shDerCeilR;
+                    const bool okS =
+                        alpaka::math::abs(acc, dSec) < shDerCeilS && alpaka::math::abs(acc, dSec) < secHalf;
+                    if (gatePass && !okR)
+                      alpaka::atomicAdd(acc, &stats[kStatDerCapR], 1u, alpaka::hierarchy::Grids{});
+                    if (gatePass && !okS)
+                      alpaka::atomicAdd(acc, &stats[kStatDerCapS], 1u, alpaka::hierarchy::Grids{});
+                    const bool pass = gatePass && okR && okS;
 
-                    // Absolute residual caps on top of the chi2 gate.
-                    const float dPhiR = dPhi * rh;
-                    constexpr float kSigmaCapMult = 5.f;
-                    const float sigPhiHitCm = sigPhiHit * rh;
-                    const float capRPhiEff = alpaka::math::max(acc, maxRPhiResidCm, kSigmaCapMult * sigPhiHitCm);
-                    const float capSecEff = isBarrel ? alpaka::math::max(acc, maxSecResidCm, kSigmaCapMult * sigSecHit)
-                                                     : endcapMaxSecResidCm;
-                    // on the derived path the cm caps act as runaway ceilings only
-                    // The selector here is the measured quantile ball; the ceilings are the per-layer
-                    // module-envelope bounds computed once per visit (shDerCeilR / shDerCeilS, derived in the
-                    // per-layer block), and every time one of them rejects a hit the ball admitted, that is
-                    // counted -- a ceiling that binds often means the delivered efficiency is not the stated
-                    // eps. The bounding half-widths sqrt(Q*sigma) follow from the same single eps and are not a
-                    // second efficiency choice.
-                    bool ballOk = true;
-                    bool ceilOk = true;
-                    if (shDerLayOn) {
-                      // The bounding box is the box of this candidate's own ball.
-                      const float wR = alpaka::math::sqrt(acc, qDer * sigPhi2Der) * rh;
-                      const float wS = alpaka::math::sqrt(acc, qDer * sigSec2Der);
-                      ballOk = (alpaka::math::abs(acc, dPhiR) < wR) && (alpaka::math::abs(acc, dSec) < wS);
-                      const bool okR = alpaka::math::abs(acc, dPhiR) < shDerCeilR;
-                      const bool okS = alpaka::math::abs(acc, dSec) < shDerCeilS;
-                      ceilOk = okR && okS;
-                      if (ballOk && !okR)
-                        alpaka::atomicAdd(acc, &stats[kStatDerCapR], 1u, alpaka::hierarchy::Grids{});
-                      if (ballOk && !okS)
-                        alpaka::atomicAdd(acc, &stats[kStatDerCapS], 1u, alpaka::hierarchy::Grids{});
-                    }
-                    const bool absResidualOk = shDerLayOn ? (ballOk && ceilOk)
-                                                          : ((alpaka::math::abs(acc, dPhiR) < capRPhiEff) &&
-                                                             (alpaka::math::abs(acc, dSec) < capSecEff));
-
-                    if (candDump_ && chi2 < baseChi2Cut && absResidualOk)  // dump: merged gate passer
+                    if (candDump_ && pass)  // dump: merged gate passer
                       alpaka::atomicAdd(acc, &shDumpPassM, 1u, alpaka::hierarchy::Blocks{});
-                    // far-first window-ambiguity condition: on a far crossing of an armed host, count
-                    // the candidates that pass this gate -- the exact set the argmin reduce below
-                    // arbitrates, which is why a count of 1 makes an argmin error impossible. The same
-                    // predicate the dump line above uses, so the two counts agree wherever both are on.
-                    // shFarLayer is 0 on every layer the ordering does not touch, so the branch is then
-                    // never taken.
-                    if (shFarLayer && chi2 < baseChi2Cut && absResidualOk)
-                      alpaka::atomicAdd(acc, &shFarPass, 1u, alpaka::hierarchy::Blocks{});
-                    // This lane's best over all considered merged hits (min chi2, tie min id).
-                    if (candDump_ && ((chi2 < bestAnyChi2) || (chi2 == bestAnyChi2 && int32_t(hitId) < bestAnyId))) {
-                      bestAnyChi2 = chi2;
+                    // This lane's best over all considered merged hits (min score, tie min id).
+                    if (candDump_ && ((score < bestAnyChi2) || (score == bestAnyChi2 && int32_t(hitId) < bestAnyId))) {
+                      bestAnyChi2 = score;
                       bestAnyId = int32_t(hitId);
-                      bestAnyPass = ((chi2 < baseChi2Cut) && absResidualOk) ? 1 : 0;
+                      bestAnyPass = pass ? 1 : 0;
                     }
                     // Record this merged road candidate (id + gate chi2 + pass) for the offline join.
-                    // One member per scored road candidate; slot m from the block cursor;
-                    // vi = shWalkSteps-1 (stable during the scan). candMemberBuf_ null => no write.
                     if (candDump_ && candMemberBuf_ != nullptr) {
                       const int viM = shWalkSteps - 1;
                       if (viM >= 0 && uint32_t(viM) < uint32_t(maxWalkLayers) && j < maxCandidates) {
@@ -2061,63 +1598,33 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                           mr.hitId = int32_t(hitId);
                           mr.chi2 = chi2;
                           mr.round = int16_t(0);
-                          mr.pass = int16_t((chi2 < baseChi2Cut && absResidualOk) ? 1 : 0);
+                          mr.pass = int16_t(pass ? 1 : 0);
                           candMemberBuf_[(uint32_t(j) * uint32_t(maxWalkLayers) + uint32_t(viM)) * kExtDumpMaxMembers +
                                          m] = mr;
                         } else {
-                          alpaka::atomicAdd(acc, &candDumpOvf_[1], 1u, alpaka::hierarchy::Grids{});
+                          if (candDumpOvf_ != nullptr)
+                            alpaka::atomicAdd(acc, &candDumpOvf_[1], 1u, alpaka::hierarchy::Blocks{});
                         }
                       }
                     }
-                    // 2S stub-bend acceptance term: veto a merged stub whose measured local bend
-                    // dPhiDr is incompatible with the track's local curvature expectation by more than
-                    // extStubBendGate nSigma, on the same kappa significance the CA build's
-                    // pixel-to-stub consistency cut uses, kappa = dPhiDr / sqrt(1 + r^2 dPhiDr^2) and
-                    // sigma(kappa) = dPhiDrError / (den^1.5). kappa_track comes from the linearized
-                    // crossing derivative (barrel shLinDphi1; endcap shLinDphi1/shLinDsec1). Correct
-                    // 2S winners sit at a bend significance of order 1, wrong ones an order of
-                    // magnitude higher; PS stubs carry a large dPhiDrError, so the term is small or
-                    // skipped there. Merged round 0 only, and a sentinel <= 0 disables it. It is also
-                    // not applied where the bend row is live: that row prices the same measurement,
-                    // and the veto divides by the measurement error alone, which alongside the
-                    // corrected sigma_b would cost a large fraction of the correct attachments.
-                    bool bendOk = true;
-                    if (!bendRow && extStubBendGate > 0.f && shLinValid && ::reco::isStub(hits, int32_t(hitId))) {
-                      const float dS = hits[hitId].dPhiDr();
-                      const float sS = hits[hitId].dPhiDrError();
-                      if (sS > 0.f) {
-                        const float dphidrTrk =
-                            isBarrel ? shLinDphi1 : (shLinDsec1 != 0.f ? shLinDphi1 / shLinDsec1 : 0.f);
-                        const float denS = 1.f + rh * rh * dS * dS;
-                        const float sqrtDenS = alpaka::math::sqrt(acc, denS);
-                        const float kS = dS / sqrtDenS;
-                        const float skS = sS / (denS * sqrtDenS);
-                        const float denT = 1.f + rh * rh * dphidrTrk * dphidrTrk;
-                        const float kT = dphidrTrk / alpaka::math::sqrt(acc, denT);
-                        const float bendSig = alpaka::math::abs(acc, kT - kS) / skS;
-                        bendOk = (bendSig <= extStubBendGate);
-                      }
-                    }
-                    const bool isBetter = (chi2 < bestChi2) || (chi2 == bestChi2 && int32_t(hitId) < bestHit);
-                    // The merged round's admission threshold is explicit, because the argmin seed above
-                    // is the wider of the two maps. Off the derived path this term is identically true
-                    // and the baseChi2Cut seed does the cutting.
-                    const bool gateOk = shDerLayOn ? (chi2 < qDer) : true;
-                    if (isBetter && gateOk && absResidualOk && bendOk) {
+                    const bool isBetter = (score < bestScore) || (score == bestScore && int32_t(hitId) < bestHit);
+                    if (isBetter && pass) {
+                      bestScore = score;
                       bestChi2 = chi2;
                       bestHit = int32_t(hitId);
-                      bestDPhi = dPhi;
-                      bestDSec = dSec;
-                      bestSigPhi2Hit = sigPhi2Hit + msPhi2;
-                      bestSigSec2Hit = sigSec2Hit + msVar * dArcSinceLast * dArcSinceLast;
-                      bestDerSigR2 = sigPhi2Der * rh2;  // full derived r-phi variance [cm^2]
-                      bestDerSigS2 = sigSec2Der;
-                      bestDerRbb = rbbCand;  // 0 when the candidate carries no bend row
+                      bestD0 = dR0;
+                      bestD1 = dSec;
+                      bestD2 = dBend;
+                      bestRpp = Rpp;
+                      bestRps = Rps;
+                      bestRss = Rss;
+                      bestRbb = Rbb;
+                      bestNRows = nRows;
+                      bestDet = detS;
+                      bestSecWin = secWin ? 2.f * secHalf : 0.f;
                       bestRh = rh;
                       bestZh = zh;
-                      bestArcS = s;
-                      bestJrCot = selJrCot;
-                      bestJrZip = selJrZip;
+                      bestArcS = p2.arcS;
                     }
                   }
                 }
@@ -2138,6 +1645,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     hitCounter += nBin;
                     for (uint32_t oo = o0; oo < nBin; oo += nLanes) {
                       const uint32_t o = pbeg[oo];
+                      // Local occupancy, counted before the skips, for the same reason as round 0.
+                      {
+                        const float sOcc = isBarrel ? otHits[o].zGlobal()
+                                                    : alpaka::math::sqrt(acc,
+                                                                         otHits[o].xGlobal() * otHits[o].xGlobal() +
+                                                                             otHits[o].yGlobal() * otHits[o].yGlobal());
+                        if (alpaka::math::abs(acc, sOcc - secPredOcc) <= wSecOcc)
+                          ++nOccSeen;
+                      }
                       if (otSource_.usedInStub[o] || (otSource_.ownership != nullptr && otSource_.ownership[o] != 0u)) {
                         continue;  // stub member or already owned
                       }
@@ -2173,21 +1689,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
 
                       // Cheap r-phi residual pre-filter (same bound as merged; OT xerr/yerr).
                       const float dPhiPF = foldPi(p2.phi + shDerElossPhi - phiH);
-                      const float xerrPF = otHits[o].xerrLocal();
-                      const float yerrPF = otHits[o].yerrLocal();
-                      const float sigPhiHitRhUB =
-                          1.001f *
-                          alpaka::math::max(acc,
-                                            alpaka::math::sqrt(acc,
-                                                               alpaka::math::max(acc,
-                                                                                 alpaka::math::abs(acc, xerrPF),
-                                                                                 alpaka::math::abs(acc, yerrPF))),
-                                            alpaka::math::sqrt(acc, 1e-6f) * rh);
-                      const float capRPhiEffUpperPF = shDerLayOn
-                                                          ? alpaka::math::min(acc, shDerWinR, shDerCeilR)
-                                                          : alpaka::math::max(acc, maxRPhiResidCm, 5.f * sigPhiHitRhUB);
-                      if (alpaka::math::abs(acc, dPhiPF) * rh > capRPhiEffUpperPF)
-                        continue;  // provably fails absResidualOk
+                      if (alpaka::math::abs(acc, dPhiPF) * rh > capRPhiEffMax)
+                        continue;  // beyond the window's own half-width: it can only fail the gate
 
                       const float secH = isBarrel ? zh : rh;
                       // Same road centre as the merged round (same layer visit, same crossing).
@@ -2195,9 +1698,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                       const float dSec = p2.secondary + shDerElossSec - secH;
                       const float rh_safe = alpaka::math::max(acc, rh, 1.f);
 
-                      // Hit resolution projected to (r*dphi, sec) through the OT sensor frame (lower/upper per
-                      // the hit's position within the stack). same toGlobal(variance) convention as merged
-                      // (xerr/yerrLocal are variances, passed unsquared).
+                      // The hit's own noise R through the OT sensor frame (lower/upper per the hit's
+                      // position in the stack); same toGlobal(variance) convention as the merged round.
+                      // A raw-OT rechit is a single cluster: two rows, no bend.
                       const float xerr = otHits[o].xerrLocal();
                       const float yerr = otHits[o].yerrLocal();
                       const uint32_t geomIdx = uint32_t(otHits[o].detectorIndex()) - ::phase2PixelTopology::nModulesPix;
@@ -2207,152 +1710,54 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                       float ge[6];
                       frame.toGlobal(xerr, 0.f, yerr, ge);
                       const float rh2 = rh_safe * rh_safe;
-                      const float gxx = ge[0], gxy = ge[1], gyy = ge[2], gzz = ge[5];
-                      const float sigPhi2HitRaw = (yh * yh * gxx - 2.f * xh * yh * gxy + xh * xh * gyy) / (rh2 * rh2);
-                      const float sigSec2HitRaw =
-                          isBarrel ? gzz : (xh * xh * gxx + 2.f * xh * yh * gxy + yh * yh * gyy) / rh2;
-                      const float sigPhi2Hit = alpaka::math::max(acc, sigPhi2HitRaw, 1e-6f);
-                      const float sigSec2Hit = alpaka::math::max(acc, sigSec2HitRaw, 1e-4f);
-                      const float sigPhiHit = alpaka::math::sqrt(acc, sigPhi2Hit);
-                      const float sigSecHit = alpaka::math::sqrt(acc, sigSec2Hit);
-
-                      // Incremental multiple scattering since the last accepted point.
-                      const HelixState hForMs = sh.helix();
-                      const float dArcSinceLast = alpaka::math::max(acc, p2.arcS - shLastArcS, 0.f);
-                      const float msVar =
-                          multScattVar(acc, shBf, hForMs, dArcSinceLast, rhoMap_, shLastR, shLastZ, rh_safe, zh);
-
-                      // Propagated fit covariance at the prediction.
-                      const float s = p2.arcS;
-                      const float Jtip = -1.f / rh_safe;
-                      const float JinvPt = -shBf * s * s / (2.f * rh_safe);
-                      const float Jcot = s;
-                      const float predPhiDiag = sh.vPhi + Jtip * Jtip * sh.vTip + JinvPt * JinvPt * sh.vPt;
-                      const float predSecDiag_barrel = sh.vZip + Jcot * Jcot * sh.vCot;
-                      const float predPhiCross =
-                          2.f * Jtip * sh.cPhiTip + 2.f * JinvPt * sh.cPhiPt + 2.f * Jtip * JinvPt * sh.cTipPt;
-                      const float predSecCross_barrel = 2.f * Jcot * sh.cCotZip;
-                      const float predPhiVar = alpaka::math::max(acc, predPhiDiag + predPhiCross, 1e-12f);
-
-                      float predSecVar;
-                      float selJrCot = 0.f, selJrZip = 0.f;
-                      if (isBarrel) {
-                        predSecVar = alpaka::math::max(acc, predSecDiag_barrel + predSecCross_barrel, 1e-12f);
-                      } else {
-                        float Jr[5];
-                        rWithGrad5(acc, sh.phi0, sh.tip, sh.invPt, sh.cotTheta, sh.zip, zh, shBf, Jr);
-                        const float Jr_phi = Jr[0];
-                        const float Jr_tip = Jr[1];
-                        const float Jr_pt = Jr[2];
-                        const float Jr_cot = Jr[3];
-                        const float Jr_zip = Jr[4];
-                        selJrCot = Jr_cot;
-                        selJrZip = Jr_zip;
-                        const float predSecCircleDiag =
-                            Jr_phi * Jr_phi * sh.vPhi + Jr_tip * Jr_tip * sh.vTip + Jr_pt * Jr_pt * sh.vPt;
-                        const float predSecCircleCross = 2.f * Jr_phi * Jr_tip * sh.cPhiTip +
-                                                         2.f * Jr_phi * Jr_pt * sh.cPhiPt +
-                                                         2.f * Jr_tip * Jr_pt * sh.cTipPt;
-                        const float predSecLineDiag = Jr_cot * Jr_cot * sh.vCot + Jr_zip * Jr_zip * sh.vZip;
-                        const float predSecLineCross = 2.f * Jr_cot * Jr_zip * sh.cCotZip;
-                        predSecVar = alpaka::math::max(
-                            acc, predSecCircleDiag + predSecCircleCross + predSecLineDiag + predSecLineCross, 1e-12f);
+                      const float gxx = ge[0], gxy = ge[1], gyy = ge[2], gxz = ge[3], gyz = ge[4], gzz = ge[5];
+                      const float Rpp = (yh * yh * gxx - 2.f * xh * yh * gxy + xh * xh * gyy) / rh2;
+                      const float Rss = isBarrel ? gzz : (xh * xh * gxx + 2.f * xh * yh * gxy + yh * yh * gyy) / rh2;
+                      const float Rps = isBarrel ? ((-yh * gxz + xh * gyz) / rh_safe)
+                                                 : ((-yh * xh * gxx + (xh * xh - yh * yh) * gxy + xh * yh * gyy) / rh2);
+                      if (!(Rpp > 0.f) || !(Rss > 0.f))
+                        continue;
+                      const float dR0 = dPhi * rh_safe;
+                      // Same row decision as the merged round: a lone 2S cluster on a disc measures
+                      // r-phi and nothing else, so it is judged on that one row inside the window.
+                      const bool secWin = extSecIsWindow(Rss, shM[3], qGate1);
+                      const float secHalf = extSecSupport(acc, Rss, shM[3], qGate1);
+                      const int nRows = secWin ? 1 : 2;
+                      float Sm[6] = {shM[0] + Rpp, 0.f, 0.f, 0.f, 0.f, 0.f};
+                      float dv[3] = {dR0, 0.f, 0.f};
+                      if (!secWin) {
+                        Sm[1] = shM[1] + Rps;
+                        Sm[3] = shM[3] + Rss;
+                        dv[1] = dSec;
                       }
-
-                      const float alignSigmaPhi2 = (alignSigmaPhiCm * alignSigmaPhiCm) / (rh_safe * rh_safe);
-                      const float alignSigmaSec2 = alignSigmaSecCm * alignSigmaSecCm;
-                      const float msPhi2 = msVar * dArcSinceLast * dArcSinceLast / (rh_safe * rh_safe);
-                      // Covariance recalibration (raw-OT round 1): scale the propagated cov by the
-                      // raw-OT class factor. Widening the OT classes does not pay, so this scale exists
-                      // for symmetry with the pixel/stub ones; at 1.0 the propagated cov is unscaled.
-                      const float covScale = extCovScaleRawOT;
-                      const float sigPhi2 = sigPhi2Hit + msPhi2 + predPhiVar * covScale + alignSigmaPhi2;
-                      const float sigSec2 =
-                          sigSec2Hit + msVar * dArcSinceLast * dArcSinceLast + predSecVar * covScale + alignSigmaSec2;
-                      // the derived road, as a separate pair of consts (same reason as in the merged round:
-                      // a mutable destination would change the FMA contraction of the fixed-cut expressions above)
-                      // sigma_R and sigma_S are built in centimetres (the frame the tables are measured in); the
-                      // r-phi one is converted back to rad^2 so it is consumed exactly like sigPhi2.
-                      float sigPhi2Der = 0.f, sigSec2Der = 0.f;
-                      if (shDerLayOn) {
-                        const float dVc = extDV[extMatClass(L, isBarrel, rh_safe)];
-                        const float sR2cm = shDerSigR2 + sigPhi2Hit * rh2 + alignSigmaPhiCm * alignSigmaPhiCm + dVc;
-                        const float sS2cm = shDerSigS2 + predSecVar + sigSec2Hit + alignSigmaSec2 + dVc;
-                        sigPhi2Der = alpaka::math::max(acc, sR2cm / rh2, 1e-12f);
-                        sigSec2Der = alpaka::math::max(acc, sS2cm, 1e-12f);
-                      }
-
-                      const float chi2 = shDerLayOn ? ((dPhi * dPhi) / sigPhi2Der + (dSec * dSec) / sigSec2Der)
-                                                    : ((dPhi * dPhi) / sigPhi2 + (dSec * dSec) / sigSec2);
+                      float detS = 0.f;
+                      const float chi2 = extChi2FromS(acc, nRows, Sm, dv, detS);
+                      if (!(chi2 >= 0.f))
+                        continue;
+                      const float score =
+                          -alpaka::math::log(acc, alpaka::math::max(acc, extChi2Tail(acc, nRows, chi2), 1e-30f));
                       if (candDump_)  // dump: min gate chi2 over considered raw-OT hits (best fail)
                         alpaka::atomicMin(acc,
                                           &shDumpBestM,
                                           chi2 >= 4.29e6f ? 0xFFFFFFFEu : uint32_t(chi2 * 1000.f + 0.5f),
                                           alpaka::hierarchy::Blocks{});
-                      // Permil decomposition of the endcap gate variance (raw-OT round).
-                      if (secFracDiag_ && !isBarrel) {
-                        const float pml = 1000.f / sigSec2;
-                        const float msSec = msVar * dArcSinceLast * dArcSinceLast;
-                        alpaka::atomicAdd(acc,
-                                          &stats[kDiagSecFracHitOT],
-                                          uint32_t(sigSec2Hit * pml + 0.5f),
-                                          alpaka::hierarchy::Grids{});
-                        alpaka::atomicAdd(
-                            acc, &stats[kDiagSecFracMsOT], uint32_t(msSec * pml + 0.5f), alpaka::hierarchy::Grids{});
-                        alpaka::atomicAdd(acc,
-                                          &stats[kDiagSecFracPredOT],
-                                          uint32_t(predSecVar * pml + 0.5f),
-                                          alpaka::hierarchy::Grids{});
-                        alpaka::atomicAdd(acc,
-                                          &stats[kDiagSecFracAlignOT],
-                                          uint32_t(alignSigmaSec2 * pml + 0.5f),
-                                          alpaka::hierarchy::Grids{});
-                        alpaka::atomicAdd(acc, &stats[kDiagSecNOT], 1u, alpaka::hierarchy::Grids{});
-                      }
-
-                      const float dPhiR = dPhi * rh;
-                      constexpr float kSigmaCapMult = 5.f;
-                      const float sigPhiHitCm = sigPhiHit * rh;
-                      const float capRPhiEff = alpaka::math::max(acc, maxRPhiResidCm, kSigmaCapMult * sigPhiHitCm);
-                      const float capSecEff = isBarrel
-                                                  ? alpaka::math::max(acc, maxSecResidCm, kSigmaCapMult * sigSecHit)
-                                                  : endcapMaxSecResidCm;
-                      // on the derived path the cm caps act as runaway ceilings only (see the merged round):
-                      // the quantile ball selects, the module-envelope ceilings only guard, and every ceiling
-                      // rejection of a ball-passer is counted.
-                      bool ballOk = true;
-                      bool ceilOk = true;
-                      if (shDerLayOn) {
-                        const float wR = alpaka::math::sqrt(acc, shDerQ * sigPhi2Der) * rh;
-                        const float wS = alpaka::math::sqrt(acc, shDerQ * sigSec2Der);
-                        ballOk = (alpaka::math::abs(acc, dPhiR) < wR) && (alpaka::math::abs(acc, dSec) < wS);
-                        const bool okR = alpaka::math::abs(acc, dPhiR) < shDerCeilR;
-                        const bool okS = alpaka::math::abs(acc, dSec) < shDerCeilS;
-                        ceilOk = okR && okS;
-                        if (ballOk && !okR)
-                          alpaka::atomicAdd(acc, &stats[kStatDerCapR], 1u, alpaka::hierarchy::Grids{});
-                        if (ballOk && !okS)
-                          alpaka::atomicAdd(acc, &stats[kStatDerCapS], 1u, alpaka::hierarchy::Grids{});
-                      }
-                      const bool absResidualOk = shDerLayOn ? (ballOk && ceilOk)
-                                                            : ((alpaka::math::abs(acc, dPhiR) < capRPhiEff) &&
-                                                               (alpaka::math::abs(acc, dSec) < capSecEff));
-
-                      // Tagged OT candidate id for the argmin (bit30). Signed-int tie-break => an OT hit
-                      // sorts after any merged hit at equal chi2, so merged wins ties deterministically.
-                      const int32_t candId = int32_t(kOTHitTag | o);
-                      const float hitCut = shDerLayOn ? shDerQ : baseChi2Cut;
-                      if (candDump_ && chi2 < hitCut && absResidualOk)  // dump: raw-OT gate passer
+                      const bool gatePass = (chi2 < (nRows == 1 ? qGate1 : qGate2));
+                      const bool okR = alpaka::math::abs(acc, dR0) < shDerCeilR;
+                      const bool okS =
+                          alpaka::math::abs(acc, dSec) < shDerCeilS && alpaka::math::abs(acc, dSec) < secHalf;
+                      if (gatePass && !okR)
+                        alpaka::atomicAdd(acc, &stats[kStatDerCapR], 1u, alpaka::hierarchy::Grids{});
+                      if (gatePass && !okS)
+                        alpaka::atomicAdd(acc, &stats[kStatDerCapS], 1u, alpaka::hierarchy::Grids{});
+                      const bool pass = gatePass && okR && okS;
+                      const int32_t candId = int32_t((uint32_t(o) | caOTHitTag::kOTHitTag));
+                      if (candDump_ && pass)
                         alpaka::atomicAdd(acc, &shDumpPassO, 1u, alpaka::hierarchy::Blocks{});
-                      // This lane's best over all considered raw-OT hits (min chi2, tie min id;
-                      // candId carries the bit30 OT tag, so at equal chi2 a merged id sorts before an OT id).
-                      if (candDump_ && ((chi2 < bestAnyChi2) || (chi2 == bestAnyChi2 && candId < bestAnyId))) {
-                        bestAnyChi2 = chi2;
+                      if (candDump_ && ((score < bestAnyChi2) || (score == bestAnyChi2 && candId < bestAnyId))) {
+                        bestAnyChi2 = score;
                         bestAnyId = candId;
-                        bestAnyPass = ((chi2 < hitCut) && absResidualOk) ? 1 : 0;
+                        bestAnyPass = pass ? 1 : 0;
                       }
-                      // Record this raw-OT road candidate (bit30-tagged id + gate chi2 + pass) into the
-                      // same per-(candidate,layer) member block as the merged round (shared cursor).
                       if (candDump_ && candMemberBuf_ != nullptr) {
                         const int viM = shWalkSteps - 1;
                         if (viM >= 0 && uint32_t(viM) < uint32_t(maxWalkLayers) && j < maxCandidates) {
@@ -2362,7 +1767,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                             mr.hitId = candId;  // bit30-tagged raw-OT id
                             mr.chi2 = chi2;
                             mr.round = int16_t(1);
-                            mr.pass = int16_t((chi2 < hitCut && absResidualOk) ? 1 : 0);
+                            mr.pass = int16_t(pass ? 1 : 0);
                             candMemberBuf_[(uint32_t(j) * uint32_t(maxWalkLayers) + uint32_t(viM)) * kExtDumpMaxMembers +
                                            m] = mr;
                           } else {
@@ -2370,28 +1775,31 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                           }
                         }
                       }
-                      const bool isBetter = (chi2 < bestChi2) || (chi2 == bestChi2 && candId < bestHit);
-                      if (isBetter && (chi2 < hitCut) && absResidualOk) {
+                      const bool isBetter = (score < bestScore) || (score == bestScore && candId < bestHit);
+                      if (isBetter && pass) {
+                        bestScore = score;
                         bestChi2 = chi2;
                         bestHit = candId;
-                        bestDPhi = dPhi;
-                        bestDSec = dSec;
-                        bestSigPhi2Hit = sigPhi2Hit + msPhi2;
-                        bestSigSec2Hit = sigSec2Hit + msVar * dArcSinceLast * dArcSinceLast;
-                        bestDerSigR2 = sigPhi2Der * rh2;
-                        bestDerSigS2 = sigSec2Der;
-                        bestDerRbb = 0.f;  // a raw-OT rechit is not a stub -- no bend row
+                        bestD0 = dR0;
+                        bestD1 = dSec;
+                        bestD2 = 0.f;
+                        bestRpp = Rpp;
+                        bestRps = Rps;
+                        bestRss = Rss;
+                        bestRbb = 0.f;
+                        bestNRows = nRows;
+                        bestDet = detS;
+                        bestSecWin = secWin ? 2.f * secHalf : 0.f;
                         bestRh = rh;
                         bestZh = zh;
-                        bestArcS = s;
-                        bestJrCot = selJrCot;
-                        bestJrZip = selJrZip;
+                        bestArcS = p2.arcS;
                       }
                     }
                   }
                 }
               }
-              laneChi2[lane] = bestChi2;
+              laneOcc[lane] = nOccSeen;
+              laneChi2[lane] = bestScore;  // the reduce ranks on the tail probability, not on chi2
               laneHit[lane] = bestHit;
               // Min-combine this round's best-any into the lane's persistent slot (initialized to
               // the sentinel at layer-select; round 0 then round 1 accumulate). Each lane owns its slot -> no
@@ -2405,18 +1813,20 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 laneBestAnyPass[lane] = bestAnyPass;
               }
               laneWin[lane] = int(lane);  // seed the argmin tree's carried lane index
-              laneDPhi[lane] = bestDPhi;
-              laneDSec[lane] = bestDSec;
-              laneSigPhi2[lane] = bestSigPhi2Hit;
-              laneSigSec2[lane] = bestSigSec2Hit;
-              laneDerSigR2[lane] = bestDerSigR2;
-              laneDerSigS2[lane] = bestDerSigS2;
-              laneDerRbb[lane] = bestDerRbb;
+              laneChi2Val[lane] = bestChi2;
+              laneD0[lane] = bestD0;
+              laneD1[lane] = bestD1;
+              laneD2[lane] = bestD2;
+              laneRpp[lane] = bestRpp;
+              laneRps[lane] = bestRps;
+              laneRss[lane] = bestRss;
+              laneRbb[lane] = bestRbb;
+              laneNRows[lane] = bestNRows;
+              laneDet[lane] = bestDet;
+              laneSecWin[lane] = bestSecWin;
               laneRh[lane] = bestRh;
               laneZh[lane] = bestZh;
               laneArcS[lane] = bestArcS;
-              laneJrCot[lane] = bestJrCot;
-              laneJrZip[lane] = bestJrZip;
             }
             alpaka::syncBlockThreads(acc);
 
@@ -2432,6 +1842,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 const uint32_t lane = element.local;
                 if (lane < stride) {
                   const uint32_t o = lane + stride;
+                  laneOcc[lane] += laneOcc[o];  // the local-occupancy count rides the same tree
                   const bool takeO =
                       (laneHit[lane] < 0) ||
                       (laneHit[o] >= 0 &&
@@ -2453,16 +1864,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 continue;
               const int L = shCurrentL;
               const bool isBarrel = caLayers.isBarrel()[L];
-              // The per-layer-class gate scales again, here only for the stack-partner threshold below;
-              // the primary gate was applied per lane in the scan and the argmin tree needs no cut.
-              const float scaleTOB456 = (L >= 31 && L <= 33) ? extChi2CutScaleTOB456 : 1.f;
-              const float scaleTID = (L >= 34 && L <= 53) ? extChi2CutScaleTID : 1.f;  // TID endcap
-              // dispgate: same TOB1-3 window tightening as the lane scan, so the partner threshold below
-              // stays consistent with the primary gate on a displaced host. 1.f when off / prompt / L>30.
-              const float scaleTOB13 = (shHostDisplaced && L >= 28 && L <= 30) ? kDispGateTOB13Scale : 1.f;
-              // pocket gate: same forward-eta TOB1-3 tightening as the lane scan, kept consistent with the
-              // primary gate. Exclusive with scaleTOB13 (see setup). 1.f when off / non-forward / L>30.
-              const float scalePocket = (shHostForwardPocket && L >= 28 && L <= 30) ? kPocketTOB13Scale : 1.f;
               int32_t gHit = laneHit[0];        // -1 when no lane passed the gate
               const float gChi2 = laneChi2[0];  // winner chi2 (used only when gHit >= 0)
               // A gate-passer existed on this layer iff the argmin winner exists (laneHit[0] >= 0, read
@@ -2472,18 +1873,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
               // the hole counter (rejGate == occupancy && !pass) can consume it.
               if (candDump_ && laneHit[0] >= 0)
                 shChainHasPass = 1;
-              // Far-first window-ambiguity condition (AttachParams::extAttachFarMaxWin). The
-              // far-first ordering gathers the outermost crossing whatever its purity, and here the
-              // walk may decline one whose window it cannot arbitrate: shFarPass is the number of
-              // candidates that cleared this crossing's gate, and above the limit the argmin is a
-              // choice among competing hits rather than a measurement. Declining is exactly "no hit
-              // on this layer": the layer is already charged to the K visit budget, the extra slot is
-              // not spent and the walk carries on into the nearer interior discs, which keep the
-              // unconditioned commit rule. Round 0 only, the merged round owning the pixel content.
-              if (shFarLayer && round == 0 && gHit >= 0 && shFarPass > uint32_t(extAttachFarMaxWin)) {
-                gHit = -1;
-                alpaka::atomicAdd(acc, &stats[kStatAttachFarDecline], 1u, alpaka::hierarchy::Grids{});
-              }
               // The hole hypothesis, "attach nothing on this layer", competes in the argmin: the
               // winner is committed only if it beats it. Its price comes from the measured per-layer
               // stub availability eta_L, the measured stub areal density rho and the window volume,
@@ -2499,26 +1888,44 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 if (round == 1)
                   alpaka::atomicAdd(acc, &stats[kStatDerHoleCandRaw], 1u, alpaka::hierarchy::Grids{});
                 const int wLane = laneWin[0];
-                const float sR2 = (wLane >= 0) ? laneDerSigR2[wLane] : 0.f;
-                const float sS2 = (wLane >= 0) ? laneDerSigS2[wLane] : 0.f;
-                // |R| is the volume of the statistic the winner was actually judged with,
-                // and the density is the one that lives in that same space -- for a stub winner the
-                // 3-dof volume sigma_R^2 sigma_S^2 R_bb against rho_3 [cm^-1 rad^-1], for a raw-OT
-                // winner the 2-dof branch, sigma_R^2 sigma_S^2 against rho_A [cm^-2]. Mixing
-                // the two is a units error, not a rounding one.
-                const float rbbW = (wLane >= 0) ? laneDerRbb[wLane] : 0.f;
-                const bool win3 = (rbbW > 0.f);
-                // The 2-dof price is keyed by source round: a round-1 winner is a raw cluster on a layer
-                // whose stub round already came up empty, so it is priced with the raw round's own
-                // conditional availability and cluster density (shDerHoleKRaw); a round-0 2-dof winner
-                // (pixel / P-hit-only merged) keeps the stub rows. extHoleRawRoundPrior off leaves
-                // shDerHoleKRaw at its sentinel and the single stub row prices both rounds.
+                // |S| is the volume of the statistic the winner was actually judged with, and the
+                // density must live in that same space: a stub winner carries the bend row (3 dof,
+                // rho_3 [cm^-1 rad^-1]), a raw-OT or non-stub winner does not (2 dof, rho_A [cm^-2]).
+                // Mixing the two is a units error, not a rounding one.
+                const float detW = (wLane >= 0) ? laneDet[wLane] : 0.f;
+                const bool win3 = (wLane >= 0) && (laneRbb[wLane] > 0.f);
+                // When the winner's secondary row is a window rather than a chi2 row, its acceptance
+                // region is that window times the Gaussian ball of the rows that remain, so the
+                // background count nu loses one (2 pi)^{1/2} and gains the window's width. nu is then
+                // literally the expected number of random clusters of this layer compatible with the
+                // candidate, and the hole wins as soon as it passes one.
+                const float secWinW = (wLane >= 0) ? laneSecWin[wLane] : 0.f;
+                // A round-1 winner is a raw cluster on a layer whose stub round came up empty, so it
+                // is priced with the raw round's own conditional availability and per-event density.
                 const float hole2 = (round == 1 && shDerHoleKRaw > -1e29f) ? shDerHoleKRaw : shDerHoleK;
-                const float holeK = win3 ? shDerHoleK3 : hole2;
-                if (sR2 > 0.f && sS2 > 0.f && holeK > -1e29f) {
-                  const float detR = win3 ? (sR2 * sS2 * rbbW) : (sR2 * sS2);
-                  const float chi2Hole = holeK - alpaka::math::log(acc, detR);
-                  if (gChi2 >= chi2Hole) {
+                float holeK = win3 ? shDerHoleK3 : hole2;
+                // Price the hole with the occupancy the scan measured here: laneOcc[0] is the patch count summed over the
+                // lanes and shOccNorm the count the same patch would hold if this layer's clusters were spread uniformly,
+                // so their product is the local contrast and the constant shifts by -2 ln of it. Only the areal part of the
+                // 3-dof density moves (the bend dimension is a property of the stub). The floor at one only guards a patch
+                // clipped by the layer's envelope.
+                if (holeK > -1e29f && shOccNorm > 0.f) {
+                  const uint32_t nLoc = (laneOcc[0] > 0u) ? laneOcc[0] : 1u;
+                  holeK -= 2.f * alpaka::math::log(acc, float(nLoc) * shOccNorm);
+                }
+                float lnVol = 0.f;
+                if (secWinW > 0.f && holeK > -1e29f) {
+                  constexpr float kLnTwoPi = 1.8378771f;
+                  holeK += kLnTwoPi;
+                  lnVol = 2.f * alpaka::math::log(acc, secWinW);
+                }
+                if (detW > 0.f && holeK > -1e29f) {
+                  const float chi2Hole = holeK - alpaka::math::log(acc, detW) - lnVol;
+                  // Both sides are -2 ln(likelihood): the winner's own gate chi2 against the
+                  // no-detection weight. gChi2 here is the reduce's ranking key (-ln tail), so the
+                  // comparison is made on the chi2 the winner actually scored.
+                  const float winChi2 = (wLane >= 0) ? laneChi2Val[wLane] : 0.f;
+                  if (winChi2 >= chi2Hole) {
                     gHit = -1;  // the hole wins: this layer contributes no measurement
                     alpaka::atomicAdd(acc, &stats[kStatDerHoleFire], 1u, alpaka::hierarchy::Grids{});
                     if (round == 1)
@@ -2526,31 +1933,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                   }
                 }
               }
-              // MTV-aligned extra cap: this winner resolves to gExtraClusters output clusters (a merged
-              // 2-hit stub -> 2 via reco::isStub; a raw-OT round-1 winner / pixel / P-hit-only -> 1). If
-              // appending it would breach the per-track cluster budget, drop it (set gHit = -1) --
-              // identical to "no hit on this layer", so the walk keeps the shorter, higher-purity track.
-              // In round 0, dropping also leaves shMergedHit == 0, letting round 1 try a 1-cluster OT hit
-              // that may still fit the budget. Cap off => shExtraClusterCap sentinel => never fires.
+              // Matching bound: this winner resolves to gExtraClusters output clusters (a merged 2-hit
+              // stub -> 2, a raw-OT or pixel winner -> 1). Over the budget it is dropped exactly as if
+              // the layer had no hit, so in round 0 round 1 may still try a one-cluster OT hit.
               int gExtraClusters = 0;
               if (gHit >= 0) {
                 gExtraClusters = isOTId(uint32_t(gHit)) ? 1 : (::reco::isStub(hits, gHit) ? 2 : 1);
-                // An OT-layer (CA >= 28) candidate on an anchored track (>= 1 prior accepted OT
-                // extra) bypasses the cluster-cap drop, having passed the per-hit gate from the
-                // anchored running state. shNOTExtraAcc counts prior-layer OT accepts only, so the
-                // test is that a prior OT accept exists; unanchored tracks and pixel candidates keep
-                // the guard. extCapExemptTOB46Only narrows the exempted set from L >= 28 to L in
-                // 31-33, and extCapExemptMaxChi2 additionally requires the winner's gate chi2 to be
-                // below it, so a high-chi2 tail is re-capped even inside TOB4-6.
-                const bool capExemptLayerOk = extCapExemptTOB46Only ? (L >= 31 && L <= 33) : (L >= 28);
-                const bool capExemptChi2Ok = (extCapExemptMaxChi2 <= 0.f) || (gChi2 < extCapExemptMaxChi2);
-                const bool capAcceptExempt =
-                    extCapExemptAnchored && shNOTExtraAcc >= 1 && capExemptLayerOk && capExemptChi2Ok;
-                if (!capAcceptExempt && shNExtraClusters + gExtraClusters > shExtraClusterCap) {
-                  // The over-budget winner is dropped here, in arrival order; the dump still records it
-                  // with outcome rejCap.
+                if (shNExtraClusters + gExtraClusters > shExtraClusterCap) {
                   gHit = -1;
-                  if (candDump_)  // dump: gate-passing winner over the MTV cluster budget
+                  if (candDump_)
                     shDumpCapDropped = 1;
                 }
               }
@@ -2558,36 +1949,17 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
               if (round == 0)
                 shMergedHit = (gHit >= 0) ? 1 : 0;  // gate round 1: OT scans only where the merged round missed
               if (gHit >= 0) {
-                // Capture the just-traversed gap's Highland msVar now (pre measurement-update
-                // helix + the old last-accept point r/z -- exactly the quantity the scan folded into this
-                // layer's window) for the post-downdate P += Q injection after recomputeHelix below. 0 when off.
-                float msVarGapJ2 = 0.f;
-                if (extStateProcessNoise > 0.f) {
-                  const HelixState hMsGapJ2 =
-                      sh.helix();  // pre-update state (the measurement downdate has not run yet)
-                  const float dArcGapJ2 = alpaka::math::max(acc, laneArcS[gLane] - shLastArcS, 0.f);
-                  msVarGapJ2 = multScattVar(acc,
-                                            shBf,
-                                            hMsGapJ2,
-                                            dArcGapJ2,
-                                            rhoMap_,
-                                            shLastR,
-                                            shLastZ,
-                                            alpaka::math::max(acc, laneRh[gLane], 1.f),
-                                            laneZh[gLane]);
-                }
                 extrasIds[j * maxExtraHitsPerTrack + shNExtra] = uint32_t(gHit);
                 extrasChi2[j * maxExtraHitsPerTrack + shNExtra] = gChi2;
                 ++shNExtra;
+                shNExtraClusters += gExtraClusters;
                 if (candDump_) {  // dump: capture this layer's committed winner (round 0 or 1)
                   shDumpWinHit = gHit;
                   shDumpWinChi2 = gChi2;
                   shDumpWinRound = round;
                 }
-                shNExtraClusters += gExtraClusters;  // MTV-aligned cap: track appended clusters
                 // Tally OT-layer (CA >= 28) accepts -- the anchor count the cluster-cap exemption reads
                 // on subsequent layers. Written here, after the per-accept guard, so at that guard it
-                // holds only prior-layer OT accepts. Read only under extCapExemptAnchored.
                 if (L >= 28)
                   ++shNOTExtraAcc;
                 // Diagnostic: split walk-committed extras by impurity layer class (TOB1-3 / TOB4-6 /
@@ -2618,157 +1990,72 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                 } else {
                   alpaka::atomicAdd(acc, &stats[kDiagWalkMerged], 1u, alpaka::hierarchy::Grids{});
                 }
-                if (secFracDiag_) {
-                  // Fold this accept into the exact full-5x5 shadow cov, linearized on the pre-update
-                  // state -- the same point at which the walk captured its residual and Jacobians.
-                  const float rhs = alpaka::math::max(acc, laneRh[gLane], 1.f);
-                  const float ss = laneArcS[gLane];
-                  const float Hp[5] = {1.f, -1.f / rhs, -shBf * ss * ss / (2.f * rhs), 0.f, 0.f};
-                  float Hs[5];
-                  if (isBarrel) {
-                    Hs[0] = 0.f;
-                    Hs[1] = 0.f;
-                    Hs[2] = 0.f;
-                    Hs[3] = ss;
-                    Hs[4] = 1.f;
-                  } else {
-                    rWithGrad5(acc, sh.phi0, sh.tip, sh.invPt, sh.cotTheta, sh.zip, laneZh[gLane], shBf, Hs);
-                  }
-                  const float R00 = laneSigPhi2[gLane] + (alignSigmaPhiCm * alignSigmaPhiCm) / (rhs * rhs);
-                  const float R11 = laneSigSec2[gLane] + alignSigmaSecCm * alignSigmaSecCm;
-                  updateShadowCov(acc, shC, Hp, Hs, R00, R11);
-                  if (!isBarrel)
-                    ++shNDiskAcc;
+                // The measurement update. The traversed gap's process noise goes into P first --
+                // exactly the Q the gate was computed with, so the two never disagree and the gap is
+                // counted once, in the state and never in R -- then the winner's rows update the
+                // state. The rows are the per-visit ones (shHphi/shHsec/shHb); R is the hit's own.
+                sh.addKinkNoise(shQcPhi, shQcCot, shGapW, shGapS1, shGapS2);
+                if (shDerQgap > 0.f) {
+                  // The last FITTED gap's exit-direction kink is structurally invisible to the fit
+                  // (varBeta(n-1) == 0). It sits at the anchor arc and enters the state once, here.
+                  const float cot2a = sh.cotTheta * sh.cotTheta;
+                  const float sk = shLastArcS;
+                  sh.addKinkNoise(
+                      shDerQgap * (1.f + cot2a), shDerQgap * (1.f + cot2a) * (1.f + cot2a), 1.f, sk, sk * sk);
+                  shDerQgap = 0.f;
                 }
-                sh.updateCircleFromPhi(acc, laneDPhi[gLane], laneSigPhi2[gLane], laneRh[gLane], shBf, laneArcS[gLane]);
-                // Line (cotTheta,zip) KF update on both regions: the barrel uses the exact H=(s,1) of
-                // z=zip+s*cot, the endcap the r-at-fixed-z dual H=(dr/dcot, dr/dzip), captured with
-                // the residual on the pre-update helix. Innovation sign: laneDSec = pred - meas and
-                // the mean update x += K (meas - pred) is applied inside the helpers (state -=
-                // K*dSec), so both line calls pass the raw +dSec residual, as the circle call does.
-                if (isBarrel)
-                  sh.updateLineFromSec(acc, laneDSec[gLane], laneSigSec2[gLane], laneArcS[gLane]);
-                else
-                  sh.updateLineFromSecH(acc, laneDSec[gLane], laneSigSec2[gLane], laneJrCot[gLane], laneJrZip[gLane]);
-                sh.recomputeHelix(acc, shBf);
-                // State process noise (P += Q): after the measurement downdate above, the direction
-                // terms of P are re-inflated by the just-traversed gap's Highland scattering variance
-                // (captured pre-update as msVarGapJ2). Circle block: vPhi += scale*msVar. Line block:
-                // vCot += scale*msVar*(1+cot^2)^2, since d(cot)/d(theta) = -(1+cot^2) maps the
-                // polar-angle scattering variance through that Jacobian squared. Curvature vPt is
-                // untouched, scattering being elastic. Injected post-downdate so this layer's window
-                // is not double-counted; it widens the next layer's propagated predPhiVar/predSecVar,
-                // which keeps an anchored track from being gate-killed by an over-confident P.
-                if (extStateProcessNoise > 0.f) {
-                  const float cot2p1 = 1.f + sh.cotTheta * sh.cotTheta;
-                  sh.vPhi += extStateProcessNoise * msVarGapJ2;
-                  sh.vCot += extStateProcessNoise * msVarGapJ2 * cot2p1 * cot2p1;
+                {
+                  // The update sees exactly the rows the gate did: a windowed secondary is not a
+                  // Gaussian measurement, so it does not update the state either.
+                  const int nR = laneNRows[gLane];
+                  const bool hasBend = laneRbb[gLane] > 0.f;
+                  const bool secIn = (laneSecWin[gLane] <= 0.f);
+                  float Hm[3][5] = {{0.f}};
+                  float dm[3] = {laneD0[gLane], 0.f, 0.f};
+                  float Rm[3][3] = {{laneRpp[gLane], 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.f, 0.f, 0.f}};
+                  for (int q = 0; q < 5; ++q)
+                    Hm[0][q] = shHphi[q];
+                  int r = 1;
+                  if (secIn) {
+                    for (int q = 0; q < 5; ++q)
+                      Hm[1][q] = shHsec[q];
+                    dm[1] = laneD1[gLane];
+                    Rm[1][1] = laneRss[gLane];
+                    Rm[0][1] = Rm[1][0] = laneRps[gLane];
+                    r = 2;
+                  }
+                  if (hasBend) {
+                    for (int q = 0; q < 5; ++q)
+                      Hm[r][q] = shHb[q];
+                    dm[r] = laneD2[gLane];
+                    Rm[r][r] = laneRbb[gLane];
+                  }
+                  sh.updateState5(acc, nR, Hm, dm, Rm, true);
                 }
-                // re-anchor the option-D band state at this accept
-                // Exact 3x3 fold of (u, u', kappa): propagate to the accept's arc, add the traversed
-                // gap's process noise from its own material moments -- the exact (W, S1, S2) split
-                // rather than one equivalent kink, which would leave the late-visit road far too narrow
-                // -- then update with the accepted r-phi measurement and move the anchor. Process noise
-                // goes into the state per gap, never into the innovation per visit; that is also why the
-                // material march runs once per visit.
-                if (shDerOn) {
-                  const float dsA = laneArcS[gLane] - shDerAnchorS;
-                  float c00 = shDerCloc[0], c01 = shDerCloc[1], c02 = shDerCloc[2];
-                  float c11 = shDerCloc[3], c12 = shDerCloc[4], c22 = shDerCloc[5];
-                  // The last fitted gap's exit-direction variance is structurally invisible to the fit
-                  // (varBeta(n-1) == 0); it enters the road explicitly until the first accept, and from
-                  // here on it lives in the band like any other direction uncertainty.
-                  if (shDerQgap > 0.f) {
-                    c11 += shDerQgap;
-                    shDerQgap = 0.f;
-                  }
-                  // F = [[1, ds, -ds^2/2], [0, 1, -ds], [0, 0, 1]]  (the same g the road consumes)
-                  const float f02 = -0.5f * dsA * dsA;
-                  const float n00 = c00 + 2.f * dsA * c01 + 2.f * f02 * c02 + dsA * dsA * c11 + 2.f * dsA * f02 * c12 +
-                                    f02 * f02 * c22;
-                  const float n01 = c01 + dsA * c11 + f02 * c12 - dsA * (c02 + dsA * c12 + f02 * c22);
-                  const float n02 = c02 + dsA * c12 + f02 * c22;
-                  const float n11 = c11 - 2.f * dsA * c12 + dsA * dsA * c22;
-                  const float n12 = c12 - dsA * c22;
-                  const float n22 = c22;
-                  // Process noise of the traversed gap: the offset carries the 3-D lever,
-                  // the angle rows carry 1/cos(lambda) per power of angle.
-                  const float cotA = sh.cotTheta;
-                  const float invCosL = alpaka::math::sqrt(acc, 1.f + cotA * cotA);
-                  c00 = n00 + shDerC * shDerS2;
-                  c01 = n01 + shDerC * shDerS1 * invCosL;
-                  c02 = n02;
-                  c11 = n11 + shDerC * shDerW * invCosL * invCosL;
-                  c12 = n12;
-                  c22 = n22;
-                  // KF update with the accepted r-phi measurement, H = [1, 0, 0], R = its own error.
-                  const float Rm = alpaka::math::max(
-                      acc,
-                      laneSigPhi2[gLane] * laneRh[gLane] * laneRh[gLane] + alignSigmaPhiCm * alignSigmaPhiCm,
-                      1e-10f);
-                  const float Sm = c00 + Rm;
-                  if (Sm > 0.f) {
-                    const float k0 = c00 / Sm, k1 = c01 / Sm, k2 = c02 / Sm;
-                    shDerCloc[0] = c00 - k0 * c00;
-                    shDerCloc[1] = c01 - k1 * c00;
-                    shDerCloc[2] = c02 - k2 * c00;
-                    shDerCloc[3] = c11 - k1 * c01;
-                    shDerCloc[4] = c12 - k2 * c01;
-                    shDerCloc[5] = c22 - k2 * c02;
-                  } else {
-                    shDerCloc[0] = c00;
-                    shDerCloc[1] = c01;
-                    shDerCloc[2] = c02;
-                    shDerCloc[3] = c11;
-                    shDerCloc[4] = c12;
-                    shDerCloc[5] = c22;
-                  }
-                  // The energy-loss centre re-anchors with the band by the same recursion: the same
-                  // F(ds) as the covariance above, applied to the deterministic triple rather than to
-                  // a matrix, and the same gap moments (shDerW/S1/S2) the process noise just used, so
-                  // the two states never disagree about how much material was traversed.
-                  //   u      <- u + u'*ds - (dkappa*ds^2 + K*S2)/2    [an identity, not a truncation]
-                  //   u'     <- u' - (dkappa*ds + K*S1)
-                  //   dkappa <- dkappa + K*W
-                  // It is not reset by the measurement update: the residual fed to the filter above
-                  // is the corrected one, so the running helix tracks the constant-kappa_0 reference
-                  // trajectory the fit published while these three carry the true track's growing
-                  // offset from it.
-                  if (shEK > 0.f) {
-                    // Same transverse-metric conversion as the per-visit evaluation above: dsA is a
-                    // transverse arc, shDerS1/S2 carry 3-D lever powers 1 and 2, so they take one and
-                    // two powers of cos(lambda) respectively. shDerW is a bare material column with no
-                    // lever in it and is metric-free, so dkappa's fold is unchanged.
-                    const float cosLA = 1.f / invCosL;
-                    const float uN = shEU + shEUp * dsA - 0.5f * (shEDk * dsA * dsA + shEK * shDerS2 * cosLA * cosLA);
-                    const float upN = shEUp - (shEDk * dsA + shEK * shDerS1 * cosLA);
-                    shEDk += shEK * shDerW;
-                    shEU = uN;
-                    shEUp = upN;
-                  }
-                  shDerAnchorS = laneArcS[gLane];
-                  shDerAnchorR = alpaka::math::max(acc, laneRh[gLane], 1.f);
-                  shDerAnchorZ = laneZh[gLane];
+                sh.recomputeHelix(acc, shSegBf);
+                // The energy-loss centre re-anchors by its own recursion on the same gap moments the process noise used:
+                //   u      <- u + u'*ds - (dkappa*ds^2 + K*S2)/2
+                //   u'     <- u' - (dkappa*ds + K*S1)
+                //   dkappa <- dkappa + K*W
+                // It is not reset by the measurement update: the running helix tracks the constant-kappa_0 reference the
+                // fit published, and these three carry the true track's growing offset from it.
+                if (shEK > 0.f) {
+                  const float dsA = laneArcS[gLane] - shLastArcS;
+                  const float uN = shEU + shEUp * dsA - 0.5f * (shEDk * dsA * dsA + shEK * shElS2);
+                  const float upN = shEUp - (shEDk * dsA + shEK * shElS1);
+                  shEDk += shEK * shGapW;
+                  shEU = uN;
+                  shEUp = upN;
                 }
                 shLastArcS = laneArcS[gLane];
                 shLastR = laneRh[gLane];
                 shLastZ = laneZh[gLane];
-                // Both-sensors attach on stub-less layers. The round-1 winner sits on one sensor of
-                // an OT stack and the killed doublet's partner rechit typically lives on the other
-                // sensor of the same module, so that partner sensor range is scanned against the
-                // updated helix with the same OT gate math (fresh predict at the hit's rh/zh, same
-                // chi2Cut and absResidualOk) and the best passing hit is accepted as a second extra
-                // on this layer. Lane-0-serial over a few hits per module, round 1 only.
-                // The partner is a second raw-OT extra of one cluster, so it needs room for one more
-                // cluster on top of the primary already counted in shNExtraClusters, and being a
-                // same-module OT extra on an anchored track it bypasses the cluster-cap check.
-                // extCapExemptTOB46Only gates it on L in 31-33 as at every other exemption site;
-                // extCapExemptMaxChi2 is not applied, since the partner's own gate chi2 does not
-                // exist yet here and it rides a primary accept that was itself chi2-gated.
-                const bool capPartnerExempt =
-                    extCapExemptAnchored && shNOTExtraAcc >= 1 && (!extCapExemptTOB46Only || (L >= 31 && L <= 33));
-                if (round == 1 && shNExtra < maxExtraHitsPerTrack &&
-                    (capPartnerExempt || shNExtraClusters < shExtraClusterCap)) {
+                // Both-sensors attach on stub-less layers (round 1 only, lane-0-serial): the round-1 winner sits on one
+                // sensor of an OT stack and the killed doublet's partner rechit usually lives on the other sensor of the
+                // same module, so that sensor range is scanned against the updated helix with the same OT gate and the
+                // best passing hit is accepted as a second extra. It needs one more cluster of room under the matching bound.
+                if (round == 1 && shNExtra < maxExtraHitsPerTrack && shNExtraClusters < shExtraClusterCap &&
+                    shDerLayOn) {
                   const auto& otHits = otSource_.otHits;
                   const uint32_t oWin = otIdx(uint32_t(gHit));
                   const uint32_t geomIdx = uint32_t(otHits[oWin].detectorIndex()) - ::phase2PixelTopology::nModulesPix;
@@ -2777,16 +2064,28 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                   // partner = the other sensor range of the same module (ranges from otHitModules)
                   const uint32_t pBeg = winUpper ? otSource_.otHitModules.moduleStart()[geomIdx] : upStart;
                   const uint32_t pEnd = winUpper ? upStart : otSource_.otHitModules.moduleStart()[geomIdx + 1u];
-                  // The partner threshold carries the same per-layer-class scaling (scaleTOB456,
-                  // scaleTID, scaleTOB13, scalePocket) as the per-lane gate.
-                  const float bestPChi2Dep =
-                      (isBarrel ? chi2Cut : endcapChi2Cut) * scaleTOB456 * scaleTID * scaleTOB13 * scalePocket;
-                  // The partner rides the same single measured quantile as the primary gate.
-                  float bestPChi2 = shDerLayOn ? shDerQ : bestPChi2Dep;
+                  // The partner rides the same eps and the same statistic as the primary gate. Its
+                  // rows are the visit's, but the state was just updated by the winner, so the
+                  // prediction block is rebuilt on the post-update covariance.
+                  float Mp[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                  {
+                    auto projP = [&](const float* Ha, const float* Hb2) {
+                      float v = 0.f;
+                      for (int x = 0; x < 5; ++x)
+                        for (int y = 0; y < 5; ++y)
+                          v += Ha[x] * sh.C[RunningHelix::cIdx(x, y)] * Hb2[y];
+                      return v;
+                    };
+                    Mp[0] = projP(shHphi, shHphi);
+                    Mp[1] = projP(shHphi, shHsec);
+                    Mp[3] = projP(shHsec, shHsec);
+                  }
+                  float bestPScore = 3.4e38f;
                   int32_t bestPHit = -1;
-                  float bestPDPhi = 0.f, bestPDSec = 0.f, bestPSigPhi2 = 0.f, bestPSigSec2 = 0.f;
+                  float bestPD0 = 0.f, bestPD1 = 0.f;
+                  float bestPRpp = 0.f, bestPRps = 0.f, bestPRss = 0.f;
+                  bool bestPSecIn = true;
                   float bestPRh = 0.f, bestPZh = 0.f, bestPArcS = 0.f;
-                  float bestPJrCot = 0.f, bestPJrZip = 0.f;
                   for (uint32_t p = pBeg; p < pEnd; ++p) {
                     if (otSource_.usedInStub[p] || (otSource_.ownership != nullptr && otSource_.ownership[p] != 0u))
                       continue;  // stub member or already owned
@@ -2807,7 +2106,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     const float dPhi = foldPi(p2.phi + shDerElossPhi - phiH);
                     const float dSec = p2.secondary + shDerElossSec - secH;
                     const float rh_safe = alpaka::math::max(acc, rh, 1.f);
-                    // OT sensor frame (lower/upper per this partner hit's position within the stack).
                     const float xerr = otHits[p].xerrLocal();
                     const float yerr = otHits[p].yerrLocal();
                     const bool isUpper = (p >= upStart);
@@ -2816,150 +2114,67 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     float ge[6];
                     frame.toGlobal(xerr, 0.f, yerr, ge);
                     const float rh2 = rh_safe * rh_safe;
-                    const float gxx = ge[0], gxy = ge[1], gyy = ge[2], gzz = ge[5];
-                    const float sigPhi2HitRaw = (yh * yh * gxx - 2.f * xh * yh * gxy + xh * xh * gyy) / (rh2 * rh2);
-                    const float sigSec2HitRaw =
-                        isBarrel ? gzz : (xh * xh * gxx + 2.f * xh * yh * gxy + yh * yh * gyy) / rh2;
-                    const float sigPhi2Hit = alpaka::math::max(acc, sigPhi2HitRaw, 1e-6f);
-                    const float sigSec2Hit = alpaka::math::max(acc, sigSec2HitRaw, 1e-4f);
-                    const float sigPhiHit = alpaka::math::sqrt(acc, sigPhi2Hit);
-                    const float sigSecHit = alpaka::math::sqrt(acc, sigSec2Hit);
-                    // Incremental multiple scattering since the last accepted point (the winner).
-                    const HelixState hForMs = sh.helix();
-                    const float dArcSinceLast = alpaka::math::max(acc, p2.arcS - shLastArcS, 0.f);
-                    const float msVar =
-                        multScattVar(acc, shBf, hForMs, dArcSinceLast, rhoMap_, shLastR, shLastZ, rh_safe, zh);
-                    const float s = p2.arcS;
-                    const float Jtip = -1.f / rh_safe;
-                    const float JinvPt = -shBf * s * s / (2.f * rh_safe);
-                    const float Jcot = s;
-                    const float predPhiDiag = sh.vPhi + Jtip * Jtip * sh.vTip + JinvPt * JinvPt * sh.vPt;
-                    const float predSecDiag_barrel = sh.vZip + Jcot * Jcot * sh.vCot;
-                    const float predPhiCross =
-                        2.f * Jtip * sh.cPhiTip + 2.f * JinvPt * sh.cPhiPt + 2.f * Jtip * JinvPt * sh.cTipPt;
-                    const float predSecCross_barrel = 2.f * Jcot * sh.cCotZip;
-                    const float predPhiVar = alpaka::math::max(acc, predPhiDiag + predPhiCross, 1e-12f);
-                    float predSecVar;
-                    float selJrCot = 0.f, selJrZip = 0.f;
-                    if (isBarrel) {
-                      predSecVar = alpaka::math::max(acc, predSecDiag_barrel + predSecCross_barrel, 1e-12f);
-                    } else {
-                      float Jr[5];
-                      rWithGrad5(acc, sh.phi0, sh.tip, sh.invPt, sh.cotTheta, sh.zip, zh, shBf, Jr);
-                      selJrCot = Jr[3];
-                      selJrZip = Jr[4];
-                      const float predSecCircleDiag =
-                          Jr[0] * Jr[0] * sh.vPhi + Jr[1] * Jr[1] * sh.vTip + Jr[2] * Jr[2] * sh.vPt;
-                      const float predSecCircleCross = 2.f * Jr[0] * Jr[1] * sh.cPhiTip +
-                                                       2.f * Jr[0] * Jr[2] * sh.cPhiPt +
-                                                       2.f * Jr[1] * Jr[2] * sh.cTipPt;
-                      const float predSecLineDiag = Jr[3] * Jr[3] * sh.vCot + Jr[4] * Jr[4] * sh.vZip;
-                      const float predSecLineCross = 2.f * Jr[3] * Jr[4] * sh.cCotZip;
-                      predSecVar = alpaka::math::max(
-                          acc, predSecCircleDiag + predSecCircleCross + predSecLineDiag + predSecLineCross, 1e-12f);
+                    const float gxx = ge[0], gxy = ge[1], gyy = ge[2], gxz = ge[3], gyz = ge[4], gzz = ge[5];
+                    const float Rpp = (yh * yh * gxx - 2.f * xh * yh * gxy + xh * xh * gyy) / rh2;
+                    const float Rss = isBarrel ? gzz : (xh * xh * gxx + 2.f * xh * yh * gxy + yh * yh * gyy) / rh2;
+                    const float Rps = isBarrel ? ((-yh * gxz + xh * gyz) / rh_safe)
+                                               : ((-yh * xh * gxx + (xh * xh - yh * yh) * gxy + xh * yh * gyy) / rh2);
+                    if (!(Rpp > 0.f) || !(Rss > 0.f))
+                      continue;
+                    const float dR0 = dPhi * rh_safe;
+                    // Same row decision as the primary gate, on the post-update prediction block.
+                    const bool secWin = extSecIsWindow(Rss, Mp[3], qGate1);
+                    const float secHalf = extSecSupport(acc, Rss, Mp[3], qGate1);
+                    const int nRows = secWin ? 1 : 2;
+                    float Sm[6] = {Mp[0] + Rpp, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    float dv[3] = {dR0, 0.f, 0.f};
+                    if (!secWin) {
+                      Sm[1] = Mp[1] + Rps;
+                      Sm[3] = Mp[3] + Rss;
+                      dv[1] = dSec;
                     }
-                    const float alignSigmaPhi2 = (alignSigmaPhiCm * alignSigmaPhiCm) / (rh_safe * rh_safe);
-                    const float alignSigmaSec2 = alignSigmaSecCm * alignSigmaSecCm;
-                    const float msPhi2 = msVar * dArcSinceLast * dArcSinceLast / (rh_safe * rh_safe);
-                    // Covariance recalibration (raw-OT stack-partner scan): the same raw-OT class scale
-                    // as round 1; at 1.0 the propagated cov is unscaled.
-                    const float covScale = extCovScaleRawOT;
-                    const float sigPhi2 = sigPhi2Hit + msPhi2 + predPhiVar * covScale + alignSigmaPhi2;
-                    const float sigSec2 =
-                        sigSec2Hit + msVar * dArcSinceLast * dArcSinceLast + predSecVar * covScale + alignSigmaSec2;
-                    // the derived road, as a separate pair of consts (same reason as in the merged round:
-                    // a mutable destination would change the FMA contraction of the fixed-cut expressions above)
-                    // sigma_R and sigma_S are built in centimetres (the frame the tables are measured in); the
-                    // r-phi one is converted back to rad^2 so it is consumed exactly like sigPhi2.
-                    float sigPhi2Der = 0.f, sigSec2Der = 0.f;
-                    if (shDerLayOn) {
-                      const float dVc = extDV[extMatClass(L, isBarrel, rh_safe)];
-                      const float sR2cm = shDerSigR2 + sigPhi2Hit * rh2 + alignSigmaPhiCm * alignSigmaPhiCm + dVc;
-                      const float sS2cm = shDerSigS2 + predSecVar + sigSec2Hit + alignSigmaSec2 + dVc;
-                      sigPhi2Der = alpaka::math::max(acc, sR2cm / rh2, 1e-12f);
-                      sigSec2Der = alpaka::math::max(acc, sS2cm, 1e-12f);
-                    }
-
-                    const float chi2 = shDerLayOn ? ((dPhi * dPhi) / sigPhi2Der + (dSec * dSec) / sigSec2Der)
-                                                  : ((dPhi * dPhi) / sigPhi2 + (dSec * dSec) / sigSec2);
-                    const float dPhiR = dPhi * rh;
-                    constexpr float kSigmaCapMult = 5.f;
-                    const float sigPhiHitCm = sigPhiHit * rh;
-                    const float capRPhiEff = alpaka::math::max(acc, maxRPhiResidCm, kSigmaCapMult * sigPhiHitCm);
-                    const float capSecEff = isBarrel ? alpaka::math::max(acc, maxSecResidCm, kSigmaCapMult * sigSecHit)
-                                                     : endcapMaxSecResidCm;
-                    // on the derived path the cm caps act as runaway ceilings only (see the merged round):
-                    // the quantile ball selects, the module-envelope ceilings only guard, and every ceiling
-                    // rejection of a ball-passer is counted.
-                    bool ballOk = true;
-                    bool ceilOk = true;
-                    if (shDerLayOn) {
-                      const float wR = alpaka::math::sqrt(acc, shDerQ * sigPhi2Der) * rh;
-                      const float wS = alpaka::math::sqrt(acc, shDerQ * sigSec2Der);
-                      ballOk = (alpaka::math::abs(acc, dPhiR) < wR) && (alpaka::math::abs(acc, dSec) < wS);
-                      const bool okR = alpaka::math::abs(acc, dPhiR) < shDerCeilR;
-                      const bool okS = alpaka::math::abs(acc, dSec) < shDerCeilS;
-                      ceilOk = okR && okS;
-                      if (ballOk && !okR)
-                        alpaka::atomicAdd(acc, &stats[kStatDerCapR], 1u, alpaka::hierarchy::Grids{});
-                      if (ballOk && !okS)
-                        alpaka::atomicAdd(acc, &stats[kStatDerCapS], 1u, alpaka::hierarchy::Grids{});
-                    }
-                    const bool absResidualOk = shDerLayOn ? (ballOk && ceilOk)
-                                                          : ((alpaka::math::abs(acc, dPhiR) < capRPhiEff) &&
-                                                             (alpaka::math::abs(acc, dSec) < capSecEff));
-                    const int32_t candId = int32_t(kOTHitTag | p);
-                    const bool isBetter = (chi2 < bestPChi2) || (chi2 == bestPChi2 && candId < bestPHit);
-                    if (isBetter && absResidualOk) {
-                      bestPChi2 = chi2;
-                      bestPHit = candId;
-                      bestPDPhi = dPhi;
-                      bestPDSec = dSec;
-                      bestPSigPhi2 = sigPhi2Hit + msPhi2;
-                      bestPSigSec2 = sigSec2Hit + msVar * dArcSinceLast * dArcSinceLast;
+                    float detS = 0.f;
+                    const float chi2 = extChi2FromS(acc, nRows, Sm, dv, detS);
+                    if (!(chi2 >= 0.f) || chi2 >= (nRows == 1 ? qGate1 : qGate2))
+                      continue;
+                    if (!(alpaka::math::abs(acc, dR0) < shDerCeilR) || !(alpaka::math::abs(acc, dSec) < shDerCeilS) ||
+                        !(alpaka::math::abs(acc, dSec) < secHalf))
+                      continue;
+                    const float score =
+                        -alpaka::math::log(acc, alpaka::math::max(acc, extChi2Tail(acc, nRows, chi2), 1e-30f));
+                    const int32_t cid = int32_t((uint32_t(p) | caOTHitTag::kOTHitTag));
+                    if ((score < bestPScore) || (score == bestPScore && cid < bestPHit)) {
+                      bestPScore = score;
+                      bestPHit = cid;
+                      bestPD0 = dR0;
+                      bestPD1 = dSec;
+                      bestPRpp = Rpp;
+                      bestPRps = Rps;
+                      bestPRss = Rss;
+                      bestPSecIn = !secWin;
                       bestPRh = rh;
                       bestPZh = zh;
-                      bestPArcS = s;
-                      bestPJrCot = selJrCot;
-                      bestPJrZip = selJrZip;
+                      bestPArcS = p2.arcS;
                     }
                   }
                   if (bestPHit >= 0) {
                     extrasIds[j * maxExtraHitsPerTrack + shNExtra] = uint32_t(bestPHit);
-                    extrasChi2[j * maxExtraHitsPerTrack + shNExtra] = bestPChi2;
+                    extrasChi2[j * maxExtraHitsPerTrack + shNExtra] = bestPScore;
                     ++shNExtra;
-                    ++shNExtraClusters;  // MTV-aligned cap: partner raw-OT extra == 1 cluster
-                    if (secFracDiag_) {
-                      // Fold the partner accept into the shadow cov: sh already carries the primary
-                      // accept, so the partner row is linearized on this post-primary state.
-                      const float rhs = alpaka::math::max(acc, bestPRh, 1.f);
-                      const float ss = bestPArcS;
-                      const float Hp[5] = {1.f, -1.f / rhs, -shBf * ss * ss / (2.f * rhs), 0.f, 0.f};
-                      float Hs[5];
-                      if (isBarrel) {
-                        Hs[0] = 0.f;
-                        Hs[1] = 0.f;
-                        Hs[2] = 0.f;
-                        Hs[3] = ss;
-                        Hs[4] = 1.f;
-                      } else {
-                        rWithGrad5(acc, sh.phi0, sh.tip, sh.invPt, sh.cotTheta, sh.zip, bestPZh, shBf, Hs);
-                      }
-                      const float R00 = bestPSigPhi2 + (alignSigmaPhiCm * alignSigmaPhiCm) / (rhs * rhs);
-                      const float R11 = bestPSigSec2 + alignSigmaSecCm * alignSigmaSecCm;
-                      updateShadowCov(acc, shC, Hp, Hs, R00, R11);
-                      if (!isBarrel)
-                        ++shNDiskAcc;
+                    ++shNExtraClusters;
+                    ++shNOTExtraAcc;
+                    // Same-crossing second sensor: no new gap, so no process noise is injected here.
+                    float Hm[3][5] = {{0.f}};
+                    for (int q = 0; q < 5; ++q) {
+                      Hm[0][q] = shHphi[q];
+                      Hm[1][q] = bestPSecIn ? shHsec[q] : 0.f;
                     }
-                    sh.updateCircleFromPhi(acc, bestPDPhi, bestPSigPhi2, bestPRh, shBf, bestPArcS);
-                    // An endcap partner attach also folds its r-innovation into the line block, with
-                    // the same +dSec convention as the primary accept above (the mean-update sign lives
-                    // inside updateLineFromSecH).
-                    if (isBarrel)
-                      sh.updateLineFromSec(acc, bestPDSec, bestPSigSec2, bestPArcS);
-                    else
-                      sh.updateLineFromSecH(acc, bestPDSec, bestPSigSec2, bestPJrCot, bestPJrZip);
-                    sh.recomputeHelix(acc, shBf);
+                    const float dm[3] = {bestPD0, bestPSecIn ? bestPD1 : 0.f, 0.f};
+                    float Rm[3][3] = {{bestPRpp, bestPSecIn ? bestPRps : 0.f, 0.f},
+                                      {bestPSecIn ? bestPRps : 0.f, bestPRss, 0.f},
+                                      {0.f, 0.f, 0.f}};
+                    sh.updateState5(acc, bestPSecIn ? 2 : 1, Hm, dm, Rm, true);
+                    sh.recomputeHelix(acc, shSegBf);
                     shLastArcS = bestPArcS;
                     shLastR = bestPRh;
                     shLastZ = bestPZh;
@@ -3078,14 +2293,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
   struct Kernel_extInitClaims {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   const int maxExtraHitsPerTrack,
-                                  const int maxSharedOwners,
                                   const uint32_t* __restrict__ nCands,
                                   const uint32_t maxCandidates,
                                   const uint32_t nHits,  // OT claims live at nHits + otIdx (0 => merged-only)
                                   const uint32_t* __restrict__ extrasIds,
                                   const int32_t* __restrict__ nExtras,
                                   uint64_t* __restrict__ hitClaims) const {
-      const int nOwners = maxSharedOwners > 1 ? maxSharedOwners : 1;
       const uint64_t kUnclaimed = ~uint64_t(0);  // 0xff..ff, the unclaimed identity
       const uint32_t nC = alpaka::math::min(acc, *nCands, maxCandidates);
       for (auto idx : cms::alpakatools::uniform_elements(acc, nC * uint32_t(maxExtraHitsPerTrack))) {
@@ -3095,8 +2308,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
           continue;
         const uint32_t id = extrasIds[j * maxExtraHitsPerTrack + k];
         const uint32_t claimIdx = isOTId(id) ? nHits + otIdx(id) : id;
-        for (int s = 0; s < nOwners; ++s)
-          hitClaims[std::size_t(claimIdx) * nOwners + s] = kUnclaimed;
+        hitClaims[claimIdx] = kUnclaimed;
       }
     }
   };
@@ -3105,7 +2317,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
   struct Kernel_extClaimExtras {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   const int maxExtraHitsPerTrack,
-                                  const int maxSharedOwners,  // N sorted claim slots per hit (1 => exclusive)
                                   const uint32_t* __restrict__ candList,
                                   const uint32_t* __restrict__ nCands,
                                   const uint32_t maxCandidates,
@@ -3114,7 +2325,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                                   const float* __restrict__ extrasChi2,
                                   const int32_t* __restrict__ nExtras,
                                   uint64_t* __restrict__ hitClaims) const {
-      const int nOwners = maxSharedOwners > 1 ? maxSharedOwners : 1;
       const uint32_t nC = alpaka::math::min(acc, *nCands, maxCandidates);
       for (auto idx : cms::alpakatools::uniform_elements(acc, nC * uint32_t(maxExtraHitsPerTrack))) {
         const uint32_t j = idx / maxExtraHitsPerTrack;
@@ -3124,20 +2334,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
         const uint32_t id = extrasIds[j * maxExtraHitsPerTrack + k];
         const uint32_t claimIdx = isOTId(id) ? nHits + otIdx(id) : id;
         const uint64_t claim = packClaim(extrasChi2[j * maxExtraHitsPerTrack + k], candList[j]);
-        // atomicMin insertion cascade into the hit's N sorted slots: each slot keeps the min of its
-        // old value and the incoming carry (atomic, no lost update), the max cascades to the next
-        // slot; a carry falling past slot N-1 is dropped (largest claim evicted). The final N-slot
-        // set is the N smallest packed claims regardless of interleaving (multiset conservation over
-        // each atomicMin). N == 1 collapses to a single atomicMin per hit.
-        uint64_t carry = claim;
-        const uint64_t kUnclaimed = ~uint64_t(0);  // 0xff..ff, the identity Kernel_extInitClaims wrote
-        for (int s = 0; s < nOwners; ++s) {
-          const uint64_t old = alpaka::atomicMin(
-              acc, &hitClaims[std::size_t(claimIdx) * nOwners + s], carry, alpaka::hierarchy::Grids{});
-          carry = old > carry ? old : carry;  // evicted (larger) value cascades to the next slot
-          if (carry == kUnclaimed)
-            break;  // an empty slot absorbed the carry; nothing more to insert
-        }
+        // Exclusive ownership: one claim slot per hit, taken by the best claimant. The key is the
+        // walk's own ranking score (-ln tail probability), so the hit goes to the track it fits best;
+        // a track that loses a hit here simply does not get it, and the duplicate removal downstream
+        // decides whether the two tracks are the same particle.
+        alpaka::atomicMin(acc, &hitClaims[claimIdx], claim, alpaka::hierarchy::Grids{});
       }
     }
   };
@@ -3147,8 +2348,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
   struct Kernel_extResolveExtras {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   const int maxExtraHitsPerTrack,
-                                  const int maxSharedOwners,      // N sorted claim slots per hit (1 => exclusive)
-                                  const float extAmbigDeltaChi2,  // ambiguity gate (<=0 => off)
                                   const uint32_t* __restrict__ candList,
                                   const uint32_t* __restrict__ nCands,
                                   const uint32_t maxCandidates,
@@ -3158,7 +2357,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                                   int32_t* __restrict__ nExtras,
                                   const uint64_t* __restrict__ hitClaims,
                                   uint32_t* __restrict__ stats) const {
-      const int nOwners = maxSharedOwners > 1 ? maxSharedOwners : 1;
       const uint32_t nC = alpaka::math::min(acc, *nCands, maxCandidates);
       for (auto j : cms::alpakatools::uniform_elements(acc, nC)) {
         const uint32_t tupleId = candList[j];
@@ -3167,36 +2365,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
         for (int k = 0; k < n; ++k) {
           const uint32_t hitId = extrasIds[j * maxExtraHitsPerTrack + k];
           const uint32_t claimIdx = isOTId(hitId) ? nHits + otIdx(hitId) : hitId;
-          // Keep the extra iff this tuple owns any of the hit's N claim slots (N == 1 => the single
-          // atomicMin winner, i.e. exclusive ownership).
-          bool won = false;
-          for (int s = 0; s < nOwners; ++s)
-            won = won || (uint32_t(hitClaims[std::size_t(claimIdx) * nOwners + s] & 0xffffffffu) == tupleId);
-          // ambiguity gate: when this hit is contested by >=2 distinct claimants whose top-2 gate
-          // chi2 sit within extAmbigDeltaChi2, the hit is an ambiguous near-tie -> keep it only for the
-          // single best claimant (slot 0, smallest gate chi2) and veto it from every worse claimant. Needs
-          // the 2nd slot (nOwners >= 2). <= 0 disables it and leaves `won` untouched.
-          bool ambigVeto = false;
-          if (extAmbigDeltaChi2 > 0.f && won && nOwners >= 2) {
-            const uint64_t c0 = hitClaims[std::size_t(claimIdx) * nOwners + 0];
-            const uint64_t c1 = hitClaims[std::size_t(claimIdx) * nOwners + 1];
-            const uint64_t kUnclaimed = ~uint64_t(0);
-            if (c1 != kUnclaimed) {  // a real 2nd claimant exists => the hit is contested
-              const float chi0 = unpackClaimChi2(c0);
-              const float chi1 = unpackClaimChi2(c1);
-              if ((chi1 - chi0) < extAmbigDeltaChi2 && uint32_t(c0 & 0xffffffffu) != tupleId) {
-                won = false;  // ambiguous contested hit: this tuple is not the best claimant -> drop
-                ambigVeto = true;
-              }
-            }
-          }
+          const bool won = (uint32_t(hitClaims[claimIdx] & 0xffffffffu) == tupleId);
           if (won) {
             extrasIds[j * maxExtraHitsPerTrack + kept] = hitId;
             extrasChi2[j * maxExtraHitsPerTrack + kept] = extrasChi2[j * maxExtraHitsPerTrack + k];
             // Keep the chain score aligned with extrasIds through the arbitration compaction.
             ++kept;
-          } else if (ambigVeto) {
-            alpaka::atomicAdd(acc, &stats[kStatAmbigVetoed], 1u, alpaka::hierarchy::Grids{});
           } else {
             // split arbitration losses by source (merged vs raw OT)
             alpaka::atomicAdd(
@@ -3230,20 +2404,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
       for (int b = 0; b < kStatHistBuckets; ++b)
         printf(" %u", stats[kStatHistFirst + b]);
       printf("\n");
-      // Host-quality pre-gate skips, per-layer-class walk-committed extras, ambiguity-gate vetoes.
-      printf("[CAExtension] preGateSkipped=%u etaSkipped=%u extras[TOB1-3=%u TOB4-6=%u TID=%u] ambigVetoed=%u\n",
+      // Pre-gate skips, per-layer-class walk-committed extras, and the candidate-cap overflow.
+      printf("[CAExtension] preGateSkipped=%u etaSkipped=%u extras[TOB1-3=%u TOB4-6=%u TID=%u] candOverflow=%u\n",
              stats[kStatPreGateSkipped],
              stats[kStatPreGateEtaSkipped],
              stats[kStatExtraTOB13],
              stats[kStatExtraTOB456],
              stats[kStatExtraTID],
-             stats[kStatAmbigVetoed]);
-      // Far-first disc ordering: hosts whose ordering was re-keyed, and far commits its window-ambiguity
-      // condition declined. Both stay 0 unless extAttachFarFirst is on; declined stays 0 additionally when
-      // extAttachFarMaxWin <= 0. The ratio is the only production-readable measure of what the condition
-      // does -- a declined layer is indistinguishable from "no gate-passer" in every other counter.
-      printf(
-          "[CAExtension] farFirst: armed=%u declined=%u\n", stats[kStatAttachFarArmed], stats[kStatAttachFarDecline]);
+             stats[kStatCandOverflow]);
       // The derived selection's own alarms. capR/capS count the ball-passers the module-envelope
       // runaway ceilings rejected; divided by derLayers (the layer visits the derived gate armed on)
       // that is the ceilings' binding rate -- << 1 % means the ceiling is a guard, anything more means
@@ -3287,9 +2455,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     // [nHits, nHits + nOTHits). nOTHits == 0 keeps this sized to nHits exactly.
     // N-way sharing (extMaxSharedOwners): each hit keeps N sorted claim slots at
     // [claimIdx*N, claimIdx*N+N); N == 1 reduces to one slot per hit (a single atomicMin winner).
-    const auto nOwners = std::size_t(std::max(1, params.extMaxSharedOwners));
-    auto hitClaims =
-        cms::alpakatools::make_device_buffer<uint64_t[]>(queue, std::max<std::size_t>(1, (nHits + nOTHits) * nOwners));
+    auto hitClaims = cms::alpakatools::make_device_buffer<uint64_t[]>(queue, std::max<std::size_t>(1, nHits + nOTHits));
     alpaka::memset(queue, nCands, 0);
     alpaka::memset(queue, stats, 0);
     // hitClaims is not memset here: the 0xFF "unclaimed" identity is needed only on the rows the
@@ -3308,14 +2474,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                         tracks,
                         passBuf,
                         maxNumberOfTuples,
-                        params.preGateMaxChi2,
                         params.preGateMinPt,
                         std::sinh(params.maxAbsEta),
-                        params.extHostMaxChi2Ndof,
-                        params.extHostMinHits,
-                        params.extHostMinPt,
                         candidateMask,  // restrict the count to the caller's set (null = no restriction)
-                        params.maxCandidates,
+                        knownCandCapacity,
                         /*candList=*/static_cast<uint32_t*>(nullptr),
                         nCands.data(),
                         stats.data());
@@ -3327,8 +2489,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     // optional ceiling on it, for callers that can only offer the whole track capacity as a bound;
     // the scratch, the refit scaffold and the per-candidate grids all shrink with it.
     assert(knownCandCapacity > 0);
-    const uint32_t candBound = std::min(knownCandCapacity, params.extRefitMaxCandidates);
-    const uint32_t candCapacity = std::min(std::max(candBound, 16u), params.maxCandidates);
+    // The candidate set is a subset of the tuples the pre-gate iterates, so the caller's track
+    // capacity IS the structural bound and no ceiling knob is needed: overflow is impossible by
+    // construction, and kStatCandOverflow (counted in both passes) reports it if it ever is not.
+    const uint32_t candCapacity = std::max(knownCandCapacity, 16u);
 
     // Reset the counter so the fill pass in launchAttach re-runs the same predicate from scratch.
     alpaka::memset(queue, nCands, 0);
@@ -3535,10 +2699,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                         cms::alpakatools::make_workdiv<Acc1D>(cms::alpakatools::divide_up_by(nTracksCap, bs), bs),
                         Kernel_extHostMask{},
                         tracks,
-                        params.preGateMaxChi2,
                         params.preGateMinPt,
                         params.maxAbsEta,
-                        params.extHostMaxChi2Ndof,
                         nTracksCap,
                         hostMask,
                         pred);
@@ -3548,10 +2710,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     const AttachParams& params,
                     float bf,
                     const float* rhoMap,
+                    const float* bMap,
                     const ExtPhiBinner* phiBinner,
                     ::reco::TrackSoAConstView tracks,
                     ::reco::TrackHitSoAConstView trackHits,
-                    const uint8_t* armId,  // pocket gate: per-track arm (0=prompt,1=disp); null=off/arm-blind
                     ::reco::TrackingRecHitConstView hits,
                     ::reco::HitModuleSoAConstView hitModules,
                     ::reco::TrackingRecHitsMaskingConstView hitMask,
@@ -3619,12 +2781,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                         tracks,
                         passBuf,
                         maxNumberOfTuples,
-                        params.preGateMaxChi2,
                         params.preGateMinPt,
                         std::sinh(params.maxAbsEta),
-                        params.extHostMaxChi2Ndof,
-                        params.extHostMinHits,
-                        params.extHostMinPt,
                         candidateMask,  // same restriction as the count pass (null = no restriction)
                         candCapacity,
                         bufs.candList.data(),
@@ -3644,64 +2802,21 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
             rhoMap, phiBinner, otSrcVal, params.verbose, candDumpOn, dumpLayerPtr, dumpHdrPtr, dumpOvfPtr, dumpMemberPtr},
         params.maxExtraHitsPerTrack,
         params.maxWalkLayers,
+        params.extMaxWalkLayers,
         bf,
-        params.chi2Cut,
-        params.endcapChi2Cut,
-        params.typePriorityBiasCm,
-        params.pixHitsTarget,
-        params.maxRPhiResidCm,
-        params.maxSecResidCm,
-        params.endcapMaxSecResidCm,
-        params.alignSigmaPhiCm,
-        params.alignSigmaSecCm,
-        params.extChi2CutScaleTOB456,      // TOB4-6 barrel gate widen
-        params.extChi2CutScaleTID,         // TID endcap gate scale
-        params.extRawOTVetoTOB456,         // raw-OT veto on TOB4-6
-        params.extRawOTVetoTID,            // raw-OT veto on TID
-        params.extDisplacementAwareGate,   // dispgate: displacement-aware TOB1-3 accept tightening
-        params.extDispGateSig2,            // dispgate: (|d0|/sigma_d0)^2 displaced-host threshold
-        params.extForwardPocketGate,       // pocket gate: forward-eta TOB1-3 accept tightening
-        params.extPocketGateArmScoped,     // pocket gate: displaced-arm-only when true
-        std::sinh(params.maxAbsEta),       // pre-gate ceiling = the pocket band's top edge
-        params.extMtvAlignedExtraCap,      // MTV-aligned per-track extra-cluster cap
-        params.extRecallReachRelax,        // pixel reachability envelope slack
-        params.extRecallPixelFirstBudget,  // pixel-first K-seat reserve
-        params.extCovScalePixel,           // pixel propagated-cov scale
-        params.extCovScaleStub,            // stub propagated-cov scale
-        params.extCovScaleRawOT,           // raw-OT propagated-cov scale
-        params.extPixelGateChi2Cut,        // pixel honest-calibration chi2 cut
-        params.extStubBendGate,            // 2S stub-bend nSigma veto
-        params.extCapExemptAnchored,       // anchored cluster-cap exemption
-        params.extCapBudgetFloor,          // cluster-budget floor
-        params.extStateProcessNoise,       // state process noise (P += Q)
-        params.extRecallForcePixelVisit,   // force pixel visit on prefer-pixel
-        params.extCapExemptTOB46Only,      // scope the anchored exemption to TOB4-6
-        params.extCapExemptMaxChi2,        // candidate gate-chi2 cap on the exemption
-        params.extMaxWalkLayers,           // runtime visit budget (loop bound)
-        params.extAttachFarFirst,          // far-first disc ordering (OT-less forward pixel)
-        params.extAttachFarMinAbsEta,      // its |eta| floor
-        params.extAttachFarMaxWin,         // its window-ambiguity condition (<=0 = none)
-        params.extDerivedSelection,        //  master switch
-        float(params.extDerivedEps),       //  the one free number
-        params.extDerivedHole,             //  the hole hypothesis
-        params.extHoleDetectionPrior,      // the hole window-mass repair (numerator eta_L)
-        params.extPred,                    //  per-slot option-D payload
-        params.extQhat,                    //  Q-hat(eps) per cell
-        params.extEtaL,                    //  measured per-layer stub availability
-        params.extRho,                     //  measured per-layer stub density
-        params.extFwdEtaBin,               //  the 5th Q-hat |eta| bin
-        params.extEtaLRaw,                 // raw round conditional availability (null=off)
-        params.extRhoRaw,                  // raw-cluster areal density (null=off)
-        params.extDV,                      //  measured target-side dV
-        params.extFmsBarrel,               //  material-dispersion scale (barrel)
-        params.extFmsEndcap,               //  material-dispersion scale (endcap)
-        params.extBendPackage,             //  the bend row + the hole's basis
-        params.extQhat3,                   //  Q-hat_3 (stub candidates)
-        params.extSigBExcess,              //  measured per-class bend-error excess
-        params.extRho3,                    //  measured 3-dof stub density
+        std::sinh(params.maxAbsEta),
+        params.extGateEps,
+        float(extDerivedTables::chi2Quantile(1, double(params.extGateEps))),
+        float(extDerivedTables::chi2Quantile(2, double(params.extGateEps))),
+        float(extDerivedTables::chi2Quantile(3, double(params.extGateEps))),
+        bMap,
+        params.extPred,
+        params.extEtaL,
+        params.extRho,
+        params.extEtaLRaw,
+        params.extRho3,
         tracks,
         trackHits,
-        armId,  // pocket gate: per-track arm (null when off/arm-blind)
         hits,
         hitModules,
         hitMask,
@@ -3720,7 +2835,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                         workDivSlots,
                         Kernel_extInitClaims{},
                         params.maxExtraHitsPerTrack,
-                        params.extMaxSharedOwners,
                         bufs.nCands.data(),
                         candCapacity,
                         otActive ? nHits : 0u,
@@ -3732,7 +2846,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                         workDivSlots,
                         Kernel_extClaimExtras{},
                         params.maxExtraHitsPerTrack,
-                        params.extMaxSharedOwners,
                         bufs.candList.data(),
                         bufs.nCands.data(),
                         candCapacity,
@@ -3746,8 +2859,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                         workDivCands,
                         Kernel_extResolveExtras{},
                         params.maxExtraHitsPerTrack,
-                        params.extMaxSharedOwners,
-                        params.extAmbigDeltaChi2,  // ambiguity gate (<=0 => off)
                         bufs.candList.data(),
                         bufs.nCands.data(),
                         candCapacity,
@@ -4614,9 +3725,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                           const AttachParams& params,
                           float bfield,
                           const float* rhoMap,
+                          const float* bMap,
                           ::reco::TrackSoAView tracks,
                           ::reco::TrackHitSoAView trackHits,
-                          const uint8_t* armId,  // pocket gate: per-track arm (0=prompt,1=disp); null=off/arm-blind
                           ::reco::TrackingRecHitConstView hits,
                           ::reco::HitModuleSoAConstView hitModules,
                           ::reco::TrackingRecHitsMaskingConstView hitMask,
@@ -4686,10 +3797,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                  params,
                  bfield,
                  rho,
+                 bMap,
                  phiHist.data(),
                  tracks,
                  trackHits,
-                 armId,  // pocket gate: forwarded per-track arm (null when off/arm-blind)
                  hits,
                  hitModules,
                  hitMask,
@@ -4704,7 +3815,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
     // Per-event demand dump of the attach stage, same line form as the CA producer's. nCands now holds
     // the fill pass's candidate count, i.e. the number of merged tracks that cleared the pre-gate, and
     // candCapacity is what the candidate scratch, the refit scaffold and the per-candidate grids were
-    // sized to. Fitting the ceiling (extRefitMaxCandidates) needs exactly this pair. One 4-byte D2H and
+    // sized to. One 4-byte D2H and
     // one host wait, compiled in only under the toggle.
     {
       auto nCandsHost = cms::alpakatools::make_host_buffer<uint32_t>(queue);

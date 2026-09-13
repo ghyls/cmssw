@@ -106,66 +106,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
 
     pixelTrack::Quality const minQuality_;
-    double const matchFraction_;
-
-    // Strict cross-arm twin merge: pair opposite-arm twins by trajectory + shared-hit evidence and
-    // unite their hit lists onto the winner track. Always on.
-    double const twinMergeDeltaEta_;
-    double const twinMergeDeltaPhi_;
-    int const twinMergeMinSharedHits_;
-    // The looser tier-2 merge (always on) also pairs twins that fail the shared-hit requirement but sit
-    // inside the tighter trajectory windows below. Strict tier-1 pairing is unchanged by it.
-    double const twinMergeTier2DeltaEta_;
-    double const twinMergeTier2DeltaPhi_;
-    // Covariance-scaled arm-invariant twin compatibility gate (phi/1pT/cotTheta:
-    // dp^2 > nSigma2*(cov_i+cov_j) rejects the pair); <=0 disables it.
-    double const twinMergeNSigma2_;
-    // A twin winner that absorbs its sibling's hits keeps its pre-union state, so the united winners are
-    // always refit: ndof is recomputed to the united fit-hit count and the merger-side GBL refit
-    // overwrites state, cov, chi2 and ndof.
-    // When true the merger sets AttachParams::verbose, so the per-event [CAExtension] summary prints
-    // (host-quality preGateSkipped and per-layer-class walk-committed extras counters included).
+    // Duplicate removal: extra shared-cluster evidence demanded of a pair beyond the one shared
+    // cluster that pairs it, as a fraction of the SHORTER track's clusters. 0 = any co-occurrence,
+    // which is the default: the 5-sigma covariance test is the criterion. One number for both the
+    // cross-arm twin merge and the final dedup.
+    // When true the merger sets AttachParams::verbose, so the per-event [CAExtension] summary prints.
     // Diagnostic only; never on in production.
     bool const mergerExtendVerbose_;
-    // Host-quality pre-gate: a track is offered to the attach walk only if its fit chi2/ndof is below
-    // this (the companion nHits and pt predicates sit at their off sentinels).
-    double const extHostMaxChi2Ndof_;
-    // The derived-selection package. Its measured input rows are compiled-in constants in
-    // ExtDerivedTables.h, not configuration; this epsilon is the package's only operating point.
-    double const extDerivedEps_;
-    double const extFmsBarrel_;
-    double const extFmsEndcap_;
-    // Attach recall/calibration knobs; see caExtension::AttachParams.
-    double const extRecallReachRelax_;
-    int const extRecallPixelFirstBudget_;
-    double const extPixelGateChi2Cut_;
-    // Runtime walk visit budget K, a loop bound only; buffer sizing stays at the compile-time
-    // maxWalkLayers. The continuation and cap behaviour it works against is fixed in the eParams block.
+    // The two compute caps of the walk: the runtime visit budget K, and the |eta| reach.
     int const extMaxWalkLayers_;
-    // The |eta| floor of the far-first disc ordering. The visit order is otherwise nearest-disc-first,
-    // which on a forward pixel-only host spends the visit and slot budgets on interior holes instead of
-    // the outermost disc crossing, the only content that lengthens the transverse lever arm.
-    double const extAttachFarMinAbsEta_;
-    // Its window-ambiguity condition: the far crossing commits only where the candidate set that cleared
-    // its gate is small enough for the argmin to be a measurement rather than a choice among competitors.
-    int const extAttachFarMaxWin_;
-    int const extMaxSharedOwners_;
-    // Ceiling on the candidate capacity the attach scratch is sized to. The attach is handed the merged
-    // track capacity as its host-known candidate bound; this parameter lets a measured maximum take over
-    // the sizing of the candidate scratch, the refit scaffold arrays and the per-candidate launch grids.
-    unsigned int const extRefitMaxCandidates_;
-    // The attach thresholds the walk gates on:
-    //   extPreGateMaxChi2_  -> AttachParams::preGateMaxChi2, the base pre-gate reduced-chi2 cut.
-    //   extChi2Cut_ / extEndcapChi2Cut_ -> AttachParams::chi2Cut / endcapChi2Cut, the attach-window
-    //     base cuts in the barrel and the endcap.
-    //   extDispGateSig2_    -> AttachParams::extDispGateSig2, the (|d0|/sigma_d0)^2 threshold above
-    //     which a host is treated as displaced.
-    double const extPreGateMaxChi2_;
-    // Attach pre-gate |eta| ceiling (AttachParams::maxAbsEta): tracks beyond it are not offered to the walk.
     double const extMaxAbsEta_;
-    double const extChi2Cut_;
-    double const extEndcapChi2Cut_;
-    double const extDispGateSig2_;
     // per-input-collection arm label: 0 = prompt-side, 1 = displaced-side. Configured explicitly
     // ("inputArms", one entry per entry of "inputTkSoAs"), never inferred from the module labels.
     std::vector<int> armPerInput_;
@@ -214,16 +164,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     mutable std::once_flag extLayersOnce_;
     mutable std::optional<ExtLayersCache> extLayersCache_;
 
-    // The measured tables are job constants: every row is a compile-time constant and the only run-time
-    // input, extDerivedEps_, is fixed at construction, so they are interpolated once per process and
-    // uploaded once per device. Per device rather than per producer, because this is a global::EDProducer
-    // whose produce() may run concurrently on every device the job owns. One flat allocation holds every
+    // The measured tables are job constants: every row is a compile-time detector measurement, so they
+    // are packed once per process and uploaded once per device. Per device rather than per producer,
+    // because this is a global::EDProducer whose produce() may run concurrently on every device the
+    // job owns. One flat allocation holds every
     // row back to back; the walk receives base and offset pointers.
     struct ExtTablesHost {
       std::vector<float> flat;
-      int offQhat = -1, offEtaL = -1, offRho = -1, offDV = -1;  // the derived-selection rows
-      int offEtaLRaw = -1, offRhoRaw = -1;                      // the per-source-round hole rows
-      int offQhat3 = -1, offSigBExc = -1, offRho3 = -1;         // the bend package rows
+      int offEtaL = -1, offRho = -1;  // stub availability and areal density, per OT layer
+      int offEtaLRaw = -1;            // the raw round's conditional availability
+      int offRho3 = -1;               // the stub density in the 3-dof (position + bend) space
     };
     // The per-device device copies. Built inside the once-init, which enumerates the platform's devices
     // exactly like CopyToDeviceCacheImpl and synchronises each copy before publishing the cache.
@@ -269,31 +219,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   PixelTracksSoAMerger::PixelTracksSoAMerger(const edm::ParameterSet& iConfig)
       : EDProducer(iConfig),
         minQuality_(pixelTrack::qualityByName(iConfig.getParameter<std::string>("minQuality"))),
-        matchFraction_(iConfig.getParameter<double>("matchFraction")),
-        twinMergeDeltaEta_(iConfig.getParameter<double>("twinMergeDeltaEta")),
-        twinMergeDeltaPhi_(iConfig.getParameter<double>("twinMergeDeltaPhi")),
-        twinMergeMinSharedHits_(iConfig.getParameter<int>("twinMergeMinSharedHits")),
-        twinMergeTier2DeltaEta_(iConfig.getParameter<double>("twinMergeTier2DeltaEta")),
-        twinMergeTier2DeltaPhi_(iConfig.getParameter<double>("twinMergeTier2DeltaPhi")),
-        twinMergeNSigma2_(iConfig.getParameter<double>("twinMergeNSigma2")),
         mergerExtendVerbose_(iConfig.getParameter<bool>("mergerExtendVerbose")),
-        extHostMaxChi2Ndof_(iConfig.getParameter<double>("extHostMaxChi2Ndof")),
-        extDerivedEps_(iConfig.getParameter<double>("extDerivedEps")),
-        extFmsBarrel_(iConfig.getParameter<double>("extFmsBarrel")),
-        extFmsEndcap_(iConfig.getParameter<double>("extFmsEndcap")),
-        extRecallReachRelax_(iConfig.getParameter<double>("extRecallReachRelax")),
-        extRecallPixelFirstBudget_(iConfig.getParameter<int>("extRecallPixelFirstBudget")),
-        extPixelGateChi2Cut_(iConfig.getParameter<double>("extPixelGateChi2Cut")),
         extMaxWalkLayers_(iConfig.getParameter<int>("extMaxWalkLayers")),
-        extAttachFarMinAbsEta_(iConfig.getParameter<double>("extAttachFarMinAbsEta")),
-        extAttachFarMaxWin_(iConfig.getParameter<int>("extAttachFarMaxWin")),
-        extMaxSharedOwners_(iConfig.getParameter<int>("extMaxSharedOwners")),
-        extRefitMaxCandidates_(iConfig.getParameter<unsigned int>("extRefitMaxCandidates")),
-        extPreGateMaxChi2_(iConfig.getParameter<double>("extPreGateMaxChi2")),
         extMaxAbsEta_(iConfig.getParameter<double>("extMaxAbsEta")),
-        extChi2Cut_(iConfig.getParameter<double>("extChi2Cut")),
-        extEndcapChi2Cut_(iConfig.getParameter<double>("extEndcapChi2Cut")),
-        extDispGateSig2_(iConfig.getParameter<double>("extDispGateSig2")),
         inputTkSoATagV_(iConfig.getParameter<std::vector<edm::InputTag>>("inputTkSoAs")),
         outputTkSoAToken_(produces()) {
     // The arm of each input collection is configured, one entry per input collection: 0 =
@@ -370,149 +298,23 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
             "Arm of each entry of inputTkSoAs: 0 = prompt-side, 1 = displaced-side. Only pairs from "
             "different arms are considered by the cross-arm twin merge. One entry per input collection.");
     desc.add<std::string>("minQuality", "highPurity");
-    desc.add<double>("matchFraction", 0.0);
-    desc.add<double>("twinMergeDeltaEta", 0.03)->setComment("Max |dEta| between twin members.");
-    desc.add<double>("twinMergeDeltaPhi", 0.03)->setComment("Max |dPhi| between twin members.");
-    desc.add<int>("twinMergeMinSharedHits", 1)
-        ->setComment("Minimum number of common hit ids required to qualify a twin pair.");
 
-    desc.add<double>("twinMergeTier2DeltaEta", 0.01)
-        ->setComment(
-            "Max |dEta| for a tier-2 (shared-hit-less) twin pair. Set to the median separation of "
-            "confirmed twins, so it admits the twin population without opening the window to neighbours.");
-    desc.add<double>("twinMergeTier2DeltaPhi", 0.01)
-        ->setComment("Max |dPhi| for a tier-2 (shared-hit-less) twin pair; same sizing as the dEta window.");
-
-    desc.add<double>("twinMergeNSigma2", 8.0)
-        ->setComment(
-            "Covariance-scaled arm-invariant twin compatibility gate: reject a pair when any of phi, "
-            "1/pT, cotTheta has dp^2 > nSigma2*(cov_i+cov_j) (tip/zip excluded: beamline-biased across "
-            "arms for displaced tracks). <=0 disables the gate. It is a threshold ON the fit covariance, "
-            "so it has to be re-derived whenever the fit's covariance convention changes.");
-
-    // The merger-side attach runs one walk over the merged HP-selected collection using the ES FULL
-    // geometry, gathering OT hits across the whole attachable layer set INCLUDING the odd OT disks the
-    // prompt doublet graph excludes. It reuses the CA's caExtension::* attach entrypoints.
     desc.add<bool>("mergerExtendVerbose", false)
         ->setComment(
-            "Diagnostic: print the per-event [CAExtension] attach summary (hosts skipped by the quality "
-            "pre-gate, extras attached per layer class). Default false; enable only for debugging.");
+            "Diagnostic: print the per-event [CAExtension] attach summary (hosts skipped by the "
+            "pre-gate, extras attached per layer class, gate alarms). Default false; enable only for "
+            "debugging.");
 
-    // Host-quality pre-gate: skip the OT attach walk on hosts the HP selector will reject anyway; they
-    // are the stray-hit fake source and the bulk of the attach compute. Of the three sentinel-gated
-    // predicates only the chi2/ndof one is active (nHits/pt sit at their off sentinels).
-    desc.add<double>("extHostMaxChi2Ndof", 1.69)
-        ->setComment(
-            "mergerExtend host-quality pre-gate: skip attach on hosts with reduced chi2/ndof >= this "
-            "(<=0 disables). tracks.chi2() is already the per-ndof GBL chi2, so this is compared to a "
-            "chi2/ndof threshold directly. A threshold ON the fit covariance convention.");
-    // The derived-selection package. One free number here; its measured input rows are compiled-in
-    // constants in ExtDerivedTables.h, being detector measurements rather than choices.
-    desc.add<double>("extDerivedEps", 0.55)
-        ->setComment(
-            "mergerExtend: THE single efficiency epsilon of the derived selection, spent once for the window, "
-            "the gate, the rank and the hole prior. It is the probability mass of the correct-hit pull "
-            "distribution the window is required to contain, so raising it widens window, gate and rank "
-            "quantile together -- more attach yield at more fake exposure. It is the package's only "
-            "continuous knob.");
-    desc.add<double>("extFmsBarrel", 1.953)
-        ->setComment(
-            "mergerExtend: MEASURED material-dispersion scale of the MS variance in the BARREL -- the "
-            "factor by which the material lattice plus the Highland formula under-state the real "
-            "trajectory dispersion, measured on scattering-dominated triples.");
-    desc.add<double>("extFmsEndcap", 1.506)
-        ->setComment("mergerExtend: the same measured material-dispersion scale in the ENDCAP.");
-    // Attach recall/calibration knobs.
-    desc.add<double>("extRecallReachRelax", 2.5)
-        ->setComment(
-            "mergerExtend pixel/inward recall: extra reachability-envelope slack (cm) on PIXEL "
-            "layers (CA L<28) for prefer-pixel (nPix<pixHitsTarget) hosts only, admitting in-road pixel layers "
-            "that the strict 1.0 cm envelope rejects -- most of the missing displaced pixel content is "
-            "already in-road and lost only to that envelope. 0 => identity.");
-    desc.add<int>("extRecallPixelFirstBudget", 3)
-        ->setComment(
-            "mergerExtend pixel/inward recall: reserve up to N of the K=maxWalkLayers visit seats "
-            "for pixel-first on prefer-pixel hosts by suppressing OT-disk forcing while a pixel layer is the "
-            "nearest unvisited-reachable (recovers the reachable-but-skipped pixel layers). 0 reserves "
-            "nothing. Sensible values are around pixHitsTarget (3).");
-    desc.add<double>("extPixelGateChi2Cut", 3.0)
-        ->setComment(
-            "mergerExtend chi2-gate calibration on PIXEL layers (CA L<28), REPLACING the base cut there. "
-            "A 2-dof gate at chi2 = 2.0 retains only 1 - exp(-1) = 63.2 % of correct hits by construction; "
-            "95 % retention is -2 ln(0.05) = 5.99. OT layers keep chi2Cut/endcapChi2Cut. "
-            "<=0 (sentinel) => identity.");
-    // The attach thresholds. All of them are thresholds ON the fit's chi2, so they track the fit's
-    // covariance convention and must be re-derived if it changes.
-    desc.add<double>("extPreGateMaxChi2", 7.5)
-        ->setComment(
-            "mergerExtend attach pre-gate: a track is offered to the attach walk only if its fit "
-            "chi2/ndof (tracks.chi2(), already per-ndof) is below this. Lowering it restricts the "
-            "extension to better-measured tracks -- fewer wrong hits attached, fewer hits recovered. "
-            "It is a threshold on the fit's chi2 and follows the fit's covariance convention.");
-    desc.add<double>("extMaxAbsEta", 4.5)
-        ->setComment(
-            "mergerExtend attach pre-gate |eta| ceiling: a track whose fitted |cotTheta| exceeds sinh of "
-            "this is not extended at all. It bounds both pre-gate passes and the host mask, and it is the "
-            "top edge of the forward-eta TOB1-3 pocket band. Raising it buys forward hit content: beyond "
-            "the outer-tracker edge the reachable targets are the pixel discs, which attach cleanly, while "
-            "outer-tracker attach purity falls off above |eta| ~ 2.5 where the trajectory crosses the last "
-            "disc near-tangentially and the true-hit residual spread grows to several cm. Above 2.5 the "
-            "ceiling decouples from the duplicate-removal fallback's drop authority, which stays bounded "
-            "at |eta| 2.5.");
-    desc.add<double>("extChi2Cut", 1.0)
-        ->setComment(
-            "mergerExtend attach-window BARREL base chi2 cut (per-hit winner chi2 on OT and pixel barrel "
-            "layers, before the per-class scales; pixel layers are overridden by extPixelGateChi2Cut when "
-            "that is >0). Raising it widens the accept window everywhere in the barrel. It is a threshold "
-            "on the fit's chi2 and its natural scale changes with the fit's covariance convention.");
-    desc.add<double>("extEndcapChi2Cut", 1.0)
-        ->setComment("mergerExtend attach-window ENDCAP base chi2 cut: the endcap counterpart of extChi2Cut.");
-    desc.add<double>("extDispGateSig2", 200.0)
-        ->setComment(
-            "mergerExtend displacement-aware gate: the (|d0|/sigma_d0)^2 threshold above which a track "
-            "counts as displaced and tightens its TOB1-3 accept window. The gate it belongs to is always "
-            "on in this producer (it is not a cfi parameter). The value is a squared significance, so 200 means about "
-            "14 "
-            "sigma of displacement; lowering it applies the tighter window to more tracks.");
     desc.add<int>("extMaxWalkLayers", 6)
         ->setComment(
-            "mergerExtend: runtime walk visit budget K, i.e. how many nearest reachable layers one track "
-            "may visit. Buffer sizing and strides stay at the compile-time maxWalkLayers; only the walk "
-            "loop bounds read this value, and it is clamped in-kernel to [1, kChainMaxVisits=8]. Each "
-            "extra layer costs walk time in proportion and buys at most one more attached hit.");
-    desc.add<double>("extAttachFarMinAbsEta", 2.8)
+            "Compute cap: how many reachable uncovered layers one track may visit. Clamped in-kernel "
+            "to [1, 8]. Each extra visit costs walk time in proportion and buys at most one more "
+            "attached hit; it selects no physics.");
+    desc.add<double>("extMaxAbsEta", 4.5)
         ->setComment(
-            "mergerExtend far-first disc ordering: the |eta| floor at which it takes effect. Below it the "
-            "walk keeps its nearest-disc-first order. The floor is placed where the far content first "
-            "becomes geometrically reachable: the fraction of recoverable forward pixel layers that pass "
-            "the walk's own envelope and arc test is 0.002 / 0.446 / 0.798 / 0.986 at |eta| 2.4-2.6 / "
-            "2.6-2.8 / 2.8-3.0 / 3.0-3.5.");
-    desc.add<int>("extAttachFarMaxWin", 1)
-        ->setComment(
-            "mergerExtend far-first disc ordering: its window-ambiguity condition. On a far crossing (an "
-            "endcap pixel disc beyond the track's own outermost |z|) the argmin winner is committed only "
-            "if at most this many candidates cleared that crossing's gate; above it the walk declines the "
-            "crossing, keeps the slot and carries on into the nearer discs. Candidate multiplicity is the "
-            "quantity that best predicts whether the argmin is a measurement or a choice among "
-            "competitors, so 1 is the pure end of the trade and larger values buy more far crossings at "
-            "steadily lower purity. The far-first ordering it belongs to is always on in this producer (it "
-            "is not a cfi parameter).");
-    desc.add<int>("extMaxSharedOwners", 2)
-        ->setComment(
-            "mergerExtend: how many tracks may claim the same attached extra hit (top-N claim slots). "
-            "1 makes attachment exclusive; larger values let genuine shared hits reach both tracks at the "
-            "cost of correlating their fits.");
-    desc.add<unsigned int>("extRefitMaxCandidates", 131072)
-        ->setComment(
-            "mergerExtend: ceiling on the candidate capacity the attach scratch is sized to. The attach "
-            "is handed the merged track capacity as its host-known candidate bound (no candidate-count "
-            "readback), and that bound sizes the candidate list and extras arrays, the stage-B refit "
-            "scaffold arrays and every per-candidate launch grid. Only the tracks that clear the attach "
-            "pre-gate are candidates, so the structural bound is several times the counts actually seen. "
-            "The effective bound is min(track capacity, this), and the value should come from a measured "
-            "per-event maximum of the candidate count with headroom -- below that maximum, candidates "
-            "past the ceiling are dropped by the fill pass. The default is the compiled-in search-volume "
-            "cap, i.e. above the track capacity, so it leaves the bound at the track capacity.");
+            "Geometric reach of the walk: a track whose fitted |cotTheta| exceeds sinh of this is not "
+            "extended. The same bound is the duplicate removal's drop authority, so the two cannot "
+            "disagree about where the extension operates.");
 
     // Refit / attach inputs (mirroring the displaced CA producer). The CA-ordered module geometry is an
     // EventSetup product.
@@ -528,60 +330,24 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
   // The once-per-job build of the measured tables. The rows are compile-time constants; this function
   // does the one piece of arithmetic that depends on a run-time input, the interpolation of the two
-  // quantile maps at extDerivedEps_, and packs every row into one flat float payload whose offsets the
+  // quantile maps at the walk's acceptance, and packs every row into one flat float payload whose offsets the
   // returned struct records, so a single device allocation carries all of them.
   PixelTracksSoAMerger::ExtTablesHost PixelTracksSoAMerger::buildExtTables() const {
-    // The compiled-in rows and the walk must agree on the cell geometry they are keyed on.
-    static_assert(extDerivedTables::kQCells == caExtension::kExtQCells, "Q-hat cell count mismatch");
+    // The compiled-in rows and the walk must agree on the row geometry they are keyed on.
     static_assert(extDerivedTables::kOTLayers == caExtension::kExtOTLayers, "OT layer count mismatch");
-    static_assert(extDerivedTables::kMatClasses == caExtension::kExtMatClasses, "module class count mismatch");
-    static_assert(extDerivedTables::kSigBClasses == caExtension::kExtSigBClasses, "bend class count mismatch");
-
-    if (!(extDerivedEps_ > 0. && extDerivedEps_ < 1.))
-      throw cms::Exception("Configuration")
-          << "extDerivedEps = " << extDerivedEps_
-          << " is not a probability: it is the mass of the correct-hit pull distribution the attach window "
-             "must contain, so it has to lie strictly inside (0,1).";
 
     ExtTablesHost t;
-    constexpr int nEps = extDerivedTables::kNEps;
-    auto const& eps = extDerivedTables::kEps;
-    // Interpolate the maps at eps once, on the host: linear in eps between grid nodes, clamped to the
-    // grid ends, since a measured quantile is never extrapolated.
-    const double epsUse = std::min(std::max(extDerivedEps_, eps.front()), eps.back());
-    int epsLo = 0;
-    while (epsLo + 2 < nEps && eps[epsLo + 1] < epsUse)
-      ++epsLo;
-    const double epsT = (eps[epsLo + 1] > eps[epsLo]) ? (epsUse - eps[epsLo]) / (eps[epsLo + 1] - eps[epsLo]) : 0.;
-    auto interpolateMap = [&](auto const& map) {
-      std::vector<float> out(caExtension::kExtQCells);
-      for (int c = 0; c < caExtension::kExtQCells; ++c) {
-        const double a0 = map[std::size_t(c) * nEps + epsLo];
-        const double a1 = map[std::size_t(c) * nEps + epsLo + 1];
-        out[c] = float(a0 + epsT * (a1 - a0));
-      }
-      return out;
-    };
-    const std::vector<float> qthrHost = interpolateMap(extDerivedTables::kQhat);    // 2-dof
-    const std::vector<float> qthr3Host = interpolateMap(extDerivedTables::kQhat3);  // 3-dof (stub candidates)
-    // The remaining rows are eps-independent: they go to the device as they were measured.
+    // Every surviving row is a measured detector property, eps-independent: it goes to the device as
+    // measured. The gate's own thresholds are the analytic chi2 quantiles of the acceptance, three floats
+    // computed at the launch site.
     auto narrow = [](auto const& row) { return std::vector<float>(row.begin(), row.end()); };
-
-    // Pack: one flat payload, each row recording where it starts.
     auto push = [&t](std::vector<float> const& v, int& off) {
       off = int(t.flat.size());
       t.flat.insert(t.flat.end(), v.begin(), v.end());
     };
-    push(qthrHost, t.offQhat);
     push(narrow(extDerivedTables::kEtaL), t.offEtaL);
     push(narrow(extDerivedTables::kRho), t.offRho);
-    push(narrow(extDerivedTables::kDV), t.offDV);
-    // the per-source-round hole rows, read by the raw-round hole pricing
     push(narrow(extDerivedTables::kEtaLRaw), t.offEtaLRaw);
-    push(narrow(extDerivedTables::kRhoRaw), t.offRhoRaw);
-    // the stub-bend rows
-    push(qthr3Host, t.offQhat3);
-    push(narrow(extDerivedTables::kSigBExcess), t.offSigBExc);
     push(narrow(extDerivedTables::kRho3), t.offRho3);
     return t;
   }
@@ -703,57 +469,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     eParams.enable = true;
     eParams.verbose = mergerExtendVerbose_;
     eParams.useOTRecHits = true;
-    eParams.extHostMaxChi2Ndof = float(extHostMaxChi2Ndof_);
-    eParams.extHostMinHits = 0;          // off sentinel
-    eParams.extHostMinPt = -1.f;         // off sentinel
-    eParams.extChi2CutScaleTID = 1.f;    // identity on the TID disks
-    eParams.extRawOTVetoTOB456 = false;  // the raw single-cluster round is open (see the note below)
-    eParams.extRawOTVetoTID = false;     // idem
-    eParams.extDisplacementAwareGate = true;
-    eParams.extForwardPocketGate = false;   // off (see the arm plumbing below)
-    eParams.extPocketGateArmScoped = true;  // inert with the gate off
-    eParams.extMtvAlignedExtraCap = true;
-    // Attach recall/calibration knobs.
-    eParams.extRecallReachRelax = float(extRecallReachRelax_);
-    eParams.extRecallPixelFirstBudget = extRecallPixelFirstBudget_;
-    eParams.extCovScalePixel = 1.f;  // identity
-    // extChi2CutScaleTOB456, extCovScaleStub and extStubBendGate are not configurable and stay at
-    // their AttachParams no-op defaults: the derived selection replaces the quantities they scale
-    // with the measured quantile, and the bend chi2 row (extBendPackage) supersedes the standalone veto.
-    eParams.extCovScaleRawOT = 1.f;  // identity
-    eParams.extPixelGateChi2Cut = float(extPixelGateChi2Cut_);
-    // The attach thresholds that track the fit's chi2/covariance convention, from the cfi.
-    eParams.preGateMaxChi2 = float(extPreGateMaxChi2_);  // attach pre-gate base reduced-chi2 cut
-    eParams.maxAbsEta = float(extMaxAbsEta_);            // attach pre-gate |eta| ceiling
-    eParams.chi2Cut = float(extChi2Cut_);                // attach-window barrel base cut
-    eParams.endcapChi2Cut = float(extEndcapChi2Cut_);    // attach-window endcap base cut
-    eParams.extDispGateSig2 = float(extDispGateSig2_);   // dispgate (|d0|/sigma_d0)^2 threshold
-    // Continuation/cap knobs.
-    eParams.extCapExemptAnchored = true;
-    eParams.extCapBudgetFloor = 0;       // no floor
-    eParams.extStateProcessNoise = 1.f;  // the physical Q, not a scale
-    eParams.extRecallForcePixelVisit = true;
-    // Their refinements, all at identity/off.
-    eParams.extCapExemptTOB46Only = false;  // the exemption applies on every layer class, not only TOB4-6
-    eParams.extCapExemptMaxChi2 = 0.f;      // off sentinel: the exemption carries no chi2 ceiling
+    eParams.maxAbsEta = float(extMaxAbsEta_);
     eParams.extMaxWalkLayers = extMaxWalkLayers_;
-    eParams.extAttachFarFirst = true;
-    eParams.extAttachFarMinAbsEta = float(extAttachFarMinAbsEta_);
-    eParams.extAttachFarMaxWin = extAttachFarMaxWin_;
-    eParams.extMaxSharedOwners = extMaxSharedOwners_;
-    // Ceiling on the attach scratch sizing: the attach takes the merged track capacity as its candidate
-    // bound, and this caps that bound (see the cfi comment). At or above the track capacity it is inert.
-    eParams.extRefitMaxCandidates = uint32_t(extRefitMaxCandidates_);
-    eParams.extAmbigDeltaChi2 = -1.f;  // off sentinel
     // ---- the measured tables come from the once-per-job, per-device cache ----------
     // The eps interpolation and the device upload are job constants (see buildExtTables()); the
     // pointers are taken below, inside the attach branch that uses them.
     std::call_once(extTablesOnce_, [&]() { extTablesCache_.emplace(buildExtTables()); });
     ExtTablesHost const& extTables = extTablesCache_->host();
-    // The raw single-cluster attach round on TOB4-6 and TID/TEDD is open unconditionally, which is sound
-    // only because the hole hypothesis is priced with that round's own conditional availability and
-    // cluster density. The four pricing components (derived selection, bend rows, derived hole,
-    // per-source-round prior) are therefore enabled together, so configuration cannot break the pairing.
+    // The raw single-cluster attach round is open on every layer, which is sound only because the hole
+    // hypothesis prices it with that round's own conditional availability and the event's own cluster
+    // density.
     // Merged hit-storage capacity: headroom for the worst-case attached extras (each candidate gains
     // <= maxExtraHitsPerTrack) so the in-place rewrite never overflows and the event never falls back
     // whole. Without the attach, mergedHitCap == totHits.
@@ -774,33 +499,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       unitedMaskPtr = unitedMask->data();
     }
 
-    // Forward-eta pocket gate arm plumbing. The gate is not enabled, so the per-track arm-label buffers
-    // it would need are never built and both pointers stay null: filterTracks performs no arm scatter and
-    // the walk reads no arm label.
-    const uint8_t* pocketArmInPtr = nullptr;
-    uint8_t* pocketArmIdOutPtr = nullptr;
-
     auto mergedTracks = deviceAlgo_.makeFilteredTracks(totTracks,
                                                        mergedHitCap,
                                                        *outputTemp,
                                                        minQuality_,
-                                                       matchFraction_,
                                                        queue,
                                                        /*twinMerge=*/true,
                                                        armPtr,
-                                                       float(twinMergeDeltaEta_),
-                                                       float(twinMergeDeltaPhi_),
-                                                       twinMergeMinSharedHits_,
-                                                       /*twinMergeTier2=*/true,
-                                                       float(twinMergeTier2DeltaEta_),
-                                                       float(twinMergeTier2DeltaPhi_),
-                                                       float(twinMergeNSigma2_),
-                                                       /*twinMergeMinSharedFwd=*/1,
                                                        /*twinMergeRefit=*/true,
                                                        /*refitAllTracks=*/true,
-                                                       unitedMaskPtr,
-                                                       pocketArmInPtr,
-                                                       pocketArmIdOutPtr);
+                                                       unitedMaskPtr);
 
     // makeFilteredTracks has enqueued every kernel that reads outputTemp, and mergedTracks is a fresh
     // collection rather than a view onto it, so it is released here. The caching allocator's free is
@@ -904,40 +612,22 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         // The measured tables are already on this device: one flat, job-constant payload uploaded once
         // per device by the cache above, each row a base plus an offset into it.
         const float* extTablesBase = extTablesCache_->base(alpaka::getDev(queue));
-        eParams.extDerivedSelection = true;
-        eParams.extDerivedEps = extDerivedEps_;
-        eParams.extDerivedHole = true;
-        eParams.extHoleDetectionPrior = true;
         eParams.extPred = predBuf->data();
-        eParams.extQhat = extTablesBase + extTables.offQhat;
+        // The hole hypothesis's measured rows. The raw round is priced with its own conditional
+        // availability; its cluster density is the event's own OT occupancy, computed in-kernel.
         eParams.extEtaL = extTablesBase + extTables.offEtaL;
         eParams.extRho = extTablesBase + extTables.offRho;
-        // The per-source-round hole rows: the raw round is priced with its own conditional availability
-        // and cluster density rather than with the stub rows.
-        eParams.extHoleRawRoundPrior = true;
         eParams.extEtaLRaw = extTablesBase + extTables.offEtaLRaw;
-        eParams.extRhoRaw = extTablesBase + extTables.offRhoRaw;
-        eParams.extDV = extTablesBase + extTables.offDV;
-        eParams.extFmsBarrel = float(extFmsBarrel_);
-        eParams.extFmsEndcap = float(extFmsEndcap_);
-        // The 5th Q-hat |eta| bin, enabled when a road can legitimately be forward. The pre-gate alone
-        // does not decide it: the cell is keyed on the walk state's |cot|, taken after the Kalman updates,
-        // which drifts past sinh(2.4) on ordinary sub-2.4 hosts. Off, the ladder saturates at the 2.0 row.
-        eParams.extFwdEtaBin = (extMaxAbsEta_ > 2.4);
-        // the stub-bend package: the third (bend) row of the selection chi2 and its own 3-dof map
         eParams.extRho3 = extTablesBase + extTables.offRho3;
-        eParams.extBendPackage = true;
-        eParams.extQhat3 = extTablesBase + extTables.offQhat3;
-        eParams.extSigBExcess = extTablesBase + extTables.offSigBExc;
       }
 
       caExtension::launchMergerAttach(queue,
                                       eParams,
                                       bfield,
                                       rhoMapDevice,
+                                      bMapDevice,
                                       mergedTracks.view().tracks(),
                                       mergedTracks.view().trackHits(),
-                                      pocketArmIdOutPtr,  // pocket gate: per-track arm (null when off/arm-blind)
                                       pixelRecHits.view().trackingHits(),
                                       pixelRecHits.view().hitModules(),
                                       maskView,
@@ -1000,56 +690,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // (the pixel+stub index space) + nDedupOTHits (bit30-tagged extras compress to nDedupPixHits+otIdx).
     const uint32_t nDedupPixHits = uint32_t(iEvent.get(tokenPixelRecHits_).view().trackingHits().metadata().size());
     const uint32_t nDedupOTHits = iEvent.get(tokenOTHits_).nHits();
-    // The merge-or-keep-both confirm needs the merger's GBL-refit inputs (the same set
-    // refitUnitedTracks takes). They are built here and passed to finalDedup; the confirm itself is
-    // not enabled, so the fallback pair simply drops its loser.
-    auto const& dedupGeometry = es.getData(tokenCAGeom_);
-    auto const& dedupPixelRecHits = iEvent.get(tokenPixelRecHits_);
-    auto const& dedupOtHits = iEvent.get(tokenOTHits_);
-    auto const& dedupStackedGeom = es.getData(tokenStackedGeomDev_);
-    const float* dedupRhoMap = es.getData(tokenBLMaterialMap_).data();
-    const float dedupBfield = float(1. / es.getData(tokenField_).inverseBzAtOriginInGeV());
-    // (Bz,Br) field map for the dedup-confirm union GBL refit.
-    const float* dedupBMap = es.getData(tokenBLBFieldMap_).data();
-    caExtension::OTHitsSource confirmOtSrc{};
-    const caExtension::OTHitsSource* confirmOtSrcPtr = nullptr;
-    if (dedupOtHits.nHits() > 0) {
-      confirmOtSrc.otHits = dedupOtHits.const_view().otRecHits();
-      confirmOtSrc.otHitModules = dedupOtHits.const_view().otHitModules();
-      confirmOtSrc.stackedGeometry = dedupStackedGeom.const_view();
-      confirmOtSrc.nOTHits = dedupOtHits.nHits();
-      confirmOtSrcPtr = &confirmOtSrc;
-    }
-    MergerDedupConfirmInputs confirm{dedupPixelRecHits.view().trackingHits(),
-                                     dedupGeometry.view().modules(),
-                                     confirmOtSrcPtr,
-                                     dedupRhoMap,
-                                     dedupBMap,
-                                     dedupBfield,
-                                     // The union-refit merge-or-keep-both confirm is off, so its
-                                     // union-hit-loss budget is never consulted.
-                                     /*fbMergeConfirm=*/false,
-                                     /*fbMergeConfirmDelta=*/1,
-                                     // Dedup ranking/guard set: finder mode (count without dropping) and
-                                     // the cross-arm corner guard are off; the length key that decides
-                                     // which of two duplicates survives is the plain hit count, which
-                                     // separates better than (nLayers, nHits) or a cluster-weighted count.
-                                     /*fbFinderOnly=*/false,
-                                     /*rankClusters=*/false,
-                                     /*rankNHits=*/true,
-                                     /*guardCrossArm=*/false,
-                                     /*guardVertPosMin=*/1.f,
-                                     /*guardChi2Margin=*/0.f,
-                                     // Fallback tuning: the gate width follows the shared-hit gate (<=0
-                                     // sentinel), the drop authority is bounded at |eta| 2.5 and the
-                                     // confirm-only box cuts are off.
-                                     /*fbNSigma2=*/-1.f,
-                                     /*fbDropBound=*/2.5f,
-                                     /*fbEnable=*/true,
-                                     /*fbSameCharge=*/false,
-                                     /*fbAbsFloorDPhi=*/1.e30f,
-                                     /*fbAbsFloorDQoP=*/1.e30f,
-                                     /*fbAbsFloorDCot=*/1.e30f};
+    // The duplicate criterion carries no configured number: the shared-cluster fraction is the
+    // validation's own matching definition and the compatibility test's threshold is the 5-sigma
+    // rejection. What the merger passes is the walk's |eta| reach as the drop authority, so the
+    // extension and the duplicate removal cannot disagree about where they operate.
+    MergerDedupConfirmInputs confirm{iEvent.get(tokenPixelRecHits_).view().trackingHits(),
+                                     iEvent.get(tokenOTStubs_).const_view().stubs(),
+                                     iEvent.get(tokenOTHits_).const_view().otRecHits(),
+                                     float(extMaxAbsEta_)};
     auto dedupTracks = deviceAlgo_.finalDedupTracks(mergedTracks, nDedupPixHits, nDedupOTHits, queue, &confirm);
     iEvent.emplace(outputTkSoAToken_, std::move(dedupTracks));
   }

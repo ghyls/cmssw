@@ -183,25 +183,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                    int const& nHits,
                                    TkSoADevice const& inpTracks,
                                    pixelTrack::Quality const& minQuality,
-                                   double const& matchFraction,
                                    Queue& queue,
                                    bool twinMerge = false,
                                    const int32_t* armOfTrack = nullptr,
-                                   float twinMergeDeltaEta = 0.03f,
-                                   float twinMergeDeltaPhi = 0.03f,
-                                   int twinMergeMinSharedHits = 1,
-                                   bool twinMergeTier2 = false,
-                                   float twinMergeTier2DeltaEta = 0.01f,
-                                   float twinMergeTier2DeltaPhi = 0.01f,
-                                   float twinMergeNSigma2 = -1.f,
-                                   int twinMergeMinSharedFwd = 1,
                                    bool twinMergeRefit = false,
                                    bool refitAllTracks = false,
-                                   int32_t* unitedWinnerMask = nullptr,
-                                   // Per-track arm, input order in and merged-SoA order out; both null
-                                   // when no arm is tracked.
-                                   const uint8_t* pocketArmIn = nullptr,
-                                   uint8_t* pocketArmIdOut = nullptr) const;
+                                   int32_t* unitedWinnerMask = nullptr) const;
 
     // Merger-side GBL refit of the twin-united winners: re-fits each winner's post-union hit list
     // (pixel plus absorbed OT extras) and overwrites its state, covariance, chi2 and ndof in place.

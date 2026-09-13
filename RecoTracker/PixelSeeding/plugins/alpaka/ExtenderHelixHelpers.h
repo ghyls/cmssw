@@ -57,6 +57,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     float phi;        // azimuth of the intersection (rad in [-pi, pi])
     float secondary;  // z for barrel prediction, r for endcap prediction
     float arcS;       // signed forward arc length from origin direction
+    float branch;     // barrel: +1/-1, which of the two cylinder roots was taken (endcap: 0)
     bool valid;
   };
 
@@ -73,7 +74,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
   template <typename TAcc>
   ALPAKA_FN_ACC ALPAKA_FN_INLINE Prediction predictOnBarrel(TAcc const& acc, HelixState const& h, float R) {
-    Prediction out{0.f, 0.f, 0.f, false};
+    Prediction out{0.f, 0.f, 0.f, 0.f, false};
     const float dc2 = h.xc * h.xc + h.yc * h.yc;
     const float absRho = alpaka::math::abs(acc, h.rho);
     const float dc = alpaka::math::sqrt(acc, dc2);
@@ -97,23 +98,27 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     };
     const float sA = arcAt(thetaA);
     const float sB = arcAt(thetaB);
-    float chosenS, chosenTheta;
+    float chosenS, chosenTheta, chosenBranch;
     const bool aOk = sA > 0.f;
     const bool bOk = sB > 0.f;
     if (aOk && bOk) {
       if (sA <= sB) {
         chosenS = sA;
         chosenTheta = thetaA;
+        chosenBranch = 1.f;
       } else {
         chosenS = sB;
         chosenTheta = thetaB;
+        chosenBranch = -1.f;
       }
     } else if (aOk) {
       chosenS = sA;
       chosenTheta = thetaA;
+      chosenBranch = 1.f;
     } else if (bOk) {
       chosenS = sB;
       chosenTheta = thetaB;
+      chosenBranch = -1.f;
     } else {
       return out;
     }
@@ -122,13 +127,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     out.phi = foldPi(chosenTheta);
     out.secondary = h.zip + chosenS * h.cotTheta;
     out.arcS = chosenS;
+    out.branch = chosenBranch;
     out.valid = true;
     return out;
   }
 
   template <typename TAcc>
   ALPAKA_FN_ACC ALPAKA_FN_INLINE Prediction predictOnEndcap(TAcc const& acc, HelixState const& h, float zLayer) {
-    Prediction out{0.f, 0.f, 0.f, false};
+    Prediction out{0.f, 0.f, 0.f, 0.f, false};
     if (alpaka::math::abs(acc, h.cotTheta) < 1e-4f)
       return out;
     const float arcS = (zLayer - h.zip) / h.cotTheta;
@@ -318,6 +324,20 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       r.d[k] = a.d[k] - b.d[k];
     return r;
   }
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE VecDual operator+(VecDual a, float b) {
+    VecDual r;
+    r.v = a.v + b;
+    for (int k = 0; k < 5; ++k)
+      r.d[k] = a.d[k];
+    return r;
+  }
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE VecDual operator+(float a, VecDual b) {
+    VecDual r;
+    r.v = a + b.v;
+    for (int k = 0; k < 5; ++k)
+      r.d[k] = b.d[k];
+    return r;
+  }
   ALPAKA_FN_ACC ALPAKA_FN_INLINE VecDual operator-(VecDual a, float b) {
     VecDual r;
     r.v = a.v - b;
@@ -436,11 +456,42 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     return r;
   }
 
-  // Exact dr/d{phi0,tip,invPt,cotTheta,zip} at fixed z=zh in one pass: the closed-form endcap
-  // r(params) in VecDual arithmetic with identity-seeded inputs, writing the five partials to Jr[5].
+  // d(acos u) = -u.d / sqrt(1 - u.v^2); the caller guards |u.v| away from 1 (a grazing crossing).
   template <typename TAcc>
-  ALPAKA_FN_ACC ALPAKA_FN_INLINE void rWithGrad5(
-      TAcc const& acc, float phi0, float tip, float invPt, float cotTheta, float zip, float zh, float bf, float Jr[5]) {
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE VecDual dacos(TAcc const& acc, VecDual u) {
+    const float w = alpaka::math::sqrt(acc, alpaka::math::max(acc, 1.f - u.v * u.v, 1e-12f));
+    VecDual r;
+    r.v = alpaka::math::acos(acc, u.v);
+    for (int k = 0; k < 5; ++k)
+      r.d[k] = -u.d[k] / w;
+    return r;
+  }
+
+  // 2pi folding of the value only: the branch shift is a constant, so the partials are untouched.
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE VecDual dfoldPi(VecDual u) {
+    u.v = foldPi(u.v);
+    return u;
+  }
+
+  // The five measurement rows of one layer crossing, from the closed-form crossing code in VecDual arithmetic
+  // (no hand-derived Jacobian or sign), written for the surface the walk predicts on (barrel: fixed R;
+  // endcap: fixed z) at the current state and used for the whole visit:
+  //   Hphi[5] = d(r * phi)/d{phi0, tip, invPt, cot, zip}   [cm per unit parameter]
+  //   Hsec[5] = d(sec)/d{...}, sec = z in the barrel and r in the endcap
+  // `branch` is predictOnBarrel's root sign (ignored in the endcap). Returns false when degenerate.
+  template <typename TAcc>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE bool crossWithGrad5(TAcc const& acc,
+                                                     float phi0,
+                                                     float tip,
+                                                     float invPt,
+                                                     float cotTheta,
+                                                     float zip,
+                                                     bool isBarrel,
+                                                     float surf,  // R (barrel) or z (endcap)
+                                                     float bf,
+                                                     float branch,
+                                                     float Hphi[5],
+                                                     float Hsec[5]) {
     const VecDual dPhi0{phi0, {1.f, 0.f, 0.f, 0.f, 0.f}};
     const VecDual dTip{tip, {0.f, 1.f, 0.f, 0.f, 0.f}};
     const VecDual dInvPt{invPt, {0.f, 0.f, 1.f, 0.f, 0.f}};
@@ -448,40 +499,76 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     const VecDual dZip{zip, {0.f, 0.f, 0.f, 0.f, 1.f}};
 
     // makeHelixStateFromParams: rho = 1/(invPt*bf); xc=(tip+rho)*sin(phi0); yc=-(tip+rho)*cos(phi0).
+    if (!(alpaka::math::abs(acc, invPt) > 1e-9f))
+      return false;
     const VecDual rho = 1.f / (dInvPt * bf);
     const VecDual sp = dsin(acc, dPhi0);
     const VecDual cp = dcos(acc, dPhi0);
-    const VecDual tr = dTip + rho;  // tip + rho
+    const VecDual tr = dTip + rho;
     const VecDual xc = tr * sp;
     const VecDual yc = -tr * cp;
     const VecDual alphaOrigin = datan2(acc, -yc, -xc);
-
-    // predictOnEndcap: arcS=(zh-zip)/cot; alphaH=alphaOrigin-arcS/rho; x=xc+|rho|cos; y=yc+|rho|sin; r=sqrt.
-    const VecDual arcS = (zh - dZip) / dCot;
-    const VecDual alphaH = alphaOrigin - arcS / rho;
     const VecDual absRho = dabs(acc, rho);
-    const VecDual x = xc + absRho * dcos(acc, alphaH);
-    const VecDual y = yc + absRho * dsin(acc, alphaH);
-    const VecDual r = dsqrt(acc, x * x + y * y);
-    for (int k = 0; k < 5; ++k)
-      Jr[k] = r.d[k];
+
+    VecDual phi, sec;
+    if (isBarrel) {
+      // predictOnBarrel: c = (R^2 + |C|^2 - rho^2)/(2 |C| R); theta = atan2(yc,xc) + branch*acos(c).
+      const VecDual dc2 = xc * xc + yc * yc;
+      const VecDual dc = dsqrt(acc, dc2);
+      if (!(dc.v > 1e-6f) || !(surf > 1e-6f))
+        return false;
+      const VecDual cc = (surf * surf + dc2 - rho * rho) / (2.f * dc * surf);
+      if (!(alpaka::math::abs(acc, cc.v) < 1.f - 1e-5f))
+        return false;  // grazing: the acos derivative blows up, and the crossing is not trusted anyway
+      const VecDual theta = datan2(acc, yc, xc) + branch * dacos(acc, cc);
+      const VecDual x = surf * dcos(acc, theta);
+      const VecDual y = surf * dsin(acc, theta);
+      const VecDual alphaH = datan2(acc, y - yc, x - xc);
+      const VecDual arcS = rho * dfoldPi(alphaOrigin - alphaH);
+      phi = theta;
+      sec = dZip + arcS * dCot;  // z at fixed R, circle terms included through arcS
+    } else {
+      // predictOnEndcap: arcS = (z - zip)/cot; alphaH = alphaOrigin - arcS/rho; (x,y) on the disc.
+      if (!(alpaka::math::abs(acc, cotTheta) > 1e-4f))
+        return false;
+      const VecDual arcS = (surf - dZip) / dCot;
+      const VecDual alphaH = alphaOrigin - arcS / rho;
+      const VecDual x = xc + absRho * dcos(acc, alphaH);
+      const VecDual y = yc + absRho * dsin(acc, alphaH);
+      sec = dsqrt(acc, x * x + y * y);
+      phi = datan2(acc, y, x);
+    }
+    const float rSurf = isBarrel ? surf : sec.v;
+    if (!(rSurf > 1e-6f))
+      return false;
+    for (int k = 0; k < 5; ++k) {
+      Hphi[k] = rSurf * phi.d[k];
+      Hsec[k] = sec.d[k];
+      if (!alpaka::math::isfinite(acc, Hphi[k]) || !alpaka::math::isfinite(acc, Hsec[k]))
+        return false;
+    }
+    return true;
   }
 
-  // RunningHelix: helix state + covariance maintained per track during the extender's hit-attach
-  // loop. The BL input cov is block-diagonal (circle 3x3 / line 2x2); barrel measurements update both
-  // blocks independently, endcap ones only the line block. Jacobian signs:
-  //   dphi/dphi0=+1  dphi/dtip=-1/r  dphi/d(1/pT)=-bf*s^2/(2r)  dz/dzip=+1  dz/dcot=+s
+  // RunningHelix: the walk's perigee state (phi0, tip, 1/pT, cot, zip) and its FULL 5x5 covariance,
+  // packed symmetric in the reco::TrackSoA layout (off[5] below). One filter: every measurement --
+  // barrel or endcap, with or without the stub bend row -- enters through updateState5 with its own
+  // rows, and the material of each traversed gap enters through addKinkNoise, so the r-phi and the
+  // r-z halves of the state keep their correlations throughout the walk.
   struct RunningHelix {
     float phi0, tip, invPt, cotTheta, zip;
-    // Circle block (3x3 symmetric, packed): V(phi), cov(phi,tip),
-    // cov(phi,1/pT), V(tip), cov(tip,1/pT), V(1/pT).
-    float vPhi, cPhiTip, cPhiPt, vTip, cTipPt, vPt;
-    // Line block (2x2 symmetric, packed): V(cotTh), cov(cotTh,zip), V(zip).
-    float vCot, cCotZip, vZip;
+    float C[15];  // packed symmetric 5x5, index cIdx(a,b)
     // Derived helix geometry, refreshed by recomputeHelix().
     float rho;
     float xc, yc;
     float alphaOrigin;
+
+    ALPAKA_FN_ACC ALPAKA_FN_INLINE static int cIdx(int a, int b) {
+      constexpr int off[5] = {0, 4, 7, 9, 10};
+      const int lo = a < b ? a : b;
+      const int hi = a < b ? b : a;
+      return off[lo] + hi;
+    }
 
     template <typename TAcc>
     ALPAKA_FN_ACC ALPAKA_FN_INLINE void recomputeHelix(TAcc const& acc, float bf) {
@@ -509,100 +596,123 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       return h;
     }
 
-    // Kalman update on the circle (3x3) block from a 1-D phi measurement; sigPhi2Hit is the hit+MS
-    // innovation (the propagation contribution is already in P). Returns chi^2 against the pre-update
-    // state. Only P is downdated; the per-gap process noise P += Q is injected by the caller.
-    template <typename TAcc>
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE float updateCircleFromPhi(
-        TAcc const& acc, float dPhi, float sigPhi2Hit, float r, float bf, float s) {
-      const float invR = 1.f / alpaka::math::max(acc, r, 1.f);
-      const float J0 = 1.f;
-      const float J1 = -invR;
-      const float J2 = -bf * s * s * 0.5f * invR;
-      // P H^T (3-vector): row i = sum_j H_j * P(i, j)
-      const float PH0 = J0 * vPhi + J1 * cPhiTip + J2 * cPhiPt;
-      const float PH1 = J0 * cPhiTip + J1 * vTip + J2 * cTipPt;
-      const float PH2 = J0 * cPhiPt + J1 * cTipPt + J2 * vPt;
-      // S = H P H^T + R (scalar)
-      const float HPHT = J0 * PH0 + J1 * PH1 + J2 * PH2;
-      const float S = HPHT + sigPhi2Hit;
-      if (!(S > 0.f))
-        return 0.f;
-      const float invS = 1.f / S;
-      const float chi2 = dPhi * dPhi * invS;
-      // K = P H^T / S (3-vector). Call sites pass d = pred - meas; the textbook
-      // Kalman mean update is state += K*(meas - pred) = state -= K*dPhi.
-      const float K0 = PH0 * invS;
-      const float K1 = PH1 * invS;
-      const float K2 = PH2 * invS;
-      phi0 -= K0 * dPhi;
-      tip -= K1 * dPhi;
-      invPt -= K2 * dPhi;
-      // P_new = P - K (H P) = P - (P H^T)(P H^T)^T / S  (symmetric rank-1)
-      vPhi -= PH0 * PH0 * invS;
-      vTip -= PH1 * PH1 * invS;
-      vPt -= PH2 * PH2 * invS;
-      cPhiTip -= PH0 * PH1 * invS;
-      cPhiPt -= PH0 * PH2 * invS;
-      cTipPt -= PH1 * PH2 * invS;
-      return chi2;
+    // H C H^T for one row (the prediction variance of that measurement).
+    ALPAKA_FN_ACC ALPAKA_FN_INLINE float predVar(const float H[5]) const {
+      float v = 0.f;
+      for (int a = 0; a < 5; ++a) {
+        v += C[cIdx(a, a)] * H[a] * H[a];
+        for (int b = a + 1; b < 5; ++b)
+          v += 2.f * C[cIdx(a, b)] * H[a] * H[b];
+      }
+      return v;
     }
 
-    // Kalman update on the line (2x2) block from a 1-D sec measurement.
-    // Barrel: sec=z (exact). Endcap: sec=r, approximate on cot/zip, to keep the blocks diagonal.
-    template <typename TAcc>
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE float updateLineFromSec(TAcc const& acc, float dSec, float sigSec2Hit, float s) {
-      // sec = zip + s * cotTh  -> H = (J_cot, J_zip) = (s, 1)
-      const float J0 = s;    // cotTh
-      const float J1 = 1.f;  // zip
-      const float PH0 = J0 * vCot + J1 * cCotZip;
-      const float PH1 = J0 * cCotZip + J1 * vZip;
-      const float HPHT = J0 * PH0 + J1 * PH1;
-      const float S = HPHT + sigSec2Hit;
-      if (!(S > 0.f))
-        return 0.f;
-      const float invS = 1.f / S;
-      const float chi2 = dSec * dSec * invS;
-      const float K0 = PH0 * invS;
-      const float K1 = PH1 * invS;
-      // Call sites pass d = pred - meas; textbook update is state -= K*dSec.
-      cotTheta -= K0 * dSec;
-      zip -= K1 * dSec;
-      vCot -= PH0 * PH0 * invS;
-      vZip -= PH1 * PH1 * invS;
-      cCotZip -= PH0 * PH1 * invS;
-      return chi2;
+    // Rank-structured multiple-scattering process noise of one traversed gap, in the perigee frame. A kink of
+    // variance q at perigee arc s_k enters the state as (dphi0, dtip) = (angle, +angle*s_k) and
+    // (dcot, dzip) = (a, -a*s_k), so summed over the gap's material
+    //   Q(phi0,tip) = cPhi * [[W, S1],[S1, S2]],   Q(cot,zip) = cCot * [[W, -S1],[-S1, S2]],
+    // with W, S1, S2 the moments of rho*dl in the perigee arc s_k (not about the arrival end: the caller
+    // converts). Curvature is untouched.
+    ALPAKA_FN_ACC ALPAKA_FN_INLINE void addKinkNoise(float cPhi, float cCot, float W, float S1, float S2) {
+      C[cIdx(0, 0)] += cPhi * W;
+      C[cIdx(0, 1)] += cPhi * S1;
+      C[cIdx(1, 1)] += cPhi * S2;
+      C[cIdx(3, 3)] += cCot * W;
+      C[cIdx(3, 4)] -= cCot * S1;
+      C[cIdx(4, 4)] += cCot * S2;
     }
 
-    // Kalman update on the line (2x2) block with a general measurement row H = (Jcot, Jzip); for the
-    // endcap, H = (Jr_cot, Jr_zip) from rWithGrad5, the r-at-fixed-z measurement being exactly
-    // representable by the 2x2 line filter. dSec = pred - meas (state -= K*dSec); sigSec2Hit = noise.
-    template <typename TAcc>
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE float updateLineFromSecH(
-        TAcc const& acc, float dSec, float sigSec2Hit, float Jcot, float Jzip) {
-      const float J0 = Jcot;
-      const float J1 = Jzip;
-      const float PH0 = J0 * vCot + J1 * cCotZip;
-      const float PH1 = J0 * cCotZip + J1 * vZip;
-      const float HPHT = J0 * PH0 + J1 * PH1;
-      const float S = HPHT + sigSec2Hit;
-      if (!(S > 0.f))
-        return 0.f;
-      const float invS = 1.f / S;
-      const float chi2 = dSec * dSec * invS;
-      const float K0 = PH0 * invS;
-      const float K1 = PH1 * invS;
-      // Call sites pass d = pred - meas; textbook update is state -= K*dSec.
-      cotTheta -= K0 * dSec;
-      zip -= K1 * dSec;
-      vCot -= PH0 * PH0 * invS;
-      vZip -= PH1 * PH1 * invS;
-      cCotZip -= PH0 * PH1 * invS;
+    // Joint Kalman update from n <= 3 measurement rows with a full n x n noise R. `d` is the residual
+    // pred - meas, so the mean update is x -= K d. Returns the innovation chi2 against the pre-update
+    // state and, in `sInvOut` (packed n(n+1)/2), the inverse innovation covariance; nRows<=0 or a
+    // singular S leaves the state untouched and returns -1.
+    template <typename TAcc, int NMAX = 3>
+    ALPAKA_FN_ACC ALPAKA_FN_INLINE float updateState5(
+        TAcc const& acc, int n, const float H[NMAX][5], const float d[NMAX], const float R[NMAX][NMAX], bool apply) {
+      if (n < 1 || n > NMAX)
+        return -1.f;
+      float PH[NMAX][5];  // (C H^T)^T, row m = C H_m
+      for (int m = 0; m < n; ++m)
+        for (int a = 0; a < 5; ++a) {
+          float v = 0.f;
+          for (int b = 0; b < 5; ++b)
+            v += C[cIdx(a, b)] * H[m][b];
+          PH[m][a] = v;
+        }
+      float S[3][3];
+      for (int m = 0; m < n; ++m)
+        for (int l = 0; l < n; ++l) {
+          float v = R[m][l];
+          for (int a = 0; a < 5; ++a)
+            v += H[m][a] * PH[l][a];
+          S[m][l] = v;
+        }
+      float Si[3][3] = {{0.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.f, 0.f, 0.f}};
+      if (n == 1) {
+        if (!(S[0][0] > 0.f))
+          return -1.f;
+        Si[0][0] = 1.f / S[0][0];
+      } else if (n == 2) {
+        const float det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
+        if (!(det > 0.f) || !alpaka::math::isfinite(acc, det))
+          return -1.f;
+        const float invDet = 1.f / det;
+        Si[0][0] = S[1][1] * invDet;
+        Si[1][1] = S[0][0] * invDet;
+        Si[0][1] = Si[1][0] = -S[0][1] * invDet;
+      } else {
+        const float a0 = S[1][1] * S[2][2] - S[1][2] * S[2][1];
+        const float a1 = S[1][2] * S[2][0] - S[1][0] * S[2][2];
+        const float a2 = S[1][0] * S[2][1] - S[1][1] * S[2][0];
+        const float det = S[0][0] * a0 + S[0][1] * a1 + S[0][2] * a2;
+        if (!(det > 0.f) || !alpaka::math::isfinite(acc, det))
+          return -1.f;
+        const float invDet = 1.f / det;
+        Si[0][0] = a0 * invDet;
+        Si[0][1] = Si[1][0] = a1 * invDet;
+        Si[0][2] = Si[2][0] = a2 * invDet;
+        Si[1][1] = (S[0][0] * S[2][2] - S[0][2] * S[2][0]) * invDet;
+        Si[1][2] = Si[2][1] = (S[0][2] * S[1][0] - S[0][0] * S[1][2]) * invDet;
+        Si[2][2] = (S[0][0] * S[1][1] - S[0][1] * S[1][0]) * invDet;
+      }
+      float chi2 = 0.f;
+      for (int m = 0; m < n; ++m)
+        for (int l = 0; l < n; ++l)
+          chi2 += d[m] * Si[m][l] * d[l];
+      if (!alpaka::math::isfinite(acc, chi2) || chi2 < 0.f)
+        return -1.f;
+      if (!apply)
+        return chi2;
+      // K = C H^T S^-1 ; x -= K d ; C -= (C H^T) S^-1 (C H^T)^T
+      float K[3][5];
+      for (int m = 0; m < n; ++m)
+        for (int a = 0; a < 5; ++a) {
+          float v = 0.f;
+          for (int l = 0; l < n; ++l)
+            v += Si[m][l] * PH[l][a];
+          K[m][a] = v;
+        }
+      float dx[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
+      for (int m = 0; m < n; ++m)
+        for (int a = 0; a < 5; ++a)
+          dx[a] += K[m][a] * d[m];
+      phi0 -= dx[0];
+      tip -= dx[1];
+      invPt -= dx[2];
+      cotTheta -= dx[3];
+      zip -= dx[4];
+      for (int a = 0; a < 5; ++a)
+        for (int b = a; b < 5; ++b) {
+          float v = 0.f;
+          for (int m = 0; m < n; ++m)
+            v += PH[m][a] * K[m][b];
+          C[cIdx(a, b)] -= v;
+        }
       return chi2;
     }
   };
 
-  // Initialize a RunningHelix from a track's BL state and cov; derived geometry is recomputed.
+  // Initialize a RunningHelix from a track's BL state and its full published covariance.
   template <typename TAcc>
   ALPAKA_FN_ACC ALPAKA_FN_INLINE RunningHelix
   makeRunningHelix(TAcc const& acc, const ::reco::TrackSoAConstView tracks, int i, float bf) {
@@ -612,55 +722,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     h.invPt = tracks[i].state()(2);
     h.cotTheta = tracks[i].state()(3);
     h.zip = tracks[i].state()(4);
-    // Circle block from cov entries (0, 1, 2, 5, 6, 9); line block from (12, 13, 14).
-    h.vPhi = tracks[i].covariance()(0);
-    h.cPhiTip = tracks[i].covariance()(1);
-    h.cPhiPt = tracks[i].covariance()(2);
-    h.vTip = tracks[i].covariance()(5);
-    h.cTipPt = tracks[i].covariance()(6);
-    h.vPt = tracks[i].covariance()(9);
-    h.vCot = tracks[i].covariance()(12);
-    h.cCotZip = tracks[i].covariance()(13);
-    h.vZip = tracks[i].covariance()(14);
+    for (int k = 0; k < 15; ++k)
+      h.C[k] = tracks[i].covariance()(k);
     h.recomputeHelix(acc, bf);
     return h;
-  }
-
-  // Diagnostic: exact full-5x5 covariance-only joint (phi,r) Kalman update, without the state update.
-  // C[15] is packed symmetric, in the reco::TrackSoA cov layout, and takes the walk's measurement rows.
-  template <typename TAcc>
-  ALPAKA_FN_ACC ALPAKA_FN_INLINE void updateShadowCov(
-      TAcc const& acc, float* C, const float Hp[5], const float Hs[5], float R00, float R11) {
-    constexpr int off[5] = {0, 4, 7, 9, 10};
-    auto cidx = [&](int a, int b) {
-      const int lo = a < b ? a : b;
-      const int hi = a < b ? b : a;
-      return off[lo] + hi;
-    };
-    float Pp[5], Ps[5];
-    for (int a = 0; a < 5; ++a) {
-      float sp = 0.f, ss = 0.f;
-      for (int b = 0; b < 5; ++b) {
-        const float cab = C[cidx(a, b)];
-        sp += cab * Hp[b];
-        ss += cab * Hs[b];
-      }
-      Pp[a] = sp;
-      Ps[a] = ss;
-    }
-    float S00 = R00, S11 = R11, S01 = 0.f;
-    for (int a = 0; a < 5; ++a) {
-      S00 += Hp[a] * Pp[a];
-      S11 += Hs[a] * Ps[a];
-      S01 += Hp[a] * Ps[a];
-    }
-    const float det = S00 * S11 - S01 * S01;
-    if (!(det > 0.f) || !alpaka::math::isfinite(acc, det))
-      return;
-    const float i00 = S11 / det, i11 = S00 / det, i01 = -S01 / det;
-    for (int a = 0; a < 5; ++a)
-      for (int b = a; b < 5; ++b)
-        C[cidx(a, b)] -= i00 * Pp[a] * Pp[b] + i01 * (Pp[a] * Ps[b] + Ps[a] * Pp[b]) + i11 * Ps[a] * Ps[b];
   }
 
   // Project a packed symmetric 5x5 (layout off[5]={0,4,7,9,10}) onto a measurement row H: H^T C H.

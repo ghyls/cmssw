@@ -237,11 +237,10 @@ for _label, _mod, _ov in (("prompt", _pm, _ovPrompt), ("displaced", _dm, _ovDisp
 if _MERGED:
     _mg = process.hltPhase2PixelTracksSoAMerger
     print("[trackNano CHAIN-STATE] merged: hltPhase2PixelTracksSoAMerger inputTkSoAs=%s | "
-          "mergerMinQuality=%s twinMergeNSigma2=%s extHostMaxChi2Ndof=%s extMaxWalkLayers=%s | "
+          "mergerMinQuality=%s extMaxWalkLayers=%s | "
           "minQuality=%s | row space = post-HP on BOTH arms (twin merge -> OT attach -> GBL refit "
           "-> dedup); valid only for the two lines above"
           % ([str(_t) for _t in _mg.inputTkSoAs], _shown(_mg, "minQuality"),
-             _shown(_mg, "twinMergeNSigma2"), _shown(_mg, "extHostMaxChi2Ndof"),
              _shown(_mg, "extMaxWalkLayers"), os.environ.get("NANO_MINQUALITY", "tight")))
 
 # Prune validation/DQM paths: only the HLT reconstruction is needed.
@@ -420,7 +419,7 @@ if _MERGED:
         # A missing OT SoA does not fail loudly: it NaNs the whole feature row of every track
         # carrying a tagged OT extra (caTrackFeatures::fill returns false with no view).
         otRecHitsSoASrc=cms.InputTag("hltPixelSeedingOTRecHitsSoA"),
-        emitHitTruth=cms.bool(False),  # heavy (TrackerHitAssociator); the merged forest does not need it
+        emitHitTruth=cms.bool(os.environ.get("NANO_MERGED_HITTRUTH") == "1"),  # heavy (TrackerHitAssociator)
         emitMergedProvenance=cms.bool(True),  # iteration / ndof / nOTExtra / nAttached
         # Pixel-cluster charge/shape block (NANO_CLUSTER=1). Off by default so an existing merged
         # dataset's schema is unchanged; the threshold is a plain parameter, so re-picking it from
