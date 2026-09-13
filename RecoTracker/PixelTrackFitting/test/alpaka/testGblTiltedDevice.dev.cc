@@ -56,6 +56,11 @@ namespace {
   constexpr double kTolTwinStiff = 1e-2;      // (d) cov / corrections
   constexpr double kTolTwinStiffChi2 = 1e-1;  // (d) chi2
   constexpr int kStiffVariant = 3;            //!< index of (d) in the variant list
+  // Variant (e) multiplies every kink precision by 10, one more decade of conditioning by the same
+  // mechanism. Only chi2 feels it: it is the one quantity built from a cancellation (chi2_ref - delta.b),
+  // so it loses about a digit against the host while the covariance and the corrections stay at kTolTwin.
+  constexpr double kTolTwinSoftMsChi2 = 1e-6;  // (e) chi2
+  constexpr int kSoftMsVariant = 4;            //!< index of (e) in the variant list
   // Bracket on sigma(1/R)_(a) / sigma(1/R)_(b), which sits close to 1: wide enough that a material or
   // scattering retune does not trip it, narrow enough that a blow-up on the tilted modules would.
   constexpr double kRatioMin = 0.5;
@@ -64,7 +69,7 @@ namespace {
   constexpr double kMonoSlack = 1e-9;
 
   // Model knobs: the field map and the three trajectory-model corrections are off (plain constant-field model).
-  constexpr double kELossPerX0 = 0.0;
+  constexpr bool kApplyELoss = false;  // ionization-loss correction off
   constexpr double kBFieldOrigin = 0.0;
   constexpr bool kTrajectoryCorrections = false;
   constexpr bool kScatteringLogAtTotal = false;
@@ -97,10 +102,8 @@ namespace {
         bld::PreparedGblData<kN> data;
         double gapD1[kN], gapW1[kN];
         bld::prepareGblFitData(acc, hits, ff, bField, rho, data, /*matCached=*/nullptr, gapD1, gapW1);
-        const double rHit0 = alpaka::math::sqrt(acc, hits(0, 0) * hits(0, 0) + hits(1, 0) * hits(1, 0));
-        double innerD1 = 0., innerW1 = 0.;
-        if (data.innerXX0 > 0.)
-          bld::segmentXX0GapSplit(acc, rho, 0., 0., rHit0, hits(2, 0), innerD1, innerW1);
+        // the upstream (PCA -> hit0) segment's own two-thin split, from the walk prepareGblFitData ran
+        const double innerD1 = data.innerD1, innerW1 = data.innerW1;
 
         const bool usedSplit = gbld::prepareGblDataSplit<Acc1D, kN>(acc,
                                                                     hits,
@@ -117,8 +120,7 @@ namespace {
                                                                     innerD1,
                                                                     innerW1,
                                                                     nodes,
-                                                                    /*msScale=*/1.0,
-                                                                    kELossPerX0,
+                                                                    kApplyELoss,
                                                                     /*bMap=*/nullptr,
                                                                     kBFieldOrigin,
                                                                     kTrajectoryCorrections,
@@ -198,14 +200,14 @@ TEST_CASE("GBL tilted-module measurement model for the " EDM_STRINGIZE(ALPAKA_AC
   Eigen::Vector4d ff;
   blh::fastFit(hits, ff);
 
-  auto rho_h = cms::alpakatools::make_host_buffer<float[], Platform>(blMaterialMap::kSize);
-  std::copy_n(blMaterialMap::blMaterialMapData(), blMaterialMap::kSize, rho_h.data());
+  auto rho_h = cms::alpakatools::make_host_buffer<float[], Platform>(blMaterialMap::kBufferFloats);
+  std::copy_n(blMaterialMap::blMaterialMapData(), blMaterialMap::kBufferFloats, rho_h.data());
 
   for (auto const& device : devices) {
     auto queue = Queue(device);
     const std::string devName = alpaka::getName(device);
 
-    auto rho_d = cms::alpakatools::make_device_buffer<float[]>(queue, blMaterialMap::kSize);
+    auto rho_d = cms::alpakatools::make_device_buffer<float[]>(queue, blMaterialMap::kBufferFloats);
     alpaka::memcpy(queue, rho_d, rho_h);
 
     auto hits_h = cms::alpakatools::make_host_buffer<double[], Platform>(3 * kN);
@@ -381,7 +383,9 @@ TEST_CASE("GBL tilted-module measurement model for the " EDM_STRINGIZE(ALPAKA_AC
       REQUIRE(corr.any);
       REQUIRE(chi2.any);
       const double tolCov = (v == kStiffVariant) ? kTolTwinStiff : kTolTwin;
-      const double tolChi2 = (v == kStiffVariant) ? kTolTwinStiffChi2 : kTolTwin;
+      const double tolChi2 = (v == kStiffVariant)    ? kTolTwinStiffChi2
+                             : (v == kSoftMsVariant) ? kTolTwinSoftMsChi2
+                                                     : kTolTwin;
       REQUIRE(cov.v < tolCov);
       REQUIRE(corr.v < tolCov);
       REQUIRE(chi2.v < tolChi2);

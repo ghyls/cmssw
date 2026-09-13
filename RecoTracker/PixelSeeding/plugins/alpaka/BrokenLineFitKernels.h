@@ -774,10 +774,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
   // Phase-buffer lane stride (doubles): the per-lane cross-launch scratch of the Kernel_BLFitPhase*
   // pipeline, indexed by the named slots below. Slots [64..104] hold the iteration-invariant tail:
-  //   [64..64+N-1] matXX0     the material march (function of hit positions alone)
-  //   [64+N]       innerXX0   function of hit 0, at the end of the window prepareGblFitData's matCached
+  //   [64..64+N-1] matXX0     the material walk (a function of the hit positions and of the reference it
+  //                           was run with: the cache freezes it at the first linearization's reference)
+  //   [64+N]       innerXX0   the upstream segment, at the end of the window prepareGblFitData's matCached
   //                           contract reads (matCached[n]); the window is sized for N <= 12
-  //   [77] [78]    innerD1/W1 segmentXX0Moments, function of hit 0 alone
+  //   [77] [78]    innerD1/W1 the upstream segment's two-thin split
   //   [79]         bFieldEff  effective field of this linearization, invariant across its phases
   constexpr int kBLPhaseJacBack = 0;     // [0..24]  hit0 -> PCA backward jacobian (hits-only node layout)
   constexpr int kBLPhaseUsedInner = 25;  // 1 if the inner-node layout was built for this lane
@@ -901,7 +902,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       generalBrokenLine::GblNodeData* gnodes = pgnodes + std::size_t(local_idx) * std::size_t(kSlotNodes);
       double innerD1 = 0., innerW1 = 0.;
       if (matFromPhase_) {
-        // Function of hit 0 alone, so it rides the same cache; the iteration-0 prep left 0/0 wherever
+        // Rides the same cache as the rest of the material; the iteration-0 prep left 0/0 wherever
         // innerXX0 was not positive, which is what the else branch produces.
         innerD1 = phase[kBLPhaseInnerD1];
         innerW1 = phase[kBLPhaseInnerW1];
@@ -960,7 +961,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                                      innerD1,
                                                                      innerW1,
                                                                      gnodes,
-                                                                     /*msScale=*/1.0,
                                                                      kApplyELossCorrection,
                                                                      chargeSymmetric_ ? bMap_ : nullptr,
                                                                      bField,
@@ -982,7 +982,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                     data.matXX0,
                                                     data.innerXX0,
                                                     gnodes,
-                                                    /*msScale=*/1.0,
                                                     kApplyELossCorrection,
                                                     &jacBack,
                                                     innerD1,

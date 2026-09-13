@@ -97,6 +97,14 @@
   <flags ALPAKA_BACKENDS="1"/>
 </bin>
 
+<bin name="testBLStubCovDevice" file="alpaka/testBLStubCovDevice.dev.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
 <bin name="testBLBFieldMapDevice" file="alpaka/testBLBFieldMapDevice.dev.cc">
   <use name="alpaka"/>
   <use name="catch2"/>

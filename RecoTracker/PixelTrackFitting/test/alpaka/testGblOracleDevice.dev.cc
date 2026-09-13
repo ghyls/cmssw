@@ -1,25 +1,9 @@
-// testGblOracleDevice.dev.cc
-//
-// The DESY oracle, on the device. For each of 15 fixtures (test/gblTestFixtures.h), the GBL node chain is
-// built on the device through the production path, the calls BrokenLineFitKernels.h makes for the
-// merger's refit:
-//
-//     brokenline::prepareGblFitData        (arc lengths, charge, the Geant4 material march, per-gap splits)
-//     brokenline::segmentXX0GapSplit       (the beamline -> hit0 two-thin split)
-//     generalBrokenLine::prepareGblDataSplit   (the 2N+1 layout production uses; prepareGblData is the fallback)
-//     generalBrokenLine::gblFitPca             (the bordered-band solve at the PCA)
-//     generalBrokenLine::gblHelixAtPca         (curvilinear -> (phi, d0, 1/R, cotTheta, z0))
-//
-// The node chain is then copied back and the device's own nodes are given to two independent host oracles:
-//
-//   (1) gbl::GblTrajectory, the DESY General-Broken-Lines library, run host-side in GblHostOracles.cc.
-//       It is handed the chain the device solved, so it is asked only whether the solver agrees.
-//   (2) the host twin, interface/GeneralBrokenLine.h, on the same nodes: serial, CUDA and ROCm all reduce
-//       to the same host numbers.
-//
-// The measurement-only Cramer-Rao floor and the CMSSW PerigeeConversions cross-check are printed as
-// physics diagnostics, not asserted: they are ratios, and a hard-coded ratio breaks when the physics
-// improves. The tolerance block below lists every number that is asserted.
+// The DESY oracle on the device. For each of 15 fixtures (test/gblTestFixtures.h) the GBL node chain is built on
+// the device through the production path (brokenline::prepareGblFitData, generalBrokenLine::prepareGblDataSplit,
+// gblFitPca, gblHelixAtPca), copied back and given to two independent host oracles: gbl::GblTrajectory (the DESY
+// library, GblHostOracles.cc) and the host twin interface/GeneralBrokenLine.h. The Cramer-Rao floor and the
+// PerigeeConversions cross-check are printed as diagnostics, not asserted; the tolerance block below lists every
+// asserted number.
 
 #include <algorithm>
 #include <cmath>
@@ -80,7 +64,7 @@ namespace {
 
   // The field map and the three trajectory-model corrections are off, so the chain under test is the plain
   // constant-field GBL model. They are named rather than left to the defaults so that a change shows here.
-  constexpr double kELossPerX0 = 0.0;             // ionization-loss correction off
+  constexpr bool kApplyELoss = false;             // ionization-loss correction off
   constexpr double kBFieldOrigin = 0.0;           // no (Bz,Br) map in these fixtures -> bMap == nullptr
   constexpr bool kTrajectoryCorrections = false;  // reference-trajectory corrections
   constexpr bool kScatteringLogAtTotal = false;   // Highland's log per gap, not at the track total
@@ -119,7 +103,7 @@ namespace {
                                   double const* ffIn,
                                   float const* rho,
                                   double bField,
-                                  double msScale,
+                                  double matScale,
                                   gbld::GblNodeData* nodes,
                                   double* scratch,
                                   double* out) const {
@@ -139,12 +123,16 @@ namespace {
         bld::PreparedGblData<N> data;
         double gapD1[N], gapW1[N];
         bld::prepareGblFitData(acc, hits, ff, bField, rho, data, /*matCached=*/nullptr, gapD1, gapW1);
+        // MS-regime lever: the declared material is scaled, which is what a lower-momentum track sees. The
+        // two-thin shares gapD1/gapW1 are ratios of the same moments and do not move with it.
+        if (matScale != 1.) {
+          for (int g = 0; g < N; ++g)
+            data.matXX0(g) *= matScale;
+          data.innerXX0 *= matScale;
+        }
 
-        // the upstream (beamline -> hit0) segment's own split, as BrokenLineFitKernels.h:627 takes it.
-        const double rHit0 = alpaka::math::sqrt(acc, hits(0, 0) * hits(0, 0) + hits(1, 0) * hits(1, 0));
-        double innerD1 = 0., innerW1 = 0.;
-        if (data.innerXX0 > 0.)
-          bld::segmentXX0GapSplit(acc, rho, 0., 0., rHit0, hits(2, 0), innerD1, innerW1);
+        // the upstream (PCA -> hit0) segment's own two-thin split, from the walk prepareGblFitData ran
+        const double innerD1 = data.innerD1, innerW1 = data.innerW1;
 
         // (ii) node builder: the 2N+1 split layout, with the N+2 arrival-node layout as the fallback.
         const bool usedSplit = gbld::prepareGblDataSplit<Acc1D, N>(acc,
@@ -162,8 +150,7 @@ namespace {
                                                                    innerD1,
                                                                    innerW1,
                                                                    nodes,
-                                                                   msScale,
-                                                                   kELossPerX0,
+                                                                   kApplyELoss,
                                                                    /*bMap=*/nullptr,
                                                                    kBFieldOrigin,
                                                                    kTrajectoryCorrections,
@@ -181,8 +168,7 @@ namespace {
                                          data.matXX0,
                                          data.innerXX0,
                                          nodes,
-                                         msScale,
-                                         kELossPerX0,
+                                         kApplyELoss,
                                          /*jacHit0ToPca=*/nullptr,
                                          innerD1,
                                          innerW1,
@@ -301,7 +287,7 @@ namespace {
                   const char* devName,
                   const char* label,
                   const double D[N][9],
-                  double msScale,
+                  double matScale,
                   double tolTwin,
                   double tolDesy,
                   const float* rhoDev) {
@@ -359,7 +345,7 @@ namespace {
                         ff_d.data(),
                         rhoDev,
                         kB,
-                        msScale,
+                        matScale,
                         nodes_d.data(),
                         scratch_d.data(),
                         out_d.data());
@@ -558,12 +544,12 @@ TEST_CASE("GBL device chain vs the DESY oracle for the " EDM_STRINGIZE(ALPAKA_AC
 
   // The Geant4 material map: no EventSetup needed, the table is compiled into the
   // RecoTracker/PixelTrackFitting library and uploaded here exactly as the ES product would.
-  auto rho_h = cms::alpakatools::make_host_buffer<float[], Platform>(blMaterialMap::kSize);
-  std::copy_n(blMaterialMap::blMaterialMapData(), blMaterialMap::kSize, rho_h.data());
+  auto rho_h = cms::alpakatools::make_host_buffer<float[], Platform>(blMaterialMap::kBufferFloats);
+  std::copy_n(blMaterialMap::blMaterialMapData(), blMaterialMap::kBufferFloats, rho_h.data());
 
   for (auto const& device : devices) {
     auto queue = Queue(device);
-    auto rho_d = cms::alpakatools::make_device_buffer<float[]>(queue, blMaterialMap::kSize);
+    auto rho_d = cms::alpakatools::make_device_buffer<float[]>(queue, blMaterialMap::kBufferFloats);
     alpaka::memcpy(queue, rho_d, rho_h);
     alpaka::wait(queue);
     const std::string dn = alpaka::getName(device);
@@ -586,14 +572,15 @@ TEST_CASE("GBL device chain vs the DESY oracle for the " EDM_STRINGIZE(ALPAKA_AC
     runFixture<10>(
         queue, dn.c_str(), "REAL barrel eta~0.62", BARRELR062, 1.0, kTolTwinIllCond, kTolDesyIllCond, rho_d.data());
 
-    std::printf("  --- multiple-scattering sweep (low-pt proxy on the central track) ---\n");
-    runFixture<10>(queue, dn.c_str(), "central MSx10 (~Pt32)", CENTRAL, 10., kTolTwin, kTolDesy, rho_d.data());
-    runFixture<10>(queue, dn.c_str(), "central MSx100 (~Pt10)", CENTRAL, 100., kTolTwin, kTolDesy, rho_d.data());
-    runFixture<10>(queue, dn.c_str(), "central MSx10000 (~Pt1)", CENTRAL, 10000., kTolTwin, kTolDesy, rho_d.data());
+    std::printf("  --- declared-material sweep (low-pt multiple-scattering proxy on the central track) ---\n");
+    runFixture<10>(queue, dn.c_str(), "central material x10 (~Pt32)", CENTRAL, 10., kTolTwin, kTolDesy, rho_d.data());
+    runFixture<10>(queue, dn.c_str(), "central material x100 (~Pt10)", CENTRAL, 100., kTolTwin, kTolDesy, rho_d.data());
+    runFixture<10>(
+        queue, dn.c_str(), "central material x10000 (~Pt1)", CENTRAL, 10000., kTolTwin, kTolDesy, rho_d.data());
 
     std::printf("  --- displaced low-pt OT-only track (the material study) ---\n");
-    runFixture<4>(queue, dn.c_str(), "displaced OT m=1.0", DISPLACED1, 1.0, kTolTwin, kTolDesy, rho_d.data());
-    runFixture<4>(queue, dn.c_str(), "displaced OT m=0.3", DISPLACED1, 0.3, kTolTwin, kTolDesy, rho_d.data());
-    runFixture<4>(queue, dn.c_str(), "displaced OT m=0.1", DISPLACED1, 0.1, kTolTwin, kTolDesy, rho_d.data());
+    runFixture<4>(queue, dn.c_str(), "displaced OT material x1.0", DISPLACED1, 1.0, kTolTwin, kTolDesy, rho_d.data());
+    runFixture<4>(queue, dn.c_str(), "displaced OT material x0.3", DISPLACED1, 0.3, kTolTwin, kTolDesy, rho_d.data());
+    runFixture<4>(queue, dn.c_str(), "displaced OT material x0.1", DISPLACED1, 0.1, kTolTwin, kTolDesy, rho_d.data());
   }
 }

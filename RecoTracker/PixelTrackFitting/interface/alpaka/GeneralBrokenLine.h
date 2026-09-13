@@ -336,10 +336,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
       const VN& matXX0,
       double innerXX0,
       GblNodeData* nodes,
-      double msScale = 1.0,  // multiple-scattering scale (1.0 in production)
-      // Enables the ionization-loss correction when > 0; only that test is read, the loss charged at a node
-      // coming from elossMostProbable / elossTypicalColumn at that node's thickness.
-      double eLossPerX0 = 0.0,
+      // Enables the ionization-loss correction: the loss charged at a node comes from elossMostProbable /
+      // elossTypicalColumn at that node's thickness.
+      bool applyELoss = false,
       Matrix5d* jacHit0ToPca = nullptr,  // optional out: hit0->PCA backward jacobian (single-scatterer layout)
       double innerD1 = 0.,               // upstream equivalent-scatterer path distance from hit0 [cm]
       double innerW1 = 0.,               // fraction of the upstream scattering variance at that node
@@ -354,7 +353,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
       // field-profile offset.
       bool trajectoryCorrections = false,
       // Evaluates Highland's logarithm at the track's TOTAL declared material rather than at each gap's own
-      // thickness (producer parameter useScatteringLogAtTotal).
+      // thickness.
       bool scatteringLogAtTotal = false,
       // Charges each gap the cumulative-column typical loss from the vertex to that node (elossTypicalColumn)
       // rather than the most-probable loss of its own lump (producer parameter useCumulativeEloss).
@@ -428,15 +427,17 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
       sTotN[1] = double(sTotal(0)) - innerPath;  // path length along the track, to the (possibly clamped) node
     for (int i = 0; i < N; ++i)
       sTotN[i + hOff] = double(sTotal(i));
-    // Total declared material of THIS layout's gap set: the upstream lump plus every inter-hit gap that gets a
-    // kink (the outermost hit carries none). Only read under scatteringLogAtTotal (see th2Of).
+    // Total declared material of the WHOLE track: the upstream lump plus every inter-hit gap. Highland's
+    // logarithm is a property of the thickness the particle actually crosses, so it must not depend on which
+    // gaps a layout gives a kink to; both node builders therefore use the same, full, gap set. Only read
+    // under scatteringLogAtTotal (see th2Of).
     double xx0TotDecl = 0.;
     if (scatteringLogAtTotal) {
       if (innerXX0 > 0.)
         xx0TotDecl += innerXX0;
-      for (int i = 1; i <= N - 2; ++i)
-        if (double(matXX0(i - 1)) > 0.)
-          xx0TotDecl += double(matXX0(i - 1));
+      for (int g = 0; g <= N - 2; ++g)
+        if (double(matXX0(g)) > 0.)
+          xx0TotDecl += double(matXX0(g));
     }
     // Highland scattering variance (pion 1/beta factor, matches CMSSW MultipleScatteringUpdator). theta0^2 is
     // not additive over a chain, so under scatteringLogAtTotal only the ARGUMENT OF THE LOG becomes the track's
@@ -449,7 +450,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
       const double tt = 0.0136 / betaP;
       const double xLog = (scatteringLogAtTotal && xx0TotDecl > 0.) ? xx0TotDecl : xx0;
       const double f = 1. + 0.038 * alpaka::math::log(acc, xLog);
-      return tt * tt * xx0 * f * f * msScale;
+      return tt * tt * xx0 * f * f;
     };
     // total upstream scattering variance from the FULL innerXX0, split linearly between the equivalent
     // scatterer node (innerW1) and hit0 (1-innerW1) in the inner-node layout.
@@ -458,7 +459,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
     // (slot 0) and the field-profile azimuth increment (slot 2) share one accumulator: both are deterministic
     // offsets of the same reference state, propagated by the same Jacobians and removed at the same place.
     const bool useField = (bMap != nullptr);
-    const bool detOffset = (eLossPerX0 > 0.) || useField;
+    const bool detOffset = applyELoss || useField;
     // The lambda row of the field-profile offset (see the increment below): its only ingredient beyond the
     // azimuth row is B_r, which the bending law already reads at the same lattice cell.
     const bool useLambdaRow = useField && trajectoryCorrections;
@@ -639,7 +640,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
     A single thin scatterer at one end of a gap reproduces the gap's total scattering variance but not its
     lever arm (far-end offset variance and angle-offset covariance come out as zero). Two equivalent thin
     scatterers reproduce all three moments: one at path distance d1 = S2/S1 upstream of the ARRIVAL end with
-    the fraction w1 = S1^2/(S2 W) of the variance, the remainder at the arrival end (segmentXX0GapSplit). The
+    the fraction w1 = S1^2/(S2 W) of the variance, the remainder at the arrival end (segmentXX0Moments). The
     interior scatterer is not a hit node, so the layout has 2N+1 nodes:
 
       node 0        PCA (reference; no measurement, no scatterer)
@@ -676,8 +677,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
                                                           double innerD1,
                                                           double innerW1,
                                                           GblNodeData* nodes,
-                                                          double msScale = 1.0,
-                                                          double eLossPerX0 = 0.0,
+                                                          bool applyELoss = false,
                                                           // (Bz,Br) map + the origin field it normalizes to; a
                                                           // null map accumulates no field-profile offset.
                                                           const float* bMap = nullptr,
@@ -686,7 +686,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
                                                           // prepareGblData.
                                                           bool trajectoryCorrections = false,
                                                           // Highland's log at the track TOTAL rather than per
-                                                          // gap (useScatteringLogAtTotal); see prepareGblData.
+                                                          // gap; see prepareGblData.
                                                           bool scatteringLogAtTotal = false,
                                                           // Cumulative-column typical-loss law (producer
                                                           // parameter useCumulativeEloss; elossTypicalColumn).
@@ -728,8 +728,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
       hy = cy + ex * sa + ey * ca;
       hz = z0 + slope * sT;
     };
-    // Total declared material of the 2N+1 layout's gap set: the upstream lump plus EVERY inter-hit gap (this
-    // layout places an interior scatterer in each). Only read under scatteringLogAtTotal (see th2Of).
+    // Total declared material of the WHOLE track: the upstream lump plus every inter-hit gap, the same set
+    // the arrival-node builder uses (see there). Only read under scatteringLogAtTotal (see th2Of).
     double xx0TotDecl = 0.;
     if (scatteringLogAtTotal) {
       if (innerXX0 > 0.)
@@ -748,7 +748,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
       const double tt = 0.0136 / betaP;
       const double xLog = (scatteringLogAtTotal && xx0TotDecl > 0.) ? xx0TotDecl : xx0;
       const double f = 1. + 0.038 * alpaka::math::log(acc, xLog);
-      return tt * tt * xx0 * f * f * msScale;
+      return tt * tt * xx0 * f * f;
     };
 
     Vector3d posPrev, dirPrev;  // node k-1 of the rolling window
@@ -756,7 +756,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
     nodes[0] = GblNodeData{};
     // one deterministic curvilinear offset accumulator for both terms; see the arrival-node builder.
     const bool useField = (bMap != nullptr);
-    const bool detOffset = (eLossPerX0 > 0.) || useField;
+    const bool detOffset = applyELoss || useField;
     const bool useLambdaRow = useField && trajectoryCorrections;
     // B_bend/Bz(0,0) at a node; see the arrival-node builder.
     auto bBendOf = [&](const Vector3d& p) {

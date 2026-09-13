@@ -17,6 +17,7 @@
 
 #include "RecoTracker/PixelTrackFitting/interface/CurvilinearToPerigee.h"  // curvilinear -> perigee transform
 #include "RecoTracker/PixelTrackFitting/interface/BLBFieldMap.h"           // normalized (Bz,Br) r-z field map
+#include "RecoTracker/PixelTrackFitting/interface/BLMaterialMap.h"         // the ionization column of a path
 
 namespace generalBrokenLine {
 
@@ -232,80 +233,94 @@ namespace generalBrokenLine {
     return (ge3 + nnT).inverse() - nnT;
   }
 
+  //!< the ionization column of a path, as the material walk accumulates it (gblTestMaterial.h)
+  using ElossColumn = blMaterialMap::ElossColumn;
+
   // Constants of the two ionization energy-loss laws below (elossMostProbable, elossTypicalColumn): both
-  // evaluate the same Landau xi in the same medium and differ only in which statistic of the loss distribution
-  // they return. The medium is the composite effective medium of the charged bands (Bragg additivity rule over
-  // the material budget), not pure silicon.
+  // evaluate the same Landau xi on the same column and differ only in which statistic of the loss
+  // distribution they return. Every material quantity comes from the column the material map's dE/dx lattice
+  // produced for the path actually walked; there is no composite constant medium.
   namespace elossMedium {
     constexpr double kPionMass = 0.13957;           // pion mass [GeV]
     constexpr double kElectronMass = 0.5109989e-3;  // electron mass [GeV]
     constexpr double kK = 0.307075e-3;              // 0.307 MeV cm^2/mol -> GeV
-    constexpr double kZ_A = 0.500;                  // composite <Z/A>
-    constexpr double kI = 122e-9;                   // composite mean excitation energy [GeV]
-    constexpr double kX0g = 28.8;                   // composite X0 [g/cm^2]
-    constexpr double kHwp = 36.16e-9;               // composite plasma energy [GeV] (Sternheimer)
     // standard Landau: lambda_median - lambda_mode = 1.35578 - (-0.22278)
     constexpr double kLandauMedianMinusMode = 1.35578 + 0.22278;
+    // hbar omega_p = 28.816 eV sqrt(rho Z/A) (PDG RPP 34.2.5) and the eV -> GeV shift, both as logarithms:
+    // the laws work on the column's log-means and never form I or the plasma energy.
+    constexpr double kLnPlasmaEV = 3.360930788433600;  // ln(28.816)
+    constexpr double kLnGeVinEV = 20.723265836946410;  // ln(1e9)
   }  // namespace elossMedium
 
-  // Most-probable (Landau) ionization energy loss [GeV] for a segment of thickness xx0 radiation lengths
-  // ALONG THE TRACK, at total momentum p [GeV] (charged-pion mass), with the Sternheimer density correction:
-  //   Delta_mp = xi * [ ln(2 me beta^2 gamma^2 / I) + ln(xi/I) + 0.2 - beta^2 - delta(betagamma) ]
-  // with xi = (K/2)(Z/A) x / beta^2, x = xx0 * X0g [g/cm^2]. The correction has to remove the loss of the
-  // typical track, not the unrestricted Bethe-Bloch mean, which includes the Landau delta-ray tail. MP is not
-  // additive across sub-segments (ln xi term).
-  inline double elossMostProbable(double p, double xx0) {
+  // Landau scale xi [GeV] and most-probable bracket of a COMPOSITE column at total momentum p (pion mass).
+  // The Landau family is stable, so a column of lumps is one Landau with xi = sum xi_i and, the xi ln xi term
+  // being the location shift of the alpha = 1 stable law,
+  //   Delta_mp = xi [ln(2 me beta^2 gamma^2 xi) + 0.2 - beta^2] - sum_i xi_i [2 ln I_i + delta_i],
+  // i.e. the column needs, besides its electron content, the xi-weighted means of ln I (Bragg additivity)
+  // and of ln rho_e -- exactly what ElossColumn carries. delta follows Sternheimer's parametrization with the
+  // generic Sternheimer-Peierls parameters Geant4 uses for materials without tabulated ones (PDG RPP 34.2.5;
+  // Sternheimer & Peierls, Phys. Rev. B 3 (1971) 3681; Bichsel, Rev. Mod. Phys. 60 (1988) 663).
+  inline bool elossLandau(double p, const ElossColumn& col, double& xi, double& bracket) {
+    xi = 0.;
+    bracket = 0.;
+    if (!(col.e > 0.) || !(p > 0.))
+      return false;
+    constexpr double kLn10 = 2.302585092994046;
+    constexpr double twoLn10 = 2. * kLn10;  // the constant Sternheimer's parametrization rounds to 4.6052
     constexpr double m = elossMedium::kPionMass;
     constexpr double me = elossMedium::kElectronMass;
     constexpr double K = elossMedium::kK;
-    constexpr double Z_A = elossMedium::kZ_A;
-    constexpr double I = elossMedium::kI;
-    constexpr double X0g = elossMedium::kX0g;
-    constexpr double hwp = elossMedium::kHwp;
-    if (xx0 <= 0.)
-      return 0.;
     const double E = std::sqrt(p * p + m * m);
     const double beta2 = p * p / (E * E);
     const double g = E / m;
     const double bg2 = beta2 * g * g;  // (beta*gamma)^2
-    const double xi = 0.5 * K * Z_A * (xx0 * X0g) / beta2;
-    // density effect, high-betagamma Sternheimer limit: delta -> 2 ln(hwp/I * betagamma) - 1 (>=0)
-    const double dhalf = std::log((hwp / I) * std::sqrt(bg2)) - 0.5;
-    const double delta = dhalf > 0. ? 2. * dhalf : 0.;
-    const double bracket = std::log(2. * me * bg2 / I) + std::log(xi / I) + 0.2 - beta2 - delta;
+    xi = 0.5 * K * col.e / beta2;
+    // The column's effective medium enters only through ln I and, via the plasma energy, ln rho_e, and the
+    // column already carries both as logarithms: I and hbar omega_p are never formed.
+    const double lnIeV = col.eLnI / col.e;               // ln(I/eV)
+    const double lnI = lnIeV - elossMedium::kLnGeVinEV;  // ln(I/GeV)
+    const double cbar = 2. * (lnIeV - 0.5 * col.eLnRho / col.e - elossMedium::kLnPlasmaEV) + 1.;
+    const bool soft = lnIeV < 2. * kLn10;  // I < 100 eV
+    const double x1 = soft ? 2. : 3.;
+    const double cbarLim = soft ? 3.681 : 5.215;
+    const double x0 = (cbar < cbarLim) ? 0.2 : (0.326 * cbar - (soft ? 1.0 : 1.5));
+    const double x = 0.5 * std::log(bg2) / kLn10;  // log10(betagamma)
+    double delta = 0.;
+    if (x >= x1) {
+      delta = twoLn10 * x - cbar;
+    } else if (x > x0) {
+      const double a = (cbar - twoLn10 * x0) / ((x1 - x0) * (x1 - x0) * (x1 - x0));
+      const double d = x1 - x;
+      delta = twoLn10 * x - cbar + a * d * d * d;
+    }
+    // ln(2 me beta^2 gamma^2 / I) + ln(xi / I) = ln(2 me beta^2 gamma^2 xi) - 2 ln I
+    bracket = std::log(2. * me * bg2 * xi) - 2. * lnI + 0.2 - beta2 - delta;
+    return true;
+  }
+
+  // Most-probable (Landau) ionization energy loss [GeV] of the column, at total momentum p [GeV]. The
+  // correction has to remove the loss of the typical track, not the unrestricted Bethe-Bloch mean, which
+  // includes the Landau delta-ray tail. MP is not additive across sub-columns (the ln xi term).
+  inline double elossMostProbable(double p, const ElossColumn& col) {
+    double xi, bracket;
+    if (!elossLandau(p, col, xi, bracket))
+      return 0.;
     const double dmp = xi * bracket;
     return dmp > 0. ? dmp : 0.;
   }
 
-  // Typical (median) ionization loss [GeV] of the CUMULATIVE charged column of thickness xx0 [X/X0], same
-  // medium as elossMostProbable, selected over the per-lump most-probable law by the runtime flag
-  // elossCumulative. The Landau family is stable under convolution, so the typical loss of a multi-slab column
-  // is the single-column law at the SUMMED thickness, not the sum of per-slab MPVs, and median - mode =
-  // (1.35578 + 0.22278) xi for a Landau (PDG RPP 34.2.9). Callers charge per-node increments
-  // T(X_cum + x_lump) - T(X_cum).
-  inline double elossTypicalColumn(double p, double xx0) {
-    constexpr double m = elossMedium::kPionMass;
-    constexpr double me = elossMedium::kElectronMass;
-    constexpr double K = elossMedium::kK;
-    constexpr double Z_A = elossMedium::kZ_A;
-    constexpr double I = elossMedium::kI;
-    constexpr double X0g = elossMedium::kX0g;
-    constexpr double hwp = elossMedium::kHwp;
-    constexpr double kLandauMedianMinusMode = elossMedium::kLandauMedianMinusMode;
-    if (xx0 <= 0.)
+  // Typical (median) ionization loss [GeV] of the CUMULATIVE column, selected over the per-lump most-probable
+  // law by the runtime flag elossCumulative. The Landau family is stable under convolution, so the typical
+  // loss of a multi-lump column is the single-column law at the SUMMED column, not the sum of per-lump MPVs,
+  // and median - mode = (1.35578 + 0.22278) xi for a Landau (PDG RPP 34.2.9). Callers charge per-node
+  // increments T(col_cum + col_lump) - T(col_cum).
+  inline double elossTypicalColumn(double p, const ElossColumn& col) {
+    double xi, bracket;
+    if (!elossLandau(p, col, xi, bracket))
       return 0.;
-    const double E = std::sqrt(p * p + m * m);
-    const double beta2 = p * p / (E * E);
-    const double g = E / m;
-    const double bg2 = beta2 * g * g;
-    const double xi = 0.5 * K * Z_A * (xx0 * X0g) / beta2;
-    const double dhalf = std::log((hwp / I) * std::sqrt(bg2)) - 0.5;
-    const double delta = dhalf > 0. ? 2. * dhalf : 0.;
-    const double bracket = std::log(2. * me * bg2 / I) + std::log(xi / I) + 0.2 - beta2 - delta;
     const double dmp = xi * bracket;
-    return (dmp > 0. ? dmp : 0.) + kLandauMedianMinusMode * xi;
+    return (dmp > 0. ? dmp : 0.) + elossMedium::kLandauMedianMinusMode * xi;
   }
-
   // Fractional stand-off of the equivalent upstream scatterer from the PCA and from hit0.
   inline constexpr double kSplitStandOff = 0.02;
   inline constexpr double kSplitStandOffHi = 0.98;
@@ -336,11 +351,9 @@ namespace generalBrokenLine {
                              const VN& matXX0,
                              double innerXX0,
                              GblNodeData* nodes,
-                             double msScale = 1.0,  // multiple-scattering scale factor (1.0 in production)
-                             // Enables the ionization-loss correction when > 0; only that test is read, the
-                             // loss charged at a node coming from elossMostProbable / elossTypicalColumn at
-                             // that node's thickness.
-                             double eLossPerX0 = 0.0,
+                             // Enables the ionization-loss correction: the loss charged at a node comes from
+                             // elossMostProbable / elossTypicalColumn at that node's thickness.
+                             bool applyELoss = false,
                              Matrix5d* jacHit0ToPca = nullptr,  // optional output: the hit0 -> PCA backward
                                                                 // curvilinear Jacobian (single-scatterer layout)
                              double innerD1 = 0.,  // upstream equivalent-scatterer path distance from hit0 [cm]
@@ -357,11 +370,18 @@ namespace generalBrokenLine {
                              // a measurement-less node, and the B_r lambda row of the field-profile offset.
                              bool trajectoryCorrections = false,
                              // Evaluates Highland's log at the track's TOTAL declared material rather than at
-                             // each gap's own thickness (producer parameter useScatteringLogAtTotal).
+                             // each gap's own thickness.
                              bool scatteringLogAtTotal = false,
                              // Charges each gap the cumulative-column typical loss from the vertex to that node
-                             // rather than each lump its own most-probable loss (useCumulativeEloss).
-                             bool elossCumulative = false) {
+                             // rather than each lump its own most-probable loss.
+                             // These model switches are not configurable: the merger's refit call sets
+                             // them (PixelTracksSoAMerger.cc), the CA path leaves them at these defaults.
+                             bool elossCumulative = false,
+                             // Ionization columns of the same lumps, from the same material walk: matCol[g]
+                             // for gap g, innerCol for the beamline -> hit0 segment. The energy-loss laws read
+                             // them; without them applyELoss charges nothing.
+                             const ElossColumn* matCol = nullptr,
+                             const ElossColumn& innerCol = ElossColumn{}) {
     constexpr int nNodes = N + 2;
     const double cx = fast_fit(0), cy = fast_fit(1), R = fast_fit(2);
     const double slope = -double(qCharge) / fast_fit(3);
@@ -434,15 +454,17 @@ namespace generalBrokenLine {
       sTotN[1] = double(sTotal(0)) - innerPath;  // path length along the track, to the (possibly clamped) node
     for (int i = 0; i < N; ++i)
       sTotN[i + hOff] = double(sTotal(i));
-    // Total declared material: upstream lump plus every inter-hit gap that carries a kink. Read only
-    // when scatteringLogAtTotal moves the Highland logarithm's argument from the gap to this total.
+    // Total declared material of the WHOLE track: the upstream lump plus every inter-hit gap. Highland's
+    // logarithm is a property of the thickness the particle actually crosses, so it must not depend on which
+    // gaps a layout gives a kink to; both node builders use the same, full, gap set. Read only when
+    // scatteringLogAtTotal moves the Highland logarithm's argument from the gap to this total.
     double xx0TotDecl = 0.;
     if (scatteringLogAtTotal) {
       if (innerXX0 > 0.)
         xx0TotDecl += innerXX0;
-      for (int i = 1; i <= N - 2; ++i)
-        if (double(matXX0(i - 1)) > 0.)
-          xx0TotDecl += double(matXX0(i - 1));
+      for (int g = 0; g <= N - 2; ++g)
+        if (double(matXX0(g)) > 0.)
+          xx0TotDecl += double(matXX0(g));
     }
     // Highland scattering variance: theta0 = 0.0136/(beta p) * sqrt(x/X0) * (1 + 0.038 ln(x/X0)). theta0^2 is
     // not additive over a chain (one logarithm); scatteringLogAtTotal moves that log from this gap's thickness
@@ -455,7 +477,7 @@ namespace generalBrokenLine {
       const double tt = 0.0136 / betaP;
       const double xLog = (scatteringLogAtTotal && xx0TotDecl > 0.) ? xx0TotDecl : xx0;
       const double f = 1. + 0.038 * std::log(xLog);
-      return tt * tt * xx0 * f * f * msScale;
+      return tt * tt * xx0 * f * f;
     };
     // total upstream scattering variance from the FULL innerXX0, split linearly between the equivalent
     // scatterer node (innerW1) and hit0 (1-innerW1) in the inner-node layout.
@@ -465,7 +487,7 @@ namespace generalBrokenLine {
     // the bending-field profile (the reference turns at -qbp*bField, the trajectory at -qbp*B_bend(s)). Only
     // the offset part (x_T,y_T) of the accumulated shift is removed from the measurement residuals.
     const bool useField = (bMap != nullptr);
-    const bool detOffset = (eLossPerX0 > 0.) || useField;
+    const bool detOffset = applyELoss || useField;
     // The lambda row of the field-profile offset (see the increment below): its only ingredient beyond the
     // azimuth row is B_r, which the bending law already reads at the same lattice cell.
     const bool useLambdaRow = useField && trajectoryCorrections;
@@ -497,7 +519,7 @@ namespace generalBrokenLine {
       bbPrev = useLambdaRow ? bBendBrOf(pos[0], bsPrev) : bBendOf(pos[0]);
     Vector5d Deloss = Vector5d::Zero();
     // running charged column [X/X0] for the cumulative typical-loss law (walk order = path order)
-    double xx0ElossCum = 0.;
+    ElossColumn colCum;  // running ionization column charged so far
     for (int k = 1; k < N + hOff; ++k) {
       const int i = k - hOff;                    // hit index (negative for the scatterer-only node)
       const bool scatOnly = useInner && k == 1;  // upstream-material node: no measurement
@@ -535,12 +557,13 @@ namespace generalBrokenLine {
       if (scatOnly) {
         nd.scatPrec << 1. / (innerW1 * th2InnerTot), 0., 0., cos2lam / (innerW1 * th2InnerTot);
         nd.hasScat = true;
-        if (eLossPerX0 > 0. && elossCumulative) {
-          const double tPrev = elossTypicalColumn(pTot, xx0ElossCum);
-          xx0ElossCum += innerXX0 * innerW1;
-          Deloss(0) += qbp * (elossTypicalColumn(pTot, xx0ElossCum) - tPrev) / pTot;
-        } else if (eLossPerX0 > 0.)
-          Deloss(0) += qbp * elossMostProbable(pTot, innerXX0 * innerW1) / pTot;
+        const ElossColumn colLump = innerCol * innerW1;
+        if (applyELoss && elossCumulative) {
+          const double tPrev = elossTypicalColumn(pTot, colCum);
+          colCum += colLump;
+          Deloss(0) += qbp * (elossTypicalColumn(pTot, colCum) - tPrev) / pTot;
+        } else if (applyELoss)
+          Deloss(0) += qbp * elossMostProbable(pTot, colLump) / pTot;
         nodes[k] = nd;
         continue;
       }
@@ -579,12 +602,17 @@ namespace generalBrokenLine {
       // reaching the inner hits. One kink per segment, no both-adjacent double count.
       double th2 = 0.;
       double xx0Eloss = 0.;
+      ElossColumn colLump;
       if (i == 0) {
-        th2 = (useInner ? (1. - innerW1) : 1.) * th2InnerTot;  // linear split of the TOTAL Highland variance
-        xx0Eloss = innerXX0 * (useInner ? (1. - innerW1) : 1.);
+        const double f = useInner ? (1. - innerW1) : 1.;
+        th2 = f * th2InnerTot;  // linear split of the TOTAL Highland variance
+        xx0Eloss = innerXX0 * f;
+        colLump = innerCol * f;
       } else if (i <= N - 2) {
         xx0Eloss = double(matXX0(i - 1));
         th2 = th2Of(xx0Eloss);
+        if (matCol != nullptr)
+          colLump = matCol[i - 1];
       }
       if (th2 > 0.) {
         nd.scatPrec << 1. / th2, 0., 0., cos2lam / th2;
@@ -592,12 +620,12 @@ namespace generalBrokenLine {
       }
       // this node's q/p increment for the downstream offsets: its material's ionization loss dE enters as
       // d(q/p) = (q/p) dE/p, so |q/p| grows as p drops outward.
-      if (eLossPerX0 > 0. && xx0Eloss > 0. && elossCumulative) {
-        const double tPrev = elossTypicalColumn(pTot, xx0ElossCum);
-        xx0ElossCum += xx0Eloss;
-        Deloss(0) += qbp * (elossTypicalColumn(pTot, xx0ElossCum) - tPrev) / pTot;
-      } else if (eLossPerX0 > 0. && xx0Eloss > 0.)
-        Deloss(0) += qbp * elossMostProbable(pTot, xx0Eloss) / pTot;
+      if (applyELoss && colLump.e > 0. && elossCumulative) {
+        const double tPrev = elossTypicalColumn(pTot, colCum);
+        colCum += colLump;
+        Deloss(0) += qbp * (elossTypicalColumn(pTot, colCum) - tPrev) / pTot;
+      } else if (applyELoss && colLump.e > 0.)
+        Deloss(0) += qbp * elossMostProbable(pTot, colLump) / pTot;
       nodes[k] = nd;
     }
     // hit0 -> PCA backward jacobian: the exact inverse of the forward PCA->hit0 transport, recomputed via the
