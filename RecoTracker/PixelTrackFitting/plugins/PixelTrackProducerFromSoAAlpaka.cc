@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -101,6 +102,7 @@ private:
   const bool throwOnMissing_;
   const bool expandStubs_;
   const bool requireQuadsFromConsecutiveLayers_;
+  const bool setAlgorithmFromIteration_;
   const bool verbose_;
 };
 
@@ -119,6 +121,7 @@ PixelTrackProducerFromSoAAlpaka::PixelTrackProducerFromSoAAlpaka(const edm::Para
       throwOnMissing_(iConfig.getParameter<bool>("throwOnMissing")),
       expandStubs_(iConfig.getParameter<bool>("expandStubs")),
       requireQuadsFromConsecutiveLayers_(iConfig.getParameter<bool>("requireQuadsFromConsecutiveLayers")),
+      setAlgorithmFromIteration_(iConfig.getParameter<bool>("setAlgorithmFromIteration")),
       verbose_(iConfig.getUntrackedParameter<bool>("verbose")) {
   if (minQuality_ == pixelTrack::Quality::notQuality) {
     throw cms::Exception("PixelTrackConfiguration")
@@ -203,6 +206,13 @@ void PixelTrackProducerFromSoAAlpaka::fillDescriptions(edm::ConfigurationDescrip
           "events "
           "whose HLT paths did not run the pixel tracking");
   desc.add<bool>("expandStubs", false);
+  desc.add<bool>("setAlgorithmFromIteration", false)
+      ->setComment(
+          "Stamp each reco::Track with the algorithm name of the CA iteration that found it, taken from the SoA "
+          "iteration column: promptHighPt -> hltPixel, promptLowPt -> lowPtTripletStep, displaced -> "
+          "displacedGeneralStep. None of the three names is produced anywhere else in the Phase-2 HLT menu, so the "
+          "algorithm word splits a merged collection by the iteration it came from (validation labels). False (the "
+          "default) leaves the algorithm at undefAlgorithm.");
 
   // this option for removing tracks with exactly 4 hits is a temporary solution to reduce the fake rate in Phase-2
   // and is to be replaced by a smarter inclusive track selection in the CA directly
@@ -226,6 +236,19 @@ void PixelTrackProducerFromSoAAlpaka::produce(edm::StreamID streamID,
                                                  reco::TrackBase::tight,
                                                  reco::TrackBase::highPurity};
   assert(reco::TrackBase::highPurity == recoQuality[int(pixelTrack::Quality::highPurity)]);
+
+  // CA iteration -> reco::Track algorithm, used only when setAlgorithmFromIteration_ is on. The three
+  // names are existing TrackAlgorithm values that no other Phase-2 HLT module produces, so a merged
+  // collection can be split by the iteration each track came from. A track united across the two arms
+  // by the merger keeps the winning arm's iteration (the merger copies the column, and a twin winner
+  // that absorbs its sibling keeps its own state), so it carries the winner's algorithm.
+  // enum class Iteration : uint8_t { promptHighPt, promptLowPt, displaced, notIteration };
+  constexpr reco::TrackBase::TrackAlgorithm recoAlgo[] = {reco::TrackBase::hltPixel,
+                                                          reco::TrackBase::lowPtTripletStep,
+                                                          reco::TrackBase::displacedGeneralStep,
+                                                          reco::TrackBase::undefAlgorithm};
+  static_assert(std::size(recoAlgo) == pixelTrack::iterationSize + 1,
+                "pixelTrack::Iteration changed size: update the iteration -> algorithm mapping");
 
 #ifdef GPU_DEBUG
   std::cout << "Converting soa helix in reco tracks" << std::endl;
@@ -685,6 +708,10 @@ void PixelTrackProducerFromSoAAlpaka::produce(edm::StreamID streamID,
       track->setQuality(reco::TrackBase::loose);
     }
     track->setQuality(tkq);
+    if (setAlgorithmFromIteration_) {
+      const auto iter = tsoa.view().tracks()[it].iteration();
+      track->setAlgorithm(recoAlgo[std::min<uint32_t>(uint32_t(iter), pixelTrack::iterationSize)]);
+    }
     // filter???
     tracks.emplace_back(track.release(), hits);
   }

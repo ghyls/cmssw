@@ -9,6 +9,7 @@
 #include "HeterogeneousCore/AlpakaInterface/interface/prefixScan.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/workdivision.h"
 
+#include "FWCore/MessageLogger/interface/MessageLogger.h"
 #include "FWCore/Utilities/interface/isFinite.h"
 
 #include "DataFormats/TrackSoA/interface/TracksDevice.h"
@@ -804,6 +805,57 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   // ------------------------------------------------------------------------------
   // -------------------------- Definitions of Launchers --------------------------
   // ------------------------------------------------------------------------------
+
+  // See kCapCountWords in the header for the word layout.
+  struct PreselectionCapCountKernel {
+    template <typename TAcc>
+    ALPAKA_FN_ACC void operator()(TAcc const& acc,
+                                  const int maxPreselectedTracks,
+                                  const int* nPreselectedTracks,
+                                  uint32_t* capCounts) const {
+      if (cms::alpakatools::once_per_grid(acc)) {
+        const int n = *nPreselectedTracks;
+        capCounts[3] += 1u;
+        if (uint32_t(n) > capCounts[0])
+          capCounts[0] = uint32_t(n);
+        if (n > maxPreselectedTracks) {
+          capCounts[1] += 1u;
+          capCounts[2] += uint32_t(n - maxPreselectedTracks);
+        }
+      }
+    }
+  };
+
+  void launchPreselectionCapCount(Queue& queue,
+                                  const int maxPreselectedTracks,
+                                  const int* nPreselectedTracks,
+                                  uint32_t* capCounts) {
+    alpaka::exec<Acc1D>(queue,
+                        cms::alpakatools::make_workdiv<Acc1D>(1u, 1u),
+                        PreselectionCapCountKernel{},
+                        maxPreselectedTracks,
+                        nPreselectedTracks,
+                        capCounts);
+  }
+
+  void reportPreselectionCap(std::string const& moduleLabel,
+                             const int maxPreselectedTracks,
+                             uint32_t const* capCounts) {
+    if (capCounts[3] == 0u)
+      return;  // stream never processed an event
+    if (capCounts[1] == 0u) {
+      edm::LogInfo("PixelTrackHighPuritySelector")
+          << moduleLabel << ": maxPreselectedTracks = " << maxPreselectedTracks << " never bound in this stream ("
+          << capCounts[3] << " events, largest preselection " << capCounts[0] << " tracks).";
+      return;
+    }
+    edm::LogWarning("PixelTrackHighPuritySelector")
+        << moduleLabel << ": the maxPreselectedTracks cap (" << maxPreselectedTracks
+        << ") truncated the preselected list in " << capCounts[1] << " of " << capCounts[3]
+        << " events of this stream, dropping " << capCounts[2]
+        << " tracks in SoA order (largest preselection seen: " << capCounts[0]
+        << " tracks). Raise maxPreselectedTracks.";
+  }
 
   void launchCAPreselection(Queue& queue,
                             const int maxNumberOfTracks,

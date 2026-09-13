@@ -1564,10 +1564,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
     }
   };
 
-  // updateMasking: one thread per track. Pure-write kernel: it never reads mask_view, so there is no
-  // read-after-write dependency across tracks, and every write stores the same constant iterationIndex to
-  // mask_view[hid].recHitMask(), so two kept tracks sharing a hit id store the identical value. The set of
-  // (hid -> iterationIndex) writes is order-independent and needs no atomics.
+  // updateMasking: one thread per track. The mask is cumulative: each masking stage ORs its own
+  // iterationIndex bit into mask_view[hid].recHitMask(), so an earlier stage's mask survives (the
+  // consumers only test != 0, CAPixelDoubletsAlgos.h). The read-modify-write needs no atomics: every
+  // writer of a given hit id ORs the same constant, and the bits already in the mask were copied in
+  // before the kernel started, so any interleaving gives the same result.
   class Kernel_updateMaskingParallel {
   public:
     ALPAKA_FN_ACC void operator()(Acc1D const &acc,
@@ -1590,7 +1591,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
           const uint32_t hid = trackhitd_view[p].id();
           if (caExtension::isOTId(hid))
             continue;
-          mask_view[hid].recHitMask() = iterationIndex;
+          mask_view[hid].recHitMask() |= iterationIndex;
         }
       }
     }

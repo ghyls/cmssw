@@ -23,6 +23,9 @@
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/FixedQueueEDProducer.h"
 
 #include <deque>
+#include <optional>
+
+#include "HeterogeneousCore/AlpakaInterface/interface/memory.h"
 
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/ParameterSet/interface/ConfigurationDescriptions.h"
@@ -67,6 +70,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   private:
     void produce(device::Event&, const device::EventSetup&) override;
     void beginStream(edm::StreamID /*sid*/, Queue queue) override;
+    void endStream(Queue queue) override;
 
     /// Registers the "track_features" input block of `tc` for batch `i_batch`: the prefix of
     /// PixelTrackFeaturesSoA the model consumes (17 fit/cov columns, plus the 14 hit/stub columns when
@@ -165,6 +169,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     const int batchSize_;
     const int warmupIterations_ = 3;
     const device::EDPutToken<TkSoADevice> tokenTrackOut_;
+    // Per-stream counter of what the maxPreselectedTracks cap drops (layout: kCapCountWords).
+    std::optional<cms::alpakatools::device_buffer<Device, uint32_t[]>> capCounts_;
   };
 
   PixelTrackTorchHighPuritySelector::PixelTrackTorchHighPuritySelector(const edm::ParameterSet& iConfig)
@@ -202,6 +208,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   }
 
   void PixelTrackTorchHighPuritySelector::beginStream(edm::StreamID /*sid*/, Queue queue) {
+    // Cap counter: one buffer per stream, zeroed once and accumulated over the whole stream.
+    capCounts_.emplace(cms::alpakatools::make_device_buffer<uint32_t[]>(queue, kCapCountWords));
+    alpaka::memset(queue, *capCounts_, 0);
+
     // Warmup the model with dummy data
 
     // Create temporary feature and score buffers used to warm up the model.
@@ -270,6 +280,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                          alpaka::getPtrNative(d_preselectedTrackIndices),
                          alpaka::getPtrNative(d_preselectionOffsets),
                          alpaka::getPtrNative(d_nPreselectedTracks));
+
+    // Count the tracks the cap below is about to drop (reported at the end of the stream).
+    launchPreselectionCapCount(
+        queue, maxPreselectedTracks_, alpaka::getPtrNative(d_nPreselectedTracks), capCounts_->data());
 
     // 2. Feature extraction. The merged TrackingRecHitsSoA is needed only for the hit/stub features;
     // otherwise pass a null view and nHitsTot = 0.
@@ -354,6 +368,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                 alpaka::getPtrNative(d_nSelectedTracks),
                                                 alpaka::getPtrNative(d_selectedTrackHitOffsets));
     iEvent.emplace(tokenTrackOut_, std::move(tracks_out));
+  }
+
+  void PixelTrackTorchHighPuritySelector::endStream(Queue queue) {
+    if (!capCounts_)
+      return;
+    auto counts = cms::alpakatools::make_host_buffer<uint32_t[]>(queue, kCapCountWords);
+    alpaka::memcpy(queue, counts, *capCounts_);
+    alpaka::wait(queue);
+    reportPreselectionCap(moduleDescription().moduleLabel(), maxPreselectedTracks_, counts.data());
+    capCounts_.reset();
   }
 
   void PixelTrackTorchHighPuritySelector::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {

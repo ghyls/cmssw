@@ -3,6 +3,8 @@
 
 #include <alpaka/alpaka.hpp>
 
+#include <string>
+
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/workdivision.h"
 
@@ -18,6 +20,22 @@
 #include "RecoTracker/PixelSeeding/interface/CAHitsView.h"
 
 namespace ALPAKA_ACCELERATOR_NAMESPACE {
+
+  // maxPreselectedTracks cap accounting. The cap truncates the preselected list silently and in SoA
+  // order, so what it drops is counted and reported at the end of the stream.
+  // Words of the counter: [0] largest nPreselected seen, [1] events over the cap, [2] tracks dropped,
+  // [3] events seen.
+  inline constexpr uint32_t kCapCountWords = 4u;
+
+  // Updates a per-stream device counter. One thread, and a stream's events run in order on its
+  // queue, so the read-modify-writes need no atomics.
+  void launchPreselectionCapCount(Queue& queue,
+                                  const int maxPreselectedTracks,
+                                  const int* nPreselectedTracks,
+                                  uint32_t* capCounts);
+
+  // Shared end-of-stream report of the counter above (host words).
+  void reportPreselectionCap(std::string const& moduleLabel, const int maxPreselectedTracks, uint32_t const* capCounts);
 
   void launchCAPreselection(Queue& queue,
                             const int maxNumberOfTracks,

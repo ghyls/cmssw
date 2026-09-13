@@ -67,6 +67,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       throw cms::Exception("PixelTrackConfiguration")
           << iConfig.getParameter<std::string>("minQuality") + " not supported";
     }
+    // 0 is the "hit is free" value of the mask, so it cannot be used as an iteration tag: a module
+    // configured with it would mask nothing and say nothing.
+    if (iterationIndex_ == 0u) {
+      throw cms::Exception("PixelTrackConfiguration")
+          << "iterationIndex 0 means 'not masked': use a distinct non-zero bit per masking stage.";
+    }
   }
 
   void PixelTracksMaskingSoA::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {
@@ -78,7 +84,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     desc.add<edm::InputTag>("tracksSoASrc",
                             edm::InputTag("pixelTracksHighPtAlpaka"));  // has to be changed for each iteration
     desc.add<std::string>("minQuality", "highPurity");
-    desc.add<uint32_t>("iterationIndex", 0);
+    desc.add<uint32_t>("iterationIndex", 1)
+        ->setComment(
+            "Non-zero tag this stage ORs into the mask of every hit it takes; 0 is the 'hit is free' value and is "
+            "refused. Give each masking stage its own bit (1, 2, 4, ...) so the tags stay readable when several "
+            "stages run.");
     desc.add<bool>("maskAttachedHits", false)
         ->setComment("also mask hits attached by the in-fit extension (default: original-hits policy)");
     desc.add<bool>("applyMasking", true)

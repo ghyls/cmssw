@@ -81,7 +81,8 @@ _hltPhase2PixelTracksIterConverterWithStubs = cms.EDProducer("PixelTrackProducer
     minQuality = cms.string('tight'),
     useOTExtension = cms.bool(True),
     expandStubs = cms.bool(True),
-    requireQuadsFromConsecutiveLayers = cms.bool(False)
+    requireQuadsFromConsecutiveLayers = cms.bool(False),
+    setAlgorithmFromIteration = cms.bool(True)
 )
 phase2CAStubs.toReplaceWith(_hltPhase2PixelTracksIterConverter, _hltPhase2PixelTracksIterConverterWithStubs)
 
@@ -108,6 +109,46 @@ hltPhase2PixelTracksMergedNoHP = _hltPhase2PixelTracksIterConverter.clone(
     trackSrc = "hltPhase2PixelTracksSoAMerger",
 )
 
+# The merged collection split in two by pixel content: tracks with no pixel hit (found from outer
+# tracker stubs alone) behave differently from pixel-seeded ones (dz/eta resolution, z-odd shift),
+# so they are monitored apart. The two cuts are complementary: together they are hltPhase2PixelTracks.
+hltPhase2PixelTracksOTOnly = cms.EDFilter("TrackSelector",
+    src = cms.InputTag("hltPhase2PixelTracks"),
+    cut = cms.string("hitPattern.numberOfValidPixelHits == 0"),
+    filter = cms.bool(False),
+)
+hltPhase2PixelTracksPixSeeded = hltPhase2PixelTracksOTOnly.clone(
+    cut = "hitPattern.numberOfValidPixelHits > 0",
+)
+
+# The same merged collection split by the CA iteration each track came from. The converter stamps the
+# iteration into the reco::Track algorithm word (hltPixel = prompt, displacedGeneralStep = displaced),
+# and these are the general-tracks per-algorithm selectors applied to it. A track united across the two
+# arms by the merger keeps the winning arm's iteration, so it lands in that arm's label; the two labels
+# are therefore complementary and together they are hltPhase2PixelTracks. Every other cut of the
+# selector is opened up, so the split stays a pure decomposition of the collection.
+_hltPhase2PixelTracksByAlgo = _cutsRecoTracks.clone(
+    throwOnMissing = cms.bool(False), # HLT collection might be missing
+    src = "hltPhase2PixelTracks",
+    beamSpot = "hltOnlineBeamSpot",
+    quality = [],
+    minLayer = 0,
+    min3DLayer = 0,
+    minHit = 0,
+    ptMin = 0.0,
+    maxChi2 = 1e9,
+    tip = 1e6,
+    lip = 1e6,
+    minRapidity = -10.0,
+    maxRapidity = 10.0,
+)
+hltPhase2PixelTracksPromptAlgo = _hltPhase2PixelTracksByAlgo.clone(
+    algorithm = ["hltPixel"],
+)
+hltPhase2PixelTracksDisplacedAlgo = _hltPhase2PixelTracksByAlgo.clone(
+    algorithm = ["displacedGeneralStep"],
+)
+
 def _modifyForPhase2(trackvalidator):
     trackvalidator.label = ["hltGeneralTracks", "hltPhase2PixelTracks", "hltInitialStepTrackSelectionHighPurity", "hltPixelLessTracks", "hltWithPixelTracks"]
 
@@ -119,6 +160,10 @@ _stubsCATwoIterPixelLabels = [
     "hltPhase2PixelTracksDisplacedOnly",       # displaced iteration alone, after its HighPurity selector
     "hltPhase2PixelTracksDisplacedOnlyNoHP",   # displaced iteration alone, before its HighPurity selector
     "hltPhase2PixelTracksMergedNoHP",          # both iterations merged, before the final HighPurity selector
+    "hltPhase2PixelTracksOTOnly",              # merged output, tracks without a pixel hit
+    "hltPhase2PixelTracksPixSeeded",           # merged output, tracks with at least one pixel hit
+    "hltPhase2PixelTracksPromptAlgo",          # merged output, tracks found by the prompt iteration
+    "hltPhase2PixelTracksDisplacedAlgo",       # merged output, tracks found by the displaced iteration
 ]
 
 def _modifyForStubsCATwoIter(trackvalidator):
@@ -185,6 +230,10 @@ def _modifyForNGTScoutingLSTStubsCATwoIter(trackvalidator):
         hltPhase2PixelTracksDisplacedOnly +
         hltPhase2PixelTracksDisplacedOnlyNoHP +
         hltPhase2PixelTracksMergedNoHP +
+        hltPhase2PixelTracksOTOnly +
+        hltPhase2PixelTracksPixSeeded +
+        hltPhase2PixelTracksPromptAlgo +
+        hltPhase2PixelTracksDisplacedAlgo +
         hltTrackValidator,
         hltMultiTrackValidationTask
     )
