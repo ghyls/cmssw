@@ -59,7 +59,9 @@
 #       --input ttbarPU=/data/ttbar,displacedPU=/data/susy,qcdPU=/data/qcd --events 300
 #
 # ENVIRONMENT (tuning; the defaults are the ones in use)
-#   hp step: WP_RULE (uniform | global | profile, see train_merged_forest.py --wp-rule),
+#   hp step: WP_RULE (profile | uniform | global, see train_merged_forest.py --wp-rule),
+#            NTREES (1000), ES_ROUNDS (0), PRUNE_TOL (0.002) -- the tree budget and the
+#            size the data chooses inside it,
 #            RECALL (0.995), LABEL (legacy: the deployed file was trained against the narrow
 #            efficiency-selected label; mtv = matched to any TrackingParticle, as the other
 #            two selectors), MIN_DXY (0.5, the |dxyBS| cut of the training rows), DXY_ALPHA
@@ -89,7 +91,7 @@ case "${STEP:-}" in
 esac
 
 BANK=displaced
-SAMPLES=${RT_SAMPLE:-${SAMPLES:-"displacedPU ttbarPU"}}
+SAMPLES=${RT_SAMPLE:-${SAMPLES:-"ttbarPU displacedPU qcdPU bsPU zpPU"}}
 CA_CFI=$(rt_ca_cfi $BANK)
 HP_CFI=$(rt_hp_cfi $BANK)
 MODEL_TAG=${MODEL_NAME:-$(date +%Y%m%d)}
@@ -215,12 +217,13 @@ step_hp() {
   echo ">>> [2/3] train the forest -> $outdir"
   rt_wp_args disp "$cache" "$RT_DATA/${deployed:-none}" "$thr" "$RT_WORK/disp_reference_profile.json" \
     --label "$label"
-  # The displaced recipe: the trainer's defaults (depth 12, up to 450 trees, two-pass tail
-  # re-weight, early stopping on the working-point rule) and 16-bit values in the exported
+  # The displaced recipe: the trainer's defaults (depth 12, two-pass tail re-weight), the
+  # large tree budget with the size chosen by the data, and 16-bit values in the exported
   # file (no --no-fp16).
   local -a train=(--cache "$cache" --out "$outdir" --feats 31 --label "$label"
                   --recall "${RECALL:-0.995}" --arm disp --tag "$tag" --date "$MODEL_TAG"
-                  --threads "${XGB_THREADS:-16}" "${RT_WP_ARGS[@]}")
+                  --threads "${XGB_THREADS:-16}"
+                  "${RT_FOREST_SIZE_ARGS[@]}" "${RT_WP_ARGS[@]}")
   [ -n "${DXY_ALPHA:-}" ] && train+=(--dxy-alpha "$DXY_ALPHA")
   # shellcheck disable=SC2206
   [ -n "${TRAIN_EXTRA:-}" ] && train+=(${TRAIN_EXTRA})

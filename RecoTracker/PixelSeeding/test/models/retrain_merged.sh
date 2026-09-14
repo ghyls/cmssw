@@ -48,8 +48,10 @@
 #   ./retrain_merged.sh hp   --work /w --dataset /w/trackNano_ttbarPU_merged.root --deploy
 #
 # ENVIRONMENT (tuning; the defaults are the ones in use)
-#   hp step: WP_RULE (uniform | global | profile, see train_merged_forest.py --wp-rule),
-#            RECALL (0.995), NTREES (900), FAKE_REGION_WEIGHT ("abseta:1.2:1.8:1.5,absdxy:1:inf:1.5",
+#   hp step: WP_RULE (profile | uniform | global, see train_merged_forest.py --wp-rule),
+#            NTREES (1000), ES_ROUNDS (0), PRUNE_TOL (0.002) -- the tree budget and the
+#            size the data chooses inside it,
+#            RECALL (0.995), FAKE_REGION_WEIGHT ("abseta:1.2:1.8:1.5,absdxy:1:inf:1.5",
 #            the training-loss up-weighting of fakes in the |eta| band and at large |dxyBS|),
 #            TAG (wp, the tag in the file name), XGB_THREADS (16), MODEL_NAME (the date in the
 #            file name, today), TRAIN_EXTRA (further train_merged_forest.py options)
@@ -76,7 +78,7 @@ case "${STEP:-}" in
 esac
 
 BANK=merged
-SAMPLES=${RT_SAMPLE:-${SAMPLES:-"ttbarPU displacedPU qcdPU"}}
+SAMPLES=${RT_SAMPLE:-${SAMPLES:-"ttbarPU displacedPU qcdPU bsPU zpPU"}}
 HP_CFI=$(rt_hp_cfi $BANK)
 MODEL_TAG=${MODEL_NAME:-$(date +%Y%m%d)}
 # The seven pixel-cluster columns the merged selector reads after the 31 + 4 provenance
@@ -157,15 +159,16 @@ step_hp() {
     --feats 35 --abi-order "$ABI_ORDER" --extra-cols "$CLUSTER_COLS"
   # The merged recipe: 42 columns in the selector's order; duplicates count as negatives in
   # the loss and are left out of the recall axis; fakes in the |eta| ~ 1.5 band and at large
-  # |dxyBS| weigh 1.5x in the loss; up to 900 trees; full-precision values in the exported file.
+  # |dxyBS| weigh 1.5x in the loss; a large tree budget with the size chosen by the data;
+  # full-precision values in the exported file.
   local -a train=(--cache "$cache" --out "$outdir"
                   --feats 35 --abi-order "$ABI_ORDER" --extra-cols "$CLUSTER_COLS"
                   --label mtv --recall "${RECALL:-0.995}" --arm merged
                   --recall-axis A_nodup --dup-as-fake 1.0
                   --fake-region-weight "${FAKE_REGION_WEIGHT:-abseta:1.2:1.8:1.5,absdxy:1:inf:1.5}"
-                  --ntrees "${NTREES:-900}" --no-fp16 --seed 0
+                  --no-fp16 --seed 0
                   --tag "$tag" --date "$MODEL_TAG" --threads "${XGB_THREADS:-16}"
-                  "${RT_WP_ARGS[@]}")
+                  "${RT_FOREST_SIZE_ARGS[@]}" "${RT_WP_ARGS[@]}")
   # shellcheck disable=SC2206
   [ -n "${TRAIN_EXTRA:-}" ] && train+=(${TRAIN_EXTRA})
   rt_run python3 "$RT_TRAINER" "${train[@]}"
