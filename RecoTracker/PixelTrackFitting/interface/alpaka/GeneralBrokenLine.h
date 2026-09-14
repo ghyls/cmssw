@@ -217,11 +217,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
     bool hasScat = false;
   };
 
+  //!< the ionization column of a path, as the material walk accumulates it (BrokenLine.h segmentWalk)
   using ElossColumn = blMaterialMap::ElossColumn;
 
   // Constants of the two ionization energy-loss laws below (elossMostProbable, elossTypicalColumn): both
   // evaluate the same Landau xi on the same column and differ only in which statistic of the loss
-  // distribution they return. The medium is no longer a constant: every material quantity comes from the
+  // distribution they return. The medium is not a constant: every material quantity comes from the
   // column the material map's dE/dx lattice produced for the path actually walked.
   namespace elossMedium {
     constexpr double kPionMass = 0.13957;           // pion mass [GeV]
@@ -356,11 +357,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
       // thickness.
       bool scatteringLogAtTotal = false,
       // Charges each gap the cumulative-column typical loss from the vertex to that node (elossTypicalColumn)
-      // rather than the most-probable loss of its own lump (producer parameter useCumulativeEloss).
+      // rather than the most-probable loss of its own lump.
+      // These model switches are not configurable: the merger's refit call sets them
+      // (PixelTracksSoAMerger.cc), the CA path leaves them at these defaults.
       bool elossCumulative = false,
       // Ionization columns of the same lumps, from the same material walk (BrokenLine.h): matCol[g] for gap g,
-      // innerCol for the beamline -> hit0 segment. The energy-loss laws read them; without them the
-      // correction charges nothing.
+      // innerCol for the beamline -> hit0 segment. The energy-loss laws read them; without them applyELoss
+      // charges nothing.
       const ElossColumn* matCol = nullptr,
       const ElossColumn& innerCol = ElossColumn{}) {
     constexpr int nNodes = N + 2;
@@ -545,11 +548,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
         nd.scatPrec << 1. / (innerW1 * th2InnerTot), 0., 0., cos2lam / (innerW1 * th2InnerTot);
         nd.hasScat = true;
         const ElossColumn colLump = innerCol * innerW1;
-        if (eLossPerX0 > 0. && elossCumulative) {
+        if (applyELoss && elossCumulative) {
           const double tPrev = elossTypicalColumn(acc, pTot, colCum);
           colCum += colLump;
           Deloss(0) += qbp * (elossTypicalColumn(acc, pTot, colCum) - tPrev) / pTot;
-        } else if (eLossPerX0 > 0.)
+        } else if (applyELoss)
           Deloss(0) += qbp * elossMostProbable(acc, pTot, colLump) / pTot;
         nodes[k] = nd;
         posPrev = posCur;  // roll the window before the measurement-less early-out
@@ -607,11 +610,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
       }
       // this node's q/p increment for the downstream offsets: its material's ionization loss dE enters as
       // d(q/p) = (q/p)*dE/p, so |q/p| grows as the track loses momentum outward.
-      if (eLossPerX0 > 0. && colLump.e > 0. && elossCumulative) {
+      if (applyELoss && colLump.e > 0. && elossCumulative) {
         const double tPrev = elossTypicalColumn(acc, pTot, colCum);
         colCum += colLump;
         Deloss(0) += qbp * (elossTypicalColumn(acc, pTot, colCum) - tPrev) / pTot;
-      } else if (eLossPerX0 > 0. && colLump.e > 0.)
+      } else if (applyELoss && colLump.e > 0.)
         Deloss(0) += qbp * elossMostProbable(acc, pTot, colLump) / pTot;
       nodes[k] = nd;
       if (k == hOff) {  // hit0: retained for the backward jacHit0ToPca below
@@ -688,11 +691,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
                                                           // Highland's log at the track TOTAL rather than per
                                                           // gap; see prepareGblData.
                                                           bool scatteringLogAtTotal = false,
-                                                          // Cumulative-column typical-loss law (producer
-                                                          // parameter useCumulativeEloss; elossTypicalColumn).
+                                                          // Cumulative-column typical-loss law
+                                                          // (elossTypicalColumn); see prepareGblData.
                                                           bool elossCumulative = false,
-                                                          // the same lumps' ionization columns, see
-                                                          // prepareGblData
+                                                          // Ionization columns of the same lumps; see
+                                                          // prepareGblData.
                                                           const ElossColumn* matCol = nullptr,
                                                           const ElossColumn& innerCol = ElossColumn{}) {
     const double cx = fast_fit(0), cy = fast_fit(1), R = fast_fit(2);
@@ -848,11 +851,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
         nd.scatPrec << 1. / th2, 0., 0., cos2lam / th2;
         nd.hasScat = true;
       }
-      if (eLossPerX0 > 0. && colLump.e > 0. && elossCumulative) {
+      if (applyELoss && colLump.e > 0. && elossCumulative) {
         const double tPrev = elossTypicalColumn(acc, pTot, colCum);
         colCum += colLump;
         Deloss(0) += qbp * (elossTypicalColumn(acc, pTot, colCum) - tPrev) / pTot;
-      } else if (eLossPerX0 > 0. && colLump.e > 0.)
+      } else if (applyELoss && colLump.e > 0.)
         Deloss(0) += qbp * elossMostProbable(acc, pTot, colLump) / pTot;
       nodes[k] = nd;
       posPrev = posCur;
@@ -870,11 +873,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
             carryOffset(nd.jacToPrev, posCur, sTotCur - sTotPrev);
           nd.scatPrec << 1. / th2, 0., 0., cos2lam / th2;
           nd.hasScat = true;
-          if (eLossPerX0 > 0. && colLump.e > 0. && elossCumulative) {
+          if (applyELoss && colLump.e > 0. && elossCumulative) {
             const double tPrev = elossTypicalColumn(acc, pTot, colCum);
             colCum += colLump;
             Deloss(0) += qbp * (elossTypicalColumn(acc, pTot, colCum) - tPrev) / pTot;
-          } else if (eLossPerX0 > 0. && colLump.e > 0.)
+          } else if (applyELoss && colLump.e > 0.)
             Deloss(0) += qbp * elossMostProbable(acc, pTot, colLump) / pTot;
           nodes[k] = nd;
           posPrev = posCur;
@@ -948,15 +951,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
         return false;  // material present but no scattering variance to place (the Highland factor vanishes)
       // the path length must follow the position the node ends up at: curvilinearJacobian is handed both the
       // geometric displacement and the arc, and the two have to be the same step.
-      emitScat(3 + 2 * g,
-               px,
-               py,
-               pz,
-               double(sTotal(g + 1)) - (hi - sa) / invn,
-               w1 * th2Gap,
-               matCol != nullptr ? matCol[g] * w1 : ElossColumn{});
+      const ElossColumn colGap = (matCol != nullptr) ? matCol[g] : ElossColumn{};
+      emitScat(3 + 2 * g, px, py, pz, double(sTotal(g + 1)) - (hi - sa) / invn, w1 * th2Gap, colGap * w1);
       const double wArr = last ? 0. : (1. - w1);
-      emitHit(4 + 2 * g, g + 1, wArr * th2Gap, matCol != nullptr ? matCol[g] * wArr : ElossColumn{});
+      emitHit(4 + 2 * g, g + 1, wArr * th2Gap, colGap * wArr);
       offPrevX = offArrX;
       offPrevY = offArrY;
       offPrevZ = offArrZ;
@@ -1302,6 +1300,45 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine {
     M(3, 1) = dcot_dtheta;
     M(4, 4) = 1.;
     helixCov = M * perigeeCov * M.transpose();
+  }
+
+  // Stub bend the fitted circle predicts at a stub node, in the producer's units: the producer publishes
+  // dPhiDr = (phi_outer - phi_inner) / dr_effective with dr_effective = separation / (nR + nZ z/r), (nR, nZ) the
+  // module normal in the (r, z) plane; following the fitted circle across the same separation gives
+  //     dPhiDr_fit = sin(beta) (nR + nZ z/r) / (r (nR cos(beta) + nZ cot(theta))),
+  // with beta the angle between the track's transverse direction and the radial one at the hit. The separation
+  // cancels, and the impact parameter sits in the circle centre. Returns false when the node is degenerate.
+  template <typename TAcc>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE bool gblStubBendPrediction(const TAcc& acc,
+                                                            double cx,
+                                                            double cy,
+                                                            double radius,
+                                                            int qCharge,
+                                                            double cotTheta,
+                                                            double x,
+                                                            double y,
+                                                            double z,
+                                                            double nR,
+                                                            double nZ,
+                                                            double& dPhiDr) {
+    dPhiDr = 0.;
+    const double r2 = x * x + y * y;
+    if (!(r2 > 1.e-8) || !(radius > 1.e-8))
+      return false;
+    const double r = alpaka::math::sqrt(acc, r2);
+    const double ux = (x - cx) / radius, uy = (y - cy) / radius;  // outward radial unit vector of the circle
+    const double un = alpaka::math::sqrt(acc, ux * ux + uy * uy);
+    if (!(un > 1.e-6))
+      return false;
+    // direction of travel: q (u_y, -u_x), the same convention gblHelixAtPca builds the centre with
+    const double tx = double(qCharge) * uy / un, ty = -double(qCharge) * ux / un;
+    const double cosBeta = (tx * x + ty * y) / r;   // along e_r
+    const double sinBeta = (-tx * y + ty * x) / r;  // along e_phi
+    const double den = nR * cosBeta + nZ * cotTheta;
+    if (!(alpaka::math::abs(acc, den) > 1.e-6))
+      return false;
+    dPhiDr = sinBeta * (nR + nZ * z / r) / (r * den);
+    return true;
   }
 
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE::generalBrokenLine

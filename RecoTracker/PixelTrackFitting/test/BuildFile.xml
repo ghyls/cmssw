@@ -49,6 +49,42 @@
   <flags CXXFLAGS="-g"/>
 </bin>
 
+<bin name="testGblFitDevice" file="alpaka/testGblFitDevice.dev.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
+<bin file="testGblJacobian.cc" name="testGblJacobian">
+  <use name="eigen"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <use name="DataFormats/GeometryVector"/>
+  <use name="MagneticField/Engine"/>
+  <use name="TrackingTools/AnalyticalJacobians"/>
+  <use name="TrackingTools/TrajectoryParametrization"/>
+  <flags CXXFLAGS="-g"/>
+</bin>
+
+<bin file="testGblPerigee.cc" name="testGblPerigee">
+  <use name="eigen"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <use name="DataFormats/GeometryVector"/>
+  <use name="MagneticField/Engine"/>
+  <use name="TrackingTools/TrajectoryState"/>
+  <flags CXXFLAGS="-g"/>
+</bin>
+
+<bin file="testPerigeeJacobian.cc" name="testPerigeeJacobian">
+  <use name="eigen"/>
+  <use name="DataFormats/GeometryVector"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <use name="DataFormats/GeometrySurface"/>
+  <use name="DataFormats/TrajectoryState"/>
+  <flags CXXFLAGS="-g"/>
+</bin>
+
 <bin file="testEigenJacobian.cpp">
   <use name="eigen"/>
   <use name="DataFormats/GeometrySurface"/>
@@ -97,7 +133,23 @@
   <flags ALPAKA_BACKENDS="1"/>
 </bin>
 
+<bin name="testGblStubTestDevice" file="alpaka/testGblStubTestDevice.dev.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
 <bin name="testBLStubCovDevice" file="alpaka/testBLStubCovDevice.dev.cc">
+  <use name="alpaka"/>
+  <use name="catch2"/>
+  <use name="HeterogeneousCore/AlpakaInterface"/>
+  <use name="RecoTracker/PixelTrackFitting"/>
+  <flags ALPAKA_BACKENDS="1"/>
+</bin>
+
+<bin name="testBLFastFieldDevice" file="alpaka/testBLFastFieldDevice.dev.cc">
   <use name="alpaka"/>
   <use name="catch2"/>
   <use name="HeterogeneousCore/AlpakaInterface"/>
@@ -119,22 +171,6 @@
   <use name="RecoTracker/PixelTrackFitting"/>
   <flags CXXFLAGS="-g"/>
   <flags NO_TESTRUN="1"/>
-</bin>
-
-<bin name="testBLStubCovDevice" file="alpaka/testBLStubCovDevice.dev.cc">
-  <use name="alpaka"/>
-  <use name="catch2"/>
-  <use name="HeterogeneousCore/AlpakaInterface"/>
-  <use name="RecoTracker/PixelTrackFitting"/>
-  <flags ALPAKA_BACKENDS="1"/>
-</bin>
-
-<bin name="testBLFastFieldDevice" file="alpaka/testBLFastFieldDevice.dev.cc">
-  <use name="alpaka"/>
-  <use name="catch2"/>
-  <use name="HeterogeneousCore/AlpakaInterface"/>
-  <use name="RecoTracker/PixelTrackFitting"/>
-  <flags ALPAKA_BACKENDS="1"/>
 </bin>
 
 <!-- The Landau energy-loss law of a composite ionization column (BLMaterialMap.h). -->
@@ -176,14 +212,6 @@
   <flags EDM_PLUGIN="1"/>
 </library>
 <test name="testBLMapsCheck" command="cmsRun ${LOCALTOP}/src/RecoTracker/PixelTrackFitting/test/blMapsCheck_cfg.py"/>
-<bin file="testPerigeeJacobian.cc" name="testPerigeeJacobian">
-  <use name="eigen"/>
-  <use name="DataFormats/GeometryVector"/>
-  <use name="RecoTracker/PixelTrackFitting"/>
-  <use name="DataFormats/GeometrySurface"/>
-  <use name="DataFormats/TrajectoryState"/>
-  <flags CXXFLAGS="-g"/>
-</bin>
 
 <library file="BLElossTruthDump.cc" name="RecoTrackerPixelTrackFittingTestBLElossTruthDump">
   <use name="CommonTools/UtilAlgos"/>

@@ -17,6 +17,7 @@
 #include <alpaka/alpaka.hpp>
 
 #include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsSoA.h"
+#include "DataFormats/TrackingRecHitSoA/interface/StubsSoA.h"  // reco::StubFlags
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
 #include "RecoTracker/PixelSeeding/interface/CAGeometrySoA.h"
 #include "RecoTracker/PixelTrackFitting/interface/alpaka/BrokenLine.h"
@@ -772,14 +773,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // Phase-buffer lane stride (doubles): the per-lane cross-launch scratch of the Kernel_BLFitPhase*
-  // pipeline, indexed by the named slots below. Slots [64..104] hold the iteration-invariant tail:
-  //   [64..64+N-1] matXX0     the material walk (a function of the hit positions and of the reference it
-  //                           was run with: the cache freezes it at the first linearization's reference)
-  //   [64+N]       innerXX0   the upstream segment, at the end of the window prepareGblFitData's matCached
-  //                           contract reads (matCached[n]); the window is sized for N <= 12
-  //   [77] [78]    innerD1/W1 the upstream segment's two-thin split
-  //   [79]         bFieldEff  effective field of this linearization, invariant across its phases
+  // Phase-buffer lane stride (doubles): the per-lane cross-launch scratch of the Kernel_BLFitPhase* pipeline,
+  // indexed by the named slots below. Slots [64..104] hold the iteration-invariant tail: [64..64+N-1] matXX0
+  // (the material walk, frozen at the first linearization's reference), [64+N] innerXX0 (the upstream
+  // segment; the window is sized for N <= 12), [77] [78] innerD1/W1 (its two-thin split), [79] bFieldEff.
   constexpr int kBLPhaseJacBack = 0;     // [0..24]  hit0 -> PCA backward jacobian (hits-only node layout)
   constexpr int kBLPhaseUsedInner = 25;  // 1 if the inner-node layout was built for this lane
   constexpr int kBLPhaseQCharge = 26;
@@ -907,10 +904,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         innerD1 = phase[kBLPhaseInnerD1];
         innerW1 = phase[kBLPhaseInnerW1];
       } else {
-        // one rule for the whole trajectory: the beamline->hit0 moments come from the same cell walk
-        // as the gaps (its W is the innerXX0 already stored).
-        const double rHit0 = alpaka::math::sqrt(acc, hits(0, 0) * hits(0, 0) + hits(1, 0) * hits(1, 0));
-        brokenline::segmentXX0Moments(acc, rhoMap_, 0., 0., rHit0, hits(2, 0), innerD1, innerW1);
+        // one rule for the whole trajectory: the upstream (PCA->hit0) moments come from the same cell
+        // walk as the gaps, run once inside prepareGblFitData (its W is the innerXX0 already stored).
+        innerD1 = data.innerD1;
+        innerW1 = data.innerW1;
       }
       if (matFromPhase_) {
         for (int i = 0; i < int(N); ++i) {
@@ -1244,6 +1241,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // appended extra.
     const uint8_t* __restrict__ fitHitIsCore_ = nullptr;
     bool coreProtect_ = false;
+    // Wrong-stub test: per fit slot, the stub's own bend and precision and its module normal in the
+    // (r, z) plane, {dPhiDr, dPhiDrErrorPrec, nR, nZ} at 4*(lane*kRefitFitIdQuota + i), written by
+    // Kernel_BLFastFitRefit. A negative precision (pixel, raw single-sensor OT hit, degenerate stub)
+    // means no bend measurement and the node is tested on its position rows only. Null: test off.
+    const float* __restrict__ fitStubBend_ = nullptr;
     // Normalized (Bz,Br) r-z field map. When set, the re-solve's curvature->pT conversion + PCA perigee
     // use a per-track hit-averaged effective field; when null (as on the CA path) they use the scalar
     // bField.
@@ -1303,6 +1305,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       generalBrokenLine::GblNodeData* fitNodes = (usedSplit || usedInner) ? gnodes : gnodes + 1;
       const int nFitNodes = usedSplit ? (kSplitN + 1) : (usedInner ? (N + 2) : N);
       auto uIdxOf = [](int k) { return 1 + 2 * k; };
+      constexpr double kOutlierChi2Cut = 13.8;    // ~99.9% of the chi2 distribution for 2 dof (position, u+v)
+      constexpr double kStubBendChi2Cut = 10.83;  // ~99.9% of the chi2 distribution for 1 dof (stub bend)
+      // Largest score of any droppable node, in units of its own cut: > 1 means the node failed a test.
       double worst = 0.;
       int worstNode = -1;
       // Fit-hit index of the current measurement node (number of measured nodes before k), used to look up
@@ -1311,6 +1316,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       const bool coreProtectOn = coreProtect_ && fitHitIsCore_ != nullptr;
       // Worst pull among protected (core) nodes; it drives the abstain rule below.
       double worstCore = 0.;
+      // The fitted circle the out phase published for this lane: centre, radius and cot(theta), with the
+      // impact parameter in the centre. It is the track side of the wrong-stub test below.
+      const double fitCx = phase[kBLPhaseNextRef + 0], fitCy = phase[kBLPhaseNextRef + 1];
+      const double fitR = phase[kBLPhaseNextRef + 2];
+      const double fitCot = (phase[kBLPhaseNextRef + 3] != 0.) ? -double(qCharge) / phase[kBLPhaseNextRef + 3] : 0.;
+      const bool stubTestOn = fitStubBend_ != nullptr && fitR > 0.;
       for (int k = 0; k < nFitNodes; ++k) {
         if (!fitNodes[k].hasMeas)
           continue;
@@ -1330,21 +1341,48 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         if (s00 <= 0. || s11 <= 0. || det <= 0.)
           continue;  // numerically non-PD residual covariance: no reliable pull
         const double pull2 = (ru * (s11 * ru - s01 * rv) + rv * (s00 * rv - s01 * ru)) / det;
+        // Ranked by how far each statistic stands past its own cut, so the two criteria are comparable.
+        double score = pull2 / kOutlierChi2Cut;
         if (isCoreNode) {
-          if (pull2 > worstCore)  // shadow only: never a drop candidate
-            worstCore = pull2;
+          if (score > worstCore)  // shadow only: never a drop candidate
+            worstCore = score;
           continue;
         }
-        if (pull2 > worst) {
-          worst = pull2;
+        // Wrong-stub test: the bend this stub measured against the bend the fitted circle has at its
+        // radius, one degree of freedom on the stub's own precision. It is a test and not a fit row, so
+        // it adds no ndof; a stub that fails it is dropped exactly like a position outlier.
+        if (stubTestOn) {
+          const float* sb =
+              fitStubBend_ + 4 * (std::size_t(local_idx) * std::size_t(kRefitFitIdQuota) + std::size_t(diThis));
+          const double sigma = double(sb[1]);
+          double bendFit = 0.;
+          if (sigma > 0. && generalBrokenLine::gblStubBendPrediction(acc,
+                                                                     fitCx,
+                                                                     fitCy,
+                                                                     fitR,
+                                                                     qCharge,
+                                                                     fitCot,
+                                                                     hits(0, diThis),
+                                                                     hits(1, diThis),
+                                                                     hits(2, diThis),
+                                                                     double(sb[2]),
+                                                                     double(sb[3]),
+                                                                     bendFit)) {
+            const double d = (double(sb[0]) - bendFit) / sigma;
+            const double bendScore = d * d / kStubBendChi2Cut;
+            if (bendScore > score)
+              score = bendScore;
+          }
+        }
+        if (score > worst) {
+          worst = score;
           worstNode = k;
         }
       }
-      constexpr double kOutlierChi2Cut = 13.8;  // ~99.9% of the chi2 distribution for 2 dof
       // Abstain when the largest-pull measured node is a protected core node: the evidence points at a hit
       // the stage may not delete, and dropping the next-worst instead would be a different hypothesis.
       const bool abstain = coreProtectOn && worstCore > worst;
-      if (!abstain && worstNode >= 0 && worst > kOutlierChi2Cut) {
+      if (!abstain && worstNode >= 0 && worst > 1.) {
         fitNodes[worstNode].hasMeas = false;
         // The dropped measurement node maps to fit hit i = number of measured nodes before it; publish its
         // raw id, fitHitId_[lane*kRefitFitIdQuota + i], so the merger drops it from the emitted hit list.
@@ -1402,6 +1440,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     const uint32_t* __restrict__ fitHitId = nullptr;
     uint32_t* __restrict__ dropHitId = nullptr;
     const uint8_t* __restrict__ fitHitIsCore = nullptr;
+    const float* __restrict__ fitStubBend = nullptr;
     bool iterFromPhase = false;
     bool matFromPhase = false;
     bool fieldFromPhase = false;
@@ -1488,6 +1527,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                                cfg.dropHitId,
                                                                cfg.fitHitIsCore,
                                                                cfg.coreProtect,
+                                                               cfg.fitStubBend,
                                                                cfg.bMap,
                                                                cfg.bFieldFromPhase,
                                                                cfg.chargeSymmetric};
@@ -1843,6 +1883,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // below offsetStubs, not a bit30 OT tag), read by the outlier phase to restrict the drop to appended
     // nodes. Null means no such record is kept.
     uint8_t* __restrict__ fitHitIsCore_ = nullptr;
+    // Wrong-stub test input, four floats per fit slot at 4*(lane*kRefitFitIdQuota + i):
+    // {dPhiDr, dPhiDrErrorPrec, nR, nZ}, the stub's own bend and precision and its module normal in the
+    // (r, z) plane. A slot with no bend measurement gets a negative precision. Null means no such record.
+    float* __restrict__ fitStubBend_ = nullptr;
     // Device-resident lane range of this bin for this round, {firstLane, nLanes} at
     // pLaneRange_[kRefitRangeStride*(N-kRefitMinN)], written by Kernel_BLRefitLaneRanges. Null means base 0
     // and the whole buffer stride. Decides where a lane lands, never a value.
@@ -1933,6 +1977,37 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           if (fitHitIsCore_ != nullptr) {
             const bool isCore = !caOTHitTag::isOTId(hid) && (!hasStubsRt || int32_t(hid) < int32_t(hh.offsetStubs()));
             fitHitIsCore_[std::size_t(lane) * std::size_t(kRefitFitIdQuota) + i] = isCore ? uint8_t(1) : uint8_t(0);
+          }
+          // The stub bend and the module normal the outlier phase tests this slot with. Raw single-sensor
+          // OT hits and pixels carry no bend and are marked with a negative precision.
+          if (fitStubBend_ != nullptr) {
+            float* sb = fitStubBend_ + 4 * (std::size_t(lane) * std::size_t(kRefitFitIdQuota) + i);
+            sb[0] = 0.f;
+            sb[1] = -1.f;
+            sb[2] = 0.f;
+            sb[3] = 0.f;
+            if (!caOTHitTag::isOTId(hid) && hasStubsRt && reco::isStub(hh, int32_t(hid)) &&
+                hh[hid].dPhiDrErrorPrec() > 0.f) {
+              const uint8_t flags = hh[hid].stubFlags();
+              const float zg = hh[hid].zGlobal();
+              const float rg = alpaka::math::sqrt(
+                  acc, hh[hid].xGlobal() * hh[hid].xGlobal() + hh[hid].yGlobal() * hh[hid].yGlobal());
+              float nR = 1.f, nZ = 0.f;
+              if (!::reco::StubFlags::isBarrel(flags)) {  // disc: the sensors are stacked along z
+                nR = 0.f;
+                nZ = (zg >= 0.f) ? 1.f : -1.f;
+              } else if (!::reco::StubFlags::isFlat(flags)) {  // tilted barrel: the stack points at the origin
+                const float nrm = alpaka::math::sqrt(acc, rg * rg + zg * zg);
+                if (nrm > 1.e-6f) {
+                  nR = rg / nrm;
+                  nZ = zg / nrm;
+                }
+              }
+              sb[0] = hh[hid].dPhiDr();
+              sb[1] = hh[hid].dPhiDrErrorPrec();
+              sb[2] = nR;
+              sb[3] = nZ;
+            }
           }
           float ge[6];
           float px, py, pz;
@@ -2080,6 +2155,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // enable. With pFitHitIsCore null or coreProtect false the outlier scan considers every node.
     uint8_t* pFitHitIsCore;
     bool coreProtect;
+    // Wrong-stub test table (written by Kernel_BLFastFitRefit, read by the outlier scan). Null: test off.
+    float* pFitStubBend;
     // Fit-consistent curvature->pT conversion field (see Kernel_BLFitPhaseSolve::fieldKernelWeights_).
     // Needs the field map, so it is inert wherever bMap is null.
     bool fieldKernelWeights = false;
@@ -2122,7 +2199,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     constexpr uint32_t kRefitStride = HelixFit<TrackerTraits>::kRefitStride;
     constexpr uint32_t kBin = uint32_t(N) - uint32_t(kRefitMinN);
     constexpr bool hasStubs = true;  // Phase2OTStubs
-    Kernel_BLFastFitRefit<N, kRefitStride> scan{c.otSrc, c.pFitHitId, c.pFitHitIsCore, c.pRange, c.pServed};
+    Kernel_BLFastFitRefit<N, kRefitStride> scan{
+        c.otSrc, c.pFitHitId, c.pFitHitIsCore, c.pFitStubBend, c.pRange, c.pServed};
     alpaka::exec<Acc1D>(c.queue,
                         c.workDivScan,
                         scan,
@@ -2220,6 +2298,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     cfg.fitHitId = c.pFitHitId;
     cfg.dropHitId = c.pDropHitId;
     cfg.fitHitIsCore = c.pFitHitIsCore;
+    cfg.fitStubBend = c.pFitStubBend;
     cfg.outlierReject = c.outlierReject;
     cfg.coreProtect = c.coreProtect;
     cfg.bFieldFromPhase = true;  // the final prep ran on this lane

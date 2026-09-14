@@ -236,91 +236,12 @@ namespace generalBrokenLine {
   //!< the ionization column of a path, as the material walk accumulates it (gblTestMaterial.h)
   using ElossColumn = blMaterialMap::ElossColumn;
 
-  // Constants of the two ionization energy-loss laws below (elossMostProbable, elossTypicalColumn): both
-  // evaluate the same Landau xi on the same column and differ only in which statistic of the loss
-  // distribution they return. Every material quantity comes from the column the material map's dE/dx lattice
-  // produced for the path actually walked; there is no composite constant medium.
-  namespace elossMedium {
-    constexpr double kPionMass = 0.13957;           // pion mass [GeV]
-    constexpr double kElectronMass = 0.5109989e-3;  // electron mass [GeV]
-    constexpr double kK = 0.307075e-3;              // 0.307 MeV cm^2/mol -> GeV
-    // standard Landau: lambda_median - lambda_mode = 1.35578 - (-0.22278)
-    constexpr double kLandauMedianMinusMode = 1.35578 + 0.22278;
-    // hbar omega_p = 28.816 eV sqrt(rho Z/A) (PDG RPP 34.2.5) and the eV -> GeV shift, both as logarithms:
-    // the laws work on the column's log-means and never form I or the plasma energy.
-    constexpr double kLnPlasmaEV = 3.360930788433600;  // ln(28.816)
-    constexpr double kLnGeVinEV = 20.723265836946410;  // ln(1e9)
-  }  // namespace elossMedium
-
-  // Landau scale xi [GeV] and most-probable bracket of a COMPOSITE column at total momentum p (pion mass).
-  // The Landau family is stable, so a column of lumps is one Landau with xi = sum xi_i and, the xi ln xi term
-  // being the location shift of the alpha = 1 stable law,
-  //   Delta_mp = xi [ln(2 me beta^2 gamma^2 xi) + 0.2 - beta^2] - sum_i xi_i [2 ln I_i + delta_i],
-  // i.e. the column needs, besides its electron content, the xi-weighted means of ln I (Bragg additivity)
-  // and of ln rho_e -- exactly what ElossColumn carries. delta follows Sternheimer's parametrization with the
-  // generic Sternheimer-Peierls parameters Geant4 uses for materials without tabulated ones (PDG RPP 34.2.5;
-  // Sternheimer & Peierls, Phys. Rev. B 3 (1971) 3681; Bichsel, Rev. Mod. Phys. 60 (1988) 663).
-  inline bool elossLandau(double p, const ElossColumn& col, double& xi, double& bracket) {
-    xi = 0.;
-    bracket = 0.;
-    if (!(col.e > 0.) || !(p > 0.))
-      return false;
-    constexpr double kLn10 = 2.302585092994046;
-    constexpr double twoLn10 = 2. * kLn10;  // the constant Sternheimer's parametrization rounds to 4.6052
-    constexpr double m = elossMedium::kPionMass;
-    constexpr double me = elossMedium::kElectronMass;
-    constexpr double K = elossMedium::kK;
-    const double E = std::sqrt(p * p + m * m);
-    const double beta2 = p * p / (E * E);
-    const double g = E / m;
-    const double bg2 = beta2 * g * g;  // (beta*gamma)^2
-    xi = 0.5 * K * col.e / beta2;
-    // The column's effective medium enters only through ln I and, via the plasma energy, ln rho_e, and the
-    // column already carries both as logarithms: I and hbar omega_p are never formed.
-    const double lnIeV = col.eLnI / col.e;               // ln(I/eV)
-    const double lnI = lnIeV - elossMedium::kLnGeVinEV;  // ln(I/GeV)
-    const double cbar = 2. * (lnIeV - 0.5 * col.eLnRho / col.e - elossMedium::kLnPlasmaEV) + 1.;
-    const bool soft = lnIeV < 2. * kLn10;  // I < 100 eV
-    const double x1 = soft ? 2. : 3.;
-    const double cbarLim = soft ? 3.681 : 5.215;
-    const double x0 = (cbar < cbarLim) ? 0.2 : (0.326 * cbar - (soft ? 1.0 : 1.5));
-    const double x = 0.5 * std::log(bg2) / kLn10;  // log10(betagamma)
-    double delta = 0.;
-    if (x >= x1) {
-      delta = twoLn10 * x - cbar;
-    } else if (x > x0) {
-      const double a = (cbar - twoLn10 * x0) / ((x1 - x0) * (x1 - x0) * (x1 - x0));
-      const double d = x1 - x;
-      delta = twoLn10 * x - cbar + a * d * d * d;
-    }
-    // ln(2 me beta^2 gamma^2 / I) + ln(xi / I) = ln(2 me beta^2 gamma^2 xi) - 2 ln I
-    bracket = std::log(2. * me * bg2 * xi) - 2. * lnI + 0.2 - beta2 - delta;
-    return true;
-  }
-
-  // Most-probable (Landau) ionization energy loss [GeV] of the column, at total momentum p [GeV]. The
-  // correction has to remove the loss of the typical track, not the unrestricted Bethe-Bloch mean, which
-  // includes the Landau delta-ray tail. MP is not additive across sub-columns (the ln xi term).
-  inline double elossMostProbable(double p, const ElossColumn& col) {
-    double xi, bracket;
-    if (!elossLandau(p, col, xi, bracket))
-      return 0.;
-    const double dmp = xi * bracket;
-    return dmp > 0. ? dmp : 0.;
-  }
-
-  // Typical (median) ionization loss [GeV] of the CUMULATIVE column, selected over the per-lump most-probable
-  // law by the runtime flag elossCumulative. The Landau family is stable under convolution, so the typical
-  // loss of a multi-lump column is the single-column law at the SUMMED column, not the sum of per-lump MPVs,
-  // and median - mode = (1.35578 + 0.22278) xi for a Landau (PDG RPP 34.2.9). Callers charge per-node
-  // increments T(col_cum + col_lump) - T(col_cum).
-  inline double elossTypicalColumn(double p, const ElossColumn& col) {
-    double xi, bracket;
-    if (!elossLandau(p, col, xi, bracket))
-      return 0.;
-    const double dmp = xi * bracket;
-    return (dmp > 0. ? dmp : 0.) + elossMedium::kLandauMedianMinusMode * xi;
-  }
+  // The ionization energy-loss laws of a column live with the column itself (BLMaterialMap.h); they are
+  // used here under their own names.
+  namespace elossMedium = blMaterialMap::elossMedium;
+  using blMaterialMap::elossLandau;
+  using blMaterialMap::elossMostProbable;
+  using blMaterialMap::elossTypicalColumn;
   // Fractional stand-off of the equivalent upstream scatterer from the PCA and from hit0.
   inline constexpr double kSplitStandOff = 0.02;
   inline constexpr double kSplitStandOffHi = 0.98;
@@ -985,6 +906,38 @@ namespace generalBrokenLine {
     M(3, 1) = dcot_dtheta;
     M(4, 4) = 1.;
     helixCov = M * perigeeCov * M.transpose();
+  }
+
+  // Host twin of the device gblStubBendPrediction (interface/alpaka/GeneralBrokenLine.h): the stub bend
+  // the fitted circle predicts at a stub node, in the producer's dPhiDr units. See there for the model.
+  inline bool gblStubBendPrediction(double cx,
+                                    double cy,
+                                    double radius,
+                                    int qCharge,
+                                    double cotTheta,
+                                    double x,
+                                    double y,
+                                    double z,
+                                    double nR,
+                                    double nZ,
+                                    double& dPhiDr) {
+    dPhiDr = 0.;
+    const double r2 = x * x + y * y;
+    if (!(r2 > 1.e-8) || !(radius > 1.e-8))
+      return false;
+    const double r = std::sqrt(r2);
+    const double ux = (x - cx) / radius, uy = (y - cy) / radius;
+    const double un = std::sqrt(ux * ux + uy * uy);
+    if (!(un > 1.e-6))
+      return false;
+    const double tx = double(qCharge) * uy / un, ty = -double(qCharge) * ux / un;
+    const double cosBeta = (tx * x + ty * y) / r;
+    const double sinBeta = (-tx * y + ty * x) / r;
+    const double den = nR * cosBeta + nZ * cotTheta;
+    if (!(std::abs(den) > 1.e-6))
+      return false;
+    dPhiDr = sinBeta * (nR + nZ * z / r) / (r * den);
+    return true;
   }
 
 }  // namespace generalBrokenLine

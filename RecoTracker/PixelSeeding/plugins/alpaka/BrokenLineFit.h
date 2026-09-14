@@ -282,6 +282,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       auto fitHitIsCoreDevice = cms::alpakatools::make_device_buffer<uint8_t[]>(
           queue, coreProtectActive ? std::size_t(nt) * std::size_t(maxN) : std::size_t(1));
       uint8_t* const pFitHitIsCore = coreProtectActive ? fitHitIsCoreDevice.data() : nullptr;
+      // Wrong-stub test: per-lane {dPhiDr, dPhiDrErrorPrec, nR, nZ} of each fit slot, written by
+      // Kernel_BLFastFitRefit and read by the outlier scan. Caching-allocator backed like the rest of the
+      // refit scratch; the test runs whenever the outlier stage does.
+      auto fitStubBendDevice = cms::alpakatools::make_device_buffer<float[]>(
+          queue, outlierReject_ ? std::size_t(nt) * std::size_t(maxN) * 4u : std::size_t(1));
+      float* const pFitStubBend = outlierReject_ ? fitStubBendDevice.data() : nullptr;
 
       constexpr uint32_t blockSize = 64;  // scan/compaction work division
       // Fit block dimension kFitBlock, a launch dimension only: the fit kernels are grid-stride loops
@@ -329,6 +335,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                  dropOutlierHitId_,
                                                  pFitHitIsCore,
                                                  coreProtectActive,
+                                                 pFitStubBend,
                                                  fieldKernelWeights_,
                                                  chargeSymmetric_,
                                                  trajectoryCorrections_,
