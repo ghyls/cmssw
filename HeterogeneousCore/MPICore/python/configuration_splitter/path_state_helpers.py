@@ -2,11 +2,9 @@
 functions to add activity filters and path state captures
 """
 
-from collections import defaultdict, deque
-from typing import Dict, Set, List
-
 import FWCore.ParameterSet.Config as cms
-from HLTrigger.Configuration.common import *
+from HLTrigger.Configuration.common import insert_modules_before
+
 
 def add_activity_filter(process, module_name, filter_name):
     filter_object =  cms.EDFilter("PathStateRelease",
@@ -20,7 +18,6 @@ def insert_path_state_capture_before(
     process,
     first_modules_in_a_group,
     capture_name,
-    prefix="PathStateCapture",
 ):
     """
       - create one PathStateCapture EDProducer
