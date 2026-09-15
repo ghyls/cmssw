@@ -1,9 +1,6 @@
 # This module contains functions to edit local and remote processes
-from typing import Dict, List
-
 import FWCore.ParameterSet.Config as cms
-from HLTrigger.Configuration.common import *
-from HeterogeneousCore.MPICore.modules import *
+from HeterogeneousCore.MPICore.modules import MPISource
 
 
 def add_controller_to_local(process, remote_name):
@@ -66,204 +63,103 @@ def create_remote_process(local_process, modules_to_run, remote_process_name, lo
 def is_device_product(prod):
     return prod["type"].startswith("edm::DeviceProduct")
 
-def make_sender_psets(products):
-    psets = []
 
+def _branch_label(module, product_instance):
+    """
+    The product instance name under which a receiver carrying several modules' products
+    registers this one, so that modules producing the same instance name do not collide.
+    """
+    return f"{module}@{product_instance}" if product_instance else module
+
+def _forwarded_products(products):
+    """
+    Every product an MPISender/MPIReceiver pair carries over MPI, as (product, the C++
+    type name to write for it in the configuration).
+    """
     for p in products:
-        if is_device_product(p):
-            continue
+        if not is_device_product(p):
+            yield p, p["type"]
 
-        psets.append(
-            cms.PSet(
-                type=cms.string(p["type"]),
-                name=cms.InputTag(p["module"], p['product_instance'])
-            )
+
+def products_of(products_by_module, modules):
+    return [product for module in modules for product in products_by_module[module]]
+
+def _sender_psets(products):
+    return [
+        cms.PSet(
+            type=cms.string(product_type),
+            name=cms.InputTag(p["module"], p["product_instance"]),
         )
+        for p, product_type in _forwarded_products(products)
+    ]
 
-    return cms.VPSet(*psets)
 
-
-def make_receiver_psets(products):
-    psets = []
-
-    for p in products:
-        if is_device_product(p):
-            continue
-
-        psets.append(
-            cms.PSet(
-                type=cms.string(p["type"]),
-                label=cms.string(p['product_instance'])
-            )
+def _receiver_psets(products, grouped):
+    return [
+        cms.PSet(
+            type=cms.string(product_type),
+            label=cms.string(
+                _branch_label(p["module"], p["product_instance"]) if grouped else p["product_instance"]
+            ),
         )
-
-    return cms.VPSet(*psets)
-
-
-def make_grouped_receiver_psets(products):
-    psets = []
-
-    for p in products:
-        if is_device_product(p):
-            continue
-        
-        if p["product_instance"] == "":
-            label = p["module"]
-        else:
-            label = f"{p['module']}@{p['product_instance']}"
-
-        psets.append(
-            cms.PSet(
-                type=cms.string(p["type"]),
-                label=cms.string(label)
-            )
-        )
-
-    return cms.VPSet(*psets)
+        for p, product_type in _forwarded_products(products)
+    ]
 
 
-def replace_module(process, name, new_module):
-    if hasattr(process, name):
-        delattr(process, name)
-    setattr(process, name, new_module)
-
-
-def create_sender(
-    products,
-    instance,
-    sender_upstream,
-    path_state_capture=None,
-):
+def create_sender(products, instance, upstream, activity=None):
     """
-    Add MPISender for one module.
+    An MPISender carrying `products`, the products of one offloaded module or of several
+    (see products_of()). `activity` names the PathStateCapture whose token decides whether
+    the send happens at all, if the send is gated.
     """
-    sender_products = make_sender_psets(products)
-
-    if path_state_capture is not None:
-        sender = cms.EDProducer(
-            "MPISender",
-            upstream=cms.InputTag(sender_upstream),
-            instance=cms.int32(instance),
-            products=cms.VPSet(*sender_products),
-            activity=cms.InputTag(path_state_capture),
-        )
-    else:
-        sender = cms.EDProducer(
-            "MPISender",
-            upstream=cms.InputTag(sender_upstream),
-            instance=cms.int32(instance),
-            products=cms.VPSet(*sender_products),
-        )
-
-    return sender
-
-
-def create_group_sender(
-    group,
-    all_products,
-    instance,
-    upstream_module,
-    path_state_capture=None,
-):
-    """
-    Add MPISender for multiple modules.
-    """
-    sender_products = []
-    for offloaded_module in group:
-        sender_products.extend(make_sender_psets(all_products[offloaded_module]))
-
-    if path_state_capture is not None:
-        sender = cms.EDProducer(
-            "MPISender",
-            upstream=cms.InputTag(upstream_module),
-            instance=cms.int32(instance),
-            products=cms.VPSet(*sender_products),
-            activity=cms.InputTag(path_state_capture),
-        )
-    else:
-        sender = cms.EDProducer(
-            "MPISender",
-            upstream=cms.InputTag(upstream_module),
-            instance=cms.int32(instance),
-            products=cms.VPSet(*sender_products),
-        )
-
-    return sender
-
-
-def create_group_receiver(
-    group,
-    all_products,
-    instance,
-    receiver_upstream,
-    path_state_capture=False,
-):
-    """
-    MPIReceiver for one module.
-    """
-    receiver_products = []
-    for offloaded_module in group:
-        receiver_products.extend(make_grouped_receiver_psets(all_products[offloaded_module]))
-
-    receiver = cms.EDProducer(
-        "MPIReceiver",
-        upstream=cms.InputTag(receiver_upstream),
+    parameters = dict(
+        upstream=cms.InputTag(upstream),
         instance=cms.int32(instance),
-        products=cms.VPSet(*receiver_products),
-        activity=cms.bool(path_state_capture),
+        products=cms.VPSet(*_sender_psets(products)),
+    )
+    if activity is not None:
+        parameters["activity"] = cms.InputTag(activity)
+
+    return cms.EDProducer("MPISender", **parameters)
+
+
+def create_receiver(products, instance, upstream, activity=False, grouped=False):
+    """
+    The MPIReceiver end of a create_sender() pair. `activity` says whether the sender is
+    gated, in which case the receiver puts the token it carries into the event, for an
+    activity filter to release the path on.
+    """
+    return cms.EDProducer(
+        "MPIReceiver",
+        upstream=cms.InputTag(upstream),
+        instance=cms.int32(instance),
+        products=cms.VPSet(*_receiver_psets(products, grouped)),
+        activity=cms.bool(activity),
     )
 
-    return receiver
 
-
-def create_receiver(
-    products,
-    instance,
-    receiver_upstream,
-    path_state_capture=False,
-):
+def create_receiver_alias(receiver_name, products, module_name):
     """
-    MPIReceiver for one module.
-    """
-    receiver_products = make_receiver_psets(products)
-
-    receiver = cms.EDProducer(
-        "MPIReceiver",
-        upstream=cms.InputTag(receiver_upstream),
-        instance=cms.int32(instance),
-        products=cms.VPSet(*receiver_products),
-        activity=cms.bool(path_state_capture),
-    )
-
-    return receiver
-
-
-def create_receiver_alias(receiver_name,
-    products,
-    module_name
-):
-    """
-    Create module aliases for receiver group
+    The EDAlias that puts a receiver's products back under the offloaded module's own
+    label, so that everything downstream finds them where it did before the split.
     """
     psets = []
 
     for p in products:
         if is_device_product(p):
             continue
-        
-        if p["product_instance"] == "":
-            fromProductInstance_string = module_name
-        else:
-            fromProductInstance_string = f"{module_name}@{p['product_instance']}"
+
+        product_instance = p["product_instance"]
+        fromProductInstance_string = _branch_label(module_name, product_instance)
 
         psets.append(
             cms.PSet(
                 type=cms.string(p["friendly_type_name"]),
                 fromProductInstance=cms.string(fromProductInstance_string),
-                toProductInstance = cms.string(p["product_instance"])
+                toProductInstance = cms.string(product_instance)
             )
         )
-    
+
     alias = cms.EDAlias(
             **{
                 receiver_name: cms.VPSet(*psets)
@@ -271,7 +167,6 @@ def create_receiver_alias(receiver_name,
         )
 
     return alias
-    
 
 
 def make_new_path(
