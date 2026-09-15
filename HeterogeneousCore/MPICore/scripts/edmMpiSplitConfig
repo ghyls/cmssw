@@ -28,23 +28,18 @@ Some TBDs:
 
 """
 
-import argparse
-import pathlib
-import os
 import sys
 
-from HeterogeneousCore.MPICore.configuration_splitter.cpp_name_getter import CPPNameGetter
-from HeterogeneousCore.MPICore.configuration_splitter.module_dependency_analyzer import ModuleDependencyAnalyzer, flatten_all_to_module_list
-from HeterogeneousCore.MPICore.configuration_splitter.editor_functions import *
-from HeterogeneousCore.MPICore.configuration_splitter.path_state_helpers import *
-from HeterogeneousCore.MPICore.configuration_splitter.multiple_remotes_option_parser import *
-from HeterogeneousCore.MPICore.configuration_splitter.split_remote import *
 from FWCore.ParameterSet.processFromFile import processFromFile
+from HeterogeneousCore.MPICore.configuration_splitter.editor_functions import annotate_portable_types
+from HeterogeneousCore.MPICore.configuration_splitter.helper_jobs import ProcessDump, SerialiserTypeGetter
+from HeterogeneousCore.MPICore.configuration_splitter.multiple_remotes_option_parser import parse_mpi_style_args
+from HeterogeneousCore.MPICore.configuration_splitter.split_remote import split_remote
 
 
 def main():
     configs = parse_mpi_style_args(sys.argv[1:])
-    
+
     if configs[0].verbose:
         for i, cfg in enumerate(configs):
             print(f"\n=== Process {i} ===")
@@ -52,40 +47,72 @@ def main():
 
     local_process = processFromFile(str(configs[0].config))
 
-    # -- get c++ names --
+    # -- Get product names and their dependency graph from the framework --
 
     if configs[0].verbose:
-        if not configs[0].reuse_cpp_names:
-            print("Launching cmsRun to get C++ names of all products in the process...")
+        if configs[0].reuse_dumps:
+            print("Trying to read the product names and dependency graph from existing files...")
         else:
-            print("Trying to get C++ product names from existing file...")
+            print("Launching cmsRun to dump the product names and dependency graph of the process...")
 
-    cpp_names_getter = CPPNameGetter(local_process, reuse=configs[0].reuse_cpp_names)
-    cpp_names_of_the_products = cpp_names_getter.get_cpp_types_of_module_products()
+    cpp_names_of_the_products, dependency_graph = ProcessDump(local_process, reuse=configs[0].reuse_dumps).run()
 
     if configs[0].verbose:
-        print("Got C++ product names")
-    
-    num_remotes = len(configs)
-    
-    for i, process_args in enumerate(configs):
-        if process_args.remote_process_name is None or process_args.remote_process_name == "":
-            process_args.remote_process_name = f"REMOTE{i}"
-        if process_args.output_remote is None:
-            if num_remotes == 1:
-                process_args.output_remote = pathlib.Path("remote.py")
-            else:
-                process_args.output_remote = pathlib.Path(
-                    f"remote_{process_args.remote_process_name}.py"
-                )
-        
-        remote_process = split_remote(local_process, process_args, cpp_names_of_the_products)
+        print("Got the product names and the dependency graph")
+
+    # -- Give device products a name that works on every backend --
+    #
+    # The product names collected above contain the backend used on the machine
+    # where they were produced, and thus they cannot go into a configuration
+    # that is meant to be runable on every backend. The output of
+    # hltSiPixelClustersSoA, for instance, is dumped
+    #
+    #   on a GPU machine as  edm::DeviceProduct<SiPixelClustersDevice<alpaka::DevUniform...> >
+    #   on a CPU machine as  SiPixelClustersHost
+    #
+    # The first hardcodes a specific backend. The second names no backend at
+    # all, and is indistinguishable from an ordinary host product. The goal of
+    # the code below is to translate that into:
+    #
+    #   ALPAKA_ACCELERATOR_NAMESPACE::SiPixelClustersSoACollection
+    #
+    # which the MPISenderPortable and MPIReceiverPortable know how to handle.
+    # This is done by running a cheap cmsRun job twice, once on this machine's
+    # backend, and another one forcing the serial_sync backend. This is because
+    #
+    # 1. Every backend registers a serialiser under the mangled typeid of
+    # `TYPE_HOST`.
+    # 2. Only the CPU backends, additionally register it under the portable
+    # name. ALPAKA_ACCELERATOR_NAMESPACE::TYPE_DEVICE. 
+    # (See the docstring in SerialiserFactoryDevice.h).
+    #
+    # The two dumps allow to translate what this machine named a type, into
+    # the ALPAKA_ACCELERATOR_NAMESPACE::TYPE_DEVICE form of that type. Despite
+    # this machine's backend.
+    #
+    # On a CPU dump with no device products at all, device products are
+    # identified by annotate_portable_types, by looking at whether the module
+    # which produced them has an "@alpaka" label.
+    #
+    # This approach allows the local and remote configurations produced by any
+    # machine (CPU-only, Nvidia or AMD) to be identical.
+    if any(process_args.use_portable_mpi_modules for process_args in configs):
+        if configs[0].verbose:
+            print("Launching cmsRun to get the backend-independent names of device product types...")
+
+        annotate_portable_types(cpp_names_of_the_products, SerialiserTypeGetter().run(), local_process)
+
+        if configs[0].verbose:
+            print("Got backend-independent device product type names")
+
+    for process_args in configs:
+        remote_process = split_remote(local_process, process_args, cpp_names_of_the_products, dependency_graph)
         process_args.output_remote.parent.mkdir(parents=True, exist_ok=True)
         process_args.output_remote.write_text(remote_process.dumpPython())
-    
+
     configs[0].output_local.parent.mkdir(parents=True, exist_ok=True)
     configs[0].output_local.write_text(local_process.dumpPython())
-    
+
 
 if __name__ == "__main__":
     main()
