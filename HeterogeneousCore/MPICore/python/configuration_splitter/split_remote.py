@@ -53,9 +53,10 @@ def _flatten_all_to_module_list(process, user_args):
     return module_list
 
 
-def _products_to_forward(consumed, process_name):
+def _products_to_forward(consumed, process_name, portable):
     """
     turns the list of `ConsumedProduct`s (from the json dependency graph) into the distinct data products to send.
+    Only the `portable` MPI modules carry device products.
     """
     products = {}
     registered = {}
@@ -65,9 +66,8 @@ def _products_to_forward(consumed, process_name):
         # MPISender. Under the same label and product instance, the host copy of
         # these products should have been registered by the FW. Consumers on the
         # other process receive the host copy, so the device product is skipped
-        # here. Sending device products (via de MPISenderPortable) will be
-        # supported soon.
-        if is_device_product(product):
+        # here. The MPISenderPortable sends the device products.
+        if is_device_product(product) and not portable:
             continue
         if product["process"] != process_name:
             product = dict(product, sender_process=c.tag[2])
@@ -91,6 +91,9 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
     Split one remote process out of the local process. Edit `local_process` in
     place, and return the new remote process.
     """
+    # Are we using the portable MPI modules or the non-portable ones?
+    portable = args.use_portable_mpi_modules
+
     # Convert the provided module lists to an ordered list of module labels.
     modules_to_offload = _flatten_all_to_module_list(local_process, args.remote_modules)
     modules_to_run_on_both = _flatten_all_to_module_list(local_process, args.duplicate_modules)
@@ -151,8 +154,8 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
         # every member of every group that needs this dependency
         consumers_in_groups = [module_name for i in group_indices for module_name in groups[i]]
         # only the data products the offloaded modules read
-        consumed = [c for c in consumed_by_producer[local_dependency] if not is_device_product(c.product)]
-        products_for_dependency = _products_to_forward(consumed, analyzer.process_name)
+        consumed = [c for c in consumed_by_producer[local_dependency] if portable or not is_device_product(c.product)]
+        products_for_dependency = _products_to_forward(consumed, analyzer.process_name, portable)
 
         # the PathStateCapture whose token says the local paths reached those consumers
         capture_name = f"activityCaptureBefore{args.remote_process_name.title()}{local_dependency.title()}"
@@ -160,11 +163,12 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
         insert_path_state_capture_before(local_process, first_modules_in_a_group=consumers_in_groups, capture_name=capture_name)
         # send the products, or, when the token is missing, the news that the path was not reached
         sender = create_sender(
-                products=products_for_dependency,
-                instance=instance,
-                upstream=controller_name,
-                activity=capture_name
-            )
+            products=products_for_dependency,
+            instance=instance,
+            upstream=controller_name,
+            activity=capture_name,
+            portable=portable,
+        )
         sender_name = f"mpiSender{args.remote_process_name.title()}{local_dependency.title()}"
         setattr(local_process, sender_name, sender)
 
@@ -172,33 +176,35 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             # "source" is a reserved cms.Source slot, so the receiver takes a label of its own and
             # carries the data products of the Source and of the input together
             receiver = create_receiver(
-                    products=products_for_dependency,
-                    instance=instance,
-                    upstream="source",
-                    activity=True,
-                    grouped=True,
-                )
+                products=products_for_dependency,
+                instance=instance,
+                upstream="source",
+                activity=True,
+                portable=portable,
+                grouped=True,
+            )
             receiver_name = f"mpiReceiver{args.remote_process_name.title()}{local_dependency.title()}"
             setattr(remote_process, receiver_name, receiver)
 
             # every label the offloaded modules ask for becomes an EDAlias of the receiver
             for c in consumed:
-                remote_aliases[c.tag[0]][receiver_name].add(alias_entry(c.product, c.instance, grouped=True))
+                remote_aliases[c.tag[0]][receiver_name].add(alias_entry(c.product, c.instance, grouped=True, portable=portable))
         else:
             # an ordinary producer: the receiver takes its module label over
             receiver = create_receiver(
-                    products=products_for_dependency,
-                    instance=instance,
-                    upstream="source",
-                    activity=True,
-                )
+                products=products_for_dependency,
+                instance=instance,
+                upstream="source",
+                activity=True,
+                portable=portable,
+            )
             receiver_name = local_dependency
             setattr(remote_process, receiver_name, receiver)
 
             # the labels of the EDAliases of the producer become EDAliases of the receiver
             for c in consumed:
                 if c.tag[0] != local_dependency:
-                    remote_aliases[c.tag[0]][receiver_name].add(alias_entry(c.product, c.instance, grouped=False))
+                    remote_aliases[c.tag[0]][receiver_name].add(alias_entry(c.product, c.instance, grouped=False, portable=portable))
 
         # create filter for the path state
         filter_name = f"activityFilterAfter{local_dependency.title()}"
@@ -216,7 +222,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
     for module in offloaded:
         for c in analyzer.consumed_products(module):
             if c.origin in offloaded and c.tag[0] != c.origin:
-                remote_aliases[c.tag[0]][c.origin].add(alias_entry(c.product, c.instance, grouped=False))
+                remote_aliases[c.tag[0]][c.origin].add(alias_entry(c.product, c.instance, grouped=False, portable=portable))
 
     for label, entries in sorted(remote_aliases.items()):
         # a label must be free on the remote; only "source" can be shared, with the MPISource
@@ -231,21 +237,23 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
         insert_path_state_capture_before(local_process, first_modules_in_a_group=group, capture_name=capture_name)
         # then, a sender carrying only the token
         sender = create_sender(
-                products=[],
-                instance=instance,
-                upstream=controller_name,
-                activity=capture_name
-            )
+            products=[],
+            instance=instance,
+            upstream=controller_name,
+            activity=capture_name,
+            portable=portable,
+        )
         sender_name = f"mpiSender{args.remote_process_name.title()}Group{group_idx}Activity"
         setattr(local_process, sender_name, sender)
 
         # The corresponding receiver
         receiver = create_receiver(
-                products=[],
-                instance=instance,
-                upstream="source",
-                activity=True,
-            )
+            products=[],
+            instance=instance,
+            upstream="source",
+            activity=True,
+            portable=portable,
+        )
         receiver_name = f"mpiReceiver{args.remote_process_name.title()}Group{group_idx}Activity"
         setattr(remote_process, receiver_name, receiver)
 
@@ -284,7 +292,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
 
         # the data products of this group's members *that the local modules
         # read*.
-        group_products = _products_to_forward(consumed_back[group_idx], analyzer.process_name)
+        group_products = _products_to_forward(consumed_back[group_idx], analyzer.process_name, portable)
 
         # the remote sender
         sender = create_sender(
@@ -292,6 +300,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             instance=instance,
             upstream=sender_upstream,
             activity=remote_capture_name,
+            portable=portable,
         )
         sender_name = f"mpiSender{args.remote_process_name.title()}Group{group_idx}"
         setattr(remote_process, sender_name, sender)
@@ -304,6 +313,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             instance=instance,
             upstream=receiver_upstream,
             activity=True,
+            portable=portable,
             grouped=True,
         )
         receiver_name = f"mpiReceiver{args.remote_process_name.title()}Group{group_idx}"
@@ -331,7 +341,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             module_alias = create_alias(
                 {
                     receiver_name: {
-                        alias_entry(p, p["product_instance"], grouped=True)
+                        alias_entry(p, p["product_instance"], grouped=True, portable=portable)
                         for p in group_products
                         if p["module"] == offloaded_module
                     }
@@ -344,8 +354,8 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
         # receiver, under the instance "member@instance". Record the entry that the EDAlias needs to
         # point at the receiver. The EDAlias itself is rewritten after the loop over the groups.
         for c in consumed_back[group_idx]:
-            if c.tag[0] != c.origin and not is_device_product(c.product):
-                local_aliases[c.tag[0]][receiver_name].add(alias_entry(c.product, c.instance, grouped=True))
+            if c.tag[0] != c.origin and (portable or not is_device_product(c.product)):
+                local_aliases[c.tag[0]][receiver_name].add(alias_entry(c.product, c.instance, grouped=True, portable=portable))
 
     # delete from the local process the offloaded modules whose products are not
     # needed on local.

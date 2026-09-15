@@ -116,3 +116,63 @@ class ProcessDump(DumpJob):
             products[entry["module"]].append(entry)
 
         return products, self.load("dependency_graph")
+
+
+class SerialiserTypeGetter(DumpJob):
+    """
+    The name every Alpaka backend agrees on for each device product type that can be
+    moved over MPI. Only the serialiser registry knows those names, so they have to be
+    read out of a running job, and only annotate_portable_types() knows what to do with
+    them.
+
+    Returns {product type as a backend spells it: the same type written with the
+    "ALPAKA_ACCELERATOR_NAMESPACE::" placeholder}, covering both this machine's backend
+    and the host one.
+    """
+
+    name = "serialiser_types"
+    json_names = ("serialiser_types", "serialiser_types_serial_sync")
+
+    placeholder_namespace = "ALPAKA_ACCELERATOR_NAMESPACE::"
+
+    def __init__(self, reuse=False):
+        process = cms.Process("DUMPSERIALISERTYPES")
+        process.source = cms.Source("EmptySource")
+        process.load("Configuration.StandardSequences.Accelerators_cff")
+        process.options.accelerators = ["*"]
+        super().__init__(process, reuse)
+
+    def configure(self, process):
+        process.dumpSerialiserTypes = cms.EDAnalyzer(
+            "DumpSerialiserTypes@alpaka",
+            outputFile=cms.string(self.json_path("serialiser_types")),
+        )
+        process.dumpSerialiserTypesSerialSync = cms.EDAnalyzer(
+            "DumpSerialiserTypes@alpaka",
+            alpaka=cms.untracked.PSet(backend=cms.untracked.string("serial_sync")),
+            outputFile=cms.string(self.json_path("serialiser_types_serial_sync")),
+        )
+        process.dumpSerialiserTypesPath = cms.EndPath(
+            process.dumpSerialiserTypes + process.dumpSerialiserTypesSerialSync
+        )
+
+    def parse(self):
+        serial_data = self.load("serialiser_types_serial_sync")
+
+        # the name a configuration can use, under every registry key naming the
+        # serialiser it belongs to
+        aliases = {key: entry["alias"]
+                   for entry in serial_data if "alias" in entry
+                   for key in entry["keys"]}
+
+        # every serialisable type under its host spelling, which is the same on every
+        # backend
+        portable_types = {entry["product_type"]: self.placeholder_namespace + entry["alias"]
+                          for entry in serial_data if "alias" in entry}
+
+        for entry in self.load("serialiser_types"):
+            alias = next((aliases[key] for key in entry["keys"] if key in aliases), None)
+            if alias is not None:
+                portable_types[entry["product_type"]] = self.placeholder_namespace + alias
+
+        return portable_types
