@@ -25,6 +25,9 @@ from HeterogeneousCore.MPICore.configuration_splitter.path_state_helpers import 
 
 
 def split_remote(local_process, args, cpp_names_of_the_products, dependency_graph):
+    # Are we using the portable MPI modules or the non-portable ones?
+    portable = args.use_portable_mpi_modules
+
     modules_to_offload = flatten_all_to_module_list(local_process, args.remote_modules)
     modules_to_run_on_both = flatten_all_to_module_list(local_process, args.duplicate_modules)
 
@@ -95,6 +98,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             instance=instance,
             upstream=controller_name,
             activity=capture_name,
+            portable=portable,
         )
         sender_name = f"mpiSender{args.remote_process_name.title()}{local_dependency.title()}"
         # add it to the local process
@@ -110,6 +114,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
                 instance=instance,
                 upstream="source",
                 activity=True,
+                portable=portable,
                 grouped=True,
             )
             receiver_name = f"mpiReceiver{args.remote_process_name.title()}{local_dependency.title()}"
@@ -122,6 +127,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
                     receiver_name=receiver_name,
                     products=daq_raw_data_products,
                     module_name="rawDataCollector",
+                    portable=portable,
                 )
                 setattr(remote_process, "rawDataCollector", alias)
 
@@ -133,6 +139,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
                         receiver_name=receiver_name,
                         products=cpp_names_of_the_products[local_dependency],
                         module_name=local_dependency,
+                        portable=portable,
                     )
                     setattr(remote_process, alias_label, alias)
         else:
@@ -143,6 +150,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
                 instance=instance,
                 upstream="source",
                 activity=True,
+                portable=portable,
             )
             receiver_name = local_dependency
             setattr(remote_process, receiver_name, receiver)
@@ -172,6 +180,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             instance=instance,
             upstream=controller_name,
             activity=capture_name,
+            portable=portable,
         )
         sender_name = f"mpiSender{args.remote_process_name.title()}Group{group_idx}Activity"
         setattr(local_process, sender_name, sender)
@@ -181,6 +190,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             instance=instance,
             upstream="source",
             activity=True,
+            portable=portable,
         )
         receiver_name = f"mpiReceiver{args.remote_process_name.title()}Group{group_idx}Activity"
         setattr(remote_process, receiver_name, receiver)
@@ -219,6 +229,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             instance=instance,
             upstream=sender_upstream,
             activity=remote_capture_name,
+            portable=portable,
         )
         sender_name = f"mpiSender{args.remote_process_name.title()}Group{group_idx}"
         setattr(remote_process, sender_name, sender)
@@ -230,6 +241,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             instance=instance,
             upstream=receiver_upstream,
             activity=True,
+            portable=portable,
             grouped=True,
         )
         receiver_name = f"mpiReceiver{args.remote_process_name.title()}Group{group_idx}"
@@ -262,6 +274,7 @@ def split_remote(local_process, args, cpp_names_of_the_products, dependency_grap
             module_alias = create_receiver_alias(receiver_name=receiver_name,
                 products=cpp_names_of_the_products[offloaded_module],
                 module_name=offloaded_module,
+                portable=portable,
             )
             setattr(local_process, offloaded_module, module_alias)
 

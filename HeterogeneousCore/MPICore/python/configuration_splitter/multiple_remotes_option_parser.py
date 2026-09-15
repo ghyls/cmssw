@@ -31,6 +31,7 @@ def build_process_parser():
     parser.add_argument("-r", "--output-remote", type=pathlib.Path, default=None)
     parser.add_argument("-d", "--duplicate-modules", nargs="+", default=None)
     parser.add_argument("-n", "--remote-process-name", default="")
+    parser.add_argument("--use-portable-mpi-modules", action="store_true")
 
     return parser
 
@@ -107,6 +108,12 @@ PROCESS OPTIONS (can be passed for different remote processes):
         Name of the remote process (default: REMOTE0, REMOTE1, ... in the
         order the ':'-separated groups are given)
 
+    --use-portable-mpi-modules
+        Move products with MPISenderPortable/MPIReceiverPortable instead of
+        MPISender/MPIReceiver. Unlike MPISender/MPIReceiver, the portable
+        modules can also move device (e.g. Alpaka SoA) products without a
+        host copy; MPISender/MPIReceiver are not used at all once this is set.
+
 
 SINGLE REMOTE EXAMPLES:
 
@@ -143,6 +150,10 @@ Notes:
 • To split a configuration it must be processed with 0 events. That single cmsRun job
     dumps both the C++ product names and the module dependency graph, into the
     '.edmMpiSplitConfig' directory.
+• --use-portable-mpi-modules additionally runs a short cmsRun job of its own,
+    into the same directory, to learn how each Alpaka backend names the device types
+    it can serialise. This is so that device products can be written into the
+    configurations without naming the backend the splitter happened to run on.
 • If the splitter was run before on the same input config, --reuse-dumps skips that job and
     reads back what it wrote, which makes the script run faster.
 • For some modules it might be better to run on both processes
@@ -175,6 +186,7 @@ def parse_mpi_style_args(argv):
         cfg.remote_modules = proc_args.remote_modules or []
         cfg.duplicate_modules = proc_args.duplicate_modules or []
         cfg.remote_process_name = proc_args.remote_process_name or f"REMOTE{i}"
+        cfg.use_portable_mpi_modules = proc_args.use_portable_mpi_modules
         # a single remote writes the plain default file name; several need one each
         cfg.output_remote = proc_args.output_remote or pathlib.Path(
             "remote.py" if len(groups) == 1 else f"remote{i}.py")
