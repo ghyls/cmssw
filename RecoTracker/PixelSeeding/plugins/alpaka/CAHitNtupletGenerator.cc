@@ -652,7 +652,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
   template <typename TrackerTraits>
   typename CAHitNtupletGenerator<TrackerTraits>::PendingTuples CAHitNtupletGenerator<TrackerTraits>::beginTuplesAsync(
-      HitsOnDeviceRefProdVector const& hitsRefProdVector,
+      HitsInput const& hitsInput,
       CAGeometryOnDevice const& geometry_d,
       float bfield,
       uint32_t nDoublets,
@@ -677,23 +677,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
     auto tracks = pending.tracks->view().tracks();
 
-    HitsMultiView trackingHits(
-        hitsRefProdVector, [](edm::RefProd<HitsOnDevice> hits) -> auto { return hits->const_view().trackingHits(); });
-
-    std::vector<int> hitModulesSizes;
-    for (const auto& hit : hitsRefProdVector) {
-      hitModulesSizes.push_back(static_cast<int>(hit->nModules()));
-    }
-
-    // We need to encounter for the last hidden module, so we add 1 to the last element of hitModulesSizes
-    if (!hitModulesSizes.empty()) {
-      ++hitModulesSizes.back();
-    }
-
-    ModulesMultiView hitModules(
-        hitsRefProdVector,
-        [](edm::RefProd<HitsOnDevice> hits) -> auto { return hits->const_view().hitModules(); },
-        hitModulesSizes);
+    // The hit and module-start views are built by the producer, which holds the event products.
+    auto const& trackingHits = hitsInput.hits;
+    auto const& hitModules = hitsInput.modules;
 
     auto layers = geometry_d.view().layers();
     auto graph = geometry_d.view().graph();
@@ -702,12 +688,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     auto ntupletCuts = geometry_d.view().ntupletCuts();
     auto modules = geometry_d.view().modules();
 
-    const uint32_t nHits = static_cast<uint32_t>(trackingHits.size());
-    const uint32_t offsetBPIX2 = static_cast<uint32_t>(hitsRefProdVector[0]->offsetBPIX2());
+    const uint32_t nHits = hitsInput.nHits;
+    const uint32_t offsetBPIX2 = static_cast<uint32_t>(hitsInput.offsetBPIX2);
 
     // Don't bother if less than 2 hits: return the empty (built=false) pending state; finish
     // hands the zeroed collection through.
-    if (trackingHits.size() < 2) {
+    if (nHits < 2) {
       const auto device = alpaka::getDev(queue);
       auto ntracks_d = cms::alpakatools::make_device_view(device, tracks.nTracks());
       alpaka::memset(queue, ntracks_d, 0);
@@ -792,10 +778,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
   template <typename TrackerTraits>
   reco::TracksSoACollection CAHitNtupletGenerator<TrackerTraits>::finishTuplesAsync(
-      PendingTuples&& pending,
-      HitsOnDeviceRefProdVector const& hitsRefProdVector,
-      CAGeometryOnDevice const& geometry_d,
-      Queue& queue) const {
+      PendingTuples&& pending, HitsInput const& hitsInput, CAGeometryOnDevice const& geometry_d, Queue& queue) const {
     using HelixFit = HelixFit<TrackerTraits>;
 
     if (!pending.built)
@@ -816,8 +799,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
 
     auto tracks = pending.tracks->view().tracks();
-    HitsMultiView trackingHits(
-        hitsRefProdVector, [](edm::RefProd<HitsOnDevice> hits) -> auto { return hits->const_view().trackingHits(); });
+    auto const& trackingHits = hitsInput.hits;
+    const uint32_t nHits = hitsInput.nHits;
     auto modules = geometry_d.view().modules();
     const uint32_t nTracks = pending.maxTuples;
     const float bfield = pending.bfield;
@@ -836,8 +819,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     if (pending.offsetsHost)
       fitter.setHostTupleMultiplicityOffsets(pending.offsetsHost->data());
     if (m_params.algoParams_.useRiemannFit_) {
-      fitter.launchRiemannKernels(
-          trackingHits, modules, trackingHits.size(), TrackerTraits::maxNumberOfQuadruplets, queue);
+      fitter.launchRiemannKernels(trackingHits, modules, nHits, TrackerTraits::maxNumberOfQuadruplets, queue);
     } else {
       // The CA main fit is the factorized fast BrokenLine fit (circle+line, 5 params + factorized cov +
       // chi2), one launchBrokenLineKernels call for every CA iteration and every topology. The fit's
@@ -846,7 +828,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       // tuple ids are always < nTracks, so the extra chunks the launcher would iterate over with the
       // compile-time cap could only launch empty kernels.
       fitter.setFitCorrections(m_params.algoParams_.useFitCorrections_);
-      fitter.launchBrokenLineKernels(trackingHits, modules, trackingHits.size(), nTracks, queue);
+      fitter.launchBrokenLineKernels(trackingHits, modules, nHits, nTracks, queue);
     }
     kernels.classifyTuples(trackingHits, tracks, queue);
 
@@ -874,7 +856,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       printf(
           "[CA Sizing] nHits=%u nCells=%u capCells=%u nTriplets=%u capTrips=%u "
           "nTracks=%u capTuples=%u nHitsInTracks=%u capHitCont=%u nCellTracks=%u capCellTrk=%u\n",
-          static_cast<uint32_t>(trackingHits.size()),
+          nHits,
           dumpNCells,
           pending.maxDoublets,
           dumpNTriplets,
