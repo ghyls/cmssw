@@ -911,6 +911,33 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     return mask;
   }
 
+  reco::TrackingRecHitsMaskingCollection CAHitMaskingAndMerger::makeMaskingAsync(uint32_t nHits,
+                                                                                 TkSoADevice const& tracks_d,
+                                                                                 const pixelTrack::Quality minQuality,
+                                                                                 uint32_t const& iterationIndex,
+                                                                                 Queue& queue,
+                                                                                 bool applyMasking,
+                                                                                 bool maskAttachedHits) const {
+    reco::TrackingRecHitsMaskingCollection mask(queue, nHits);
+
+    // No input mask: the chain starts all-open. The zeroing is a stream-ordered memset, in place of
+    // the D2D copy of the input mask's zeros.
+    auto maskView = cms::alpakatools::make_device_view(queue, mask.view().recHitMask(), nHits);
+    alpaka::memset(queue, maskView, 0);
+
+    if (applyMasking && nHits > 0) {
+      CAHitMaskingAndMergerKernels kernels;
+      kernels.updateMasking(mask.view(),
+                            tracks_d.view().tracks(),
+                            tracks_d.view().trackHits(),
+                            minQuality,
+                            iterationIndex,
+                            queue,
+                            maskAttachedHits);
+    }
+    return mask;
+  }
+
   void CAHitMaskingAndMerger::mergeGather(TkSoADevice& outTracks,
                                           TkSoADevice const& inp0Tracks,
                                           TkSoADevice const& inp1Tracks,
@@ -1009,7 +1036,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   void CAHitMaskingAndMerger::refitUnitedTracks(TkSoADevice& tracks,
                                                 const int32_t* unitedWinnerMask,
                                                 reco::CAGeometrySoACollection const& geometry,
-                                                reco::TrackingRecHitsSoACollection const& hits,
+                                                caStructures::CAHitsView const& hits,
                                                 reco::OTRecHitsSoACollection const* otHits,
                                                 reco::StackedModuleGeometrySoACollection const* stackedGeom,
                                                 const float* rhoMapDevice,
@@ -1053,7 +1080,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     fitter.setTrajectoryCorrections(trajectoryCorrections);    // reference-trajectory corrections, default off
     fitter.setScatteringLogAtTotal(scatteringLogAtTotal);      // Highland log at the track total, default off
     fitter.setCumulativeEloss(cumulativeEloss);                // cumulative-column typical loss, default off
-    fitter.refitMergedTwins(hits.view().trackingHits(),
+    fitter.refitMergedTwins(hits,
                             geometry.view().modules(),
                             tracks.view().tracks(),
                             tracks.view().trackHits(),

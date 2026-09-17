@@ -415,7 +415,8 @@ if _MERGED:
         "CATrackFeaturesTableProducer",
         tableName=cms.string("TrkMergedCA"),
         trackSrc=cms.InputTag(_mergedLabel),
-        mergedHitsSrc=cms.InputTag("hltPhase2PixelRecHitsStubsMerger"),
+        pixelRecHitSrc=cms.InputTag("hltPhase2SiPixelRecHitsSoA"),
+        stubsSrc=cms.InputTag("hltOTStubProducer"),
         # A missing OT SoA does not fail loudly: it NaNs the whole feature row of every track
         # carrying a tagged OT extra (caTrackFeatures::fill returns false with no view).
         otRecHitsSoASrc=cms.InputTag("hltPixelSeedingOTRecHitsSoA"),

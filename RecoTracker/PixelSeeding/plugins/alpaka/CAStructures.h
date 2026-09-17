@@ -11,6 +11,7 @@
 #include "Geometry/CommonTopologies/interface/SimplePixelTopology.h"
 #include "DataFormats/TrackSoA/interface/TrackDefinitions.h"
 #include "DataFormats/TrackSoA/interface/TracksSoA.h"
+#include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsMaskSoA.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/SimpleVector.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/VecArray.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/HistoContainer.h"
@@ -162,7 +163,7 @@ namespace caStructures {
 
   using MapToHitConstView = ::reco::TrackingRecHitsMaskingConstView;
 
-  //Tracks data formats
+  // Tracks data formats
   using TkSoAView = ::reco::TrackSoAView;
   using TkHitsSoAView = ::reco::TrackHitSoAView;
   using TkSoABlocksView = ::reco::TrackBlocksView;

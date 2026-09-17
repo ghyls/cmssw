@@ -51,10 +51,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   uint32_t* __restrict__ content,
                                   ::reco::TrackSoAConstView tracks,
-                                  ::reco::TrackingRecHitConstView hh,
+                                  caStructures::CAHitsView hh,
                                   const int32_t* __restrict__ unitedMask,
                                   uint32_t nTracks) const {
-      const uint32_t nTot = uint32_t(hh.metadata().size());
+      const uint32_t nTot = uint32_t(hh.size());
       constexpr float kFar = 3.40282347e+38f;
       constexpr uint32_t kSentinel = 0x3FFFFFFFu;  // untagged, >= any real nTot -> walk break
       // Position and class of an id; false for unresolvable ids (sorted last). isPixel = merged-SoA
@@ -75,7 +75,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         x = hh[id].xGlobal();
         y = hh[id].yGlobal();
         z = hh[id].zGlobal();
-        isPixel = !::reco::isStub(hh, int32_t(id));
+        isPixel = !isStub(hh, int32_t(id));
         return true;
       };
       auto keyOf = [&](uint32_t id) -> float {
@@ -501,7 +501,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // nothing is written back to the track SoA. A free function rather than a HelixFit member, so this
     // translation unit never re-instantiates the fit's class template.
     void launchExtPredCoeff(Queue& queue,
-                            ::reco::TrackingRecHitConstView hv,
+                            caStructures::CAHitsView hv,
                             ::reco::CAModulesConstView cm,
                             ::reco::TrackSoAView mergedTracks,
                             ::reco::TrackHitSoAView mergedHits,

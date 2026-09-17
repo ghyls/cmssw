@@ -58,7 +58,9 @@ layerPairsDisplaced = [
 ]
 
 hltPhase2PixelTracksSoADisplacedWithStubs = cms.EDProducer('CAHitNtupletAlpakaPhase2OTStubs@alpaka',
-    pixelRecHitSrc = cms.InputTag('hltPhase2PixelRecHitsStubsMerger'),
+    # The CA reads the pixel rechits and the outer-tracker stubs through the CAHitsView facade.
+    pixelRecHitSrc = cms.InputTag('hltPhase2SiPixelRecHitsSoA'),
+    stubsSrc = cms.InputTag('hltOTStubProducer'),
     hitMask = cms.InputTag('hltPhase2PixelTrackHighPtMasking'),
     iterationName = cms.string('displaced'),
     # In-kernel triplet and track classifiers; the working points are baked into the weight headers.

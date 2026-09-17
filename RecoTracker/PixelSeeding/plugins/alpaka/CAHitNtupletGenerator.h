@@ -14,6 +14,7 @@
 #include "DataFormats/TrackSoA/interface/TracksDevice.h"
 #include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsSoA.h"
 #include "DataFormats/TrackingRecHitSoA/interface/alpaka/TrackingRecHitsSoACollection.h"
+#include "DataFormats/TrackingRecHitSoA/interface/alpaka/TrackingRecHitsMaskSoACollection.h"
 #include "DataFormats/TrackingRecHitSoA/interface/alpaka/OTRecHitsSoACollection.h"
 #include "DataFormats/TrackingRecHitSoA/interface/alpaka/StubsSoACollection.h"
 #include "FWCore/Framework/interface/EventSetup.h"
@@ -49,6 +50,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // Everything the CA build needs from the event's hit collections, assembled by the producer: the
     // topology's hit view and module-start view (see CAStructures.h) plus the two scalars.
     using HitsInput = caStructures::HitsInputT<TrackerTraits>;
+
     using MapToHitConstView = ::reco::TrackingRecHitsMaskingConstView;
 
     using TkSoADevice = reco::TracksSoACollection;
@@ -167,6 +169,17 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                               bool applyMasking = true,
                               bool maskAttachedHits = false) const;
 
+    // Same, seeded from an all-open mask of nHits rows instead of an input mask product: the first
+    // masking stage of a chain has nothing to inherit, and the hit collections it would read only to
+    // copy their zeros are the pixel rechits and the stubs, whose row count is all that is needed.
+    MapToHit makeMaskingAsync(uint32_t nHits,
+                              TkSoADevice const& tracks_d,
+                              const pixelTrack::Quality minQuality,
+                              uint32_t const& iterationIndex,
+                              Queue& queue,
+                              bool applyMasking = true,
+                              bool maskAttachedHits = false) const;
+
     // Device-side gather/compact: reads each input's nTracks() and hitOffsets() on device and packs
     // the track and trackHits columns into a dense merged layout, writing the merged nTracks and the
     // shifted hitOffsets on device. No host readback in the sizing or in the copy.
@@ -196,7 +209,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     void refitUnitedTracks(TkSoADevice& tracks,
                            const int32_t* unitedWinnerMask,
                            reco::CAGeometrySoACollection const& geometry,
-                           reco::TrackingRecHitsSoACollection const& hits,
+                           caStructures::CAHitsView const& hits,
                            reco::OTRecHitsSoACollection const* otHits,
                            reco::StackedModuleGeometrySoACollection const* stackedGeom,
                            const float* rhoMapDevice,

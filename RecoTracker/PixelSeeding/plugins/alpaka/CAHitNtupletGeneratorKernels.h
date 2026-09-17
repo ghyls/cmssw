@@ -16,6 +16,7 @@
 #include "DataFormats/TrackSoA/interface/alpaka/TrackUtilities.h"
 #include "DataFormats/TrackingRecHitSoA/interface/OTRecHitsSoA.h"
 #include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsSoA.h"
+#include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsMaskSoA.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/AtomicPairCounter.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/HistoContainer.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
@@ -247,7 +248,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     void classifyTuples(const HitsMultiView& hh,
                         TkSoAView& track_view,
                         Queue& queue,
-                        ::reco::OTRecHitsMultiView const* otView = nullptr);
+                        ::reco::OTRecHitsConstView const* otView = nullptr);
 
     // Returns the doublet count read back by the count-only pass, or 0 when that pass did not run.
     // It is an upper bound on the fill pass, which skips the hit->cell capacity term, so the caller

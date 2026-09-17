@@ -52,7 +52,7 @@ HLTLocalTrackerSequence = cms.Sequence(
 
 # Second pixel-track iteration on the hits the first one left unused, plus the merger of the two
 # iterations and its final selector. Like the menu, it runs only in the two-iteration stub chain:
-# the mask and the merger read the stub-merged rechits, and the legacy converter then reads the
+# the mask and the merger read the pixel rechits and the stubs, and the legacy converter then reads the
 # final selection, so it follows this sequence.
 HLTPixelTrackingSecondIterationSequence = cms.Sequence()
 

@@ -7,6 +7,7 @@
 
 #include "DataFormats/TrackSoA/interface/TracksSoA.h"
 #include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsSoA.h"
+#include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsMaskSoA.h"
 #include "DataFormats/TrackingRecHitSoA/interface/OTRecHitsSoA.h"
 #include "DataFormats/TrackingRecHitSoA/interface/StubsSoA.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
@@ -383,7 +384,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
   // over every merged track selected by hostMask and publishes the walk's prediction covariance.
   // Read-only on the tracks.
   void launchExtPredCoeff(Queue& queue,
-                          ::reco::TrackingRecHitConstView hv,
+                          caStructures::CAHitsView hv,
                           ::reco::CAModulesConstView cm,
                           ::reco::TrackSoAView mergedTracks,
                           ::reco::TrackHitSoAView mergedHits,
@@ -478,7 +479,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                                    float bf,
                                    ::reco::TrackSoAConstView tracks,
                                    ::reco::TrackHitSoAConstView trackHits,
-                                   ::reco::TrackingRecHitConstView hits,
+                                   caStructures::CAHitsView hits,
                                    uint32_t maxNumberOfTuples,
                                    uint32_t hitCapacity,
                                    AttachBuffers& bufs,
@@ -495,7 +496,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                            const AttachParams& params,
                            ::reco::TrackSoAView tracks,
                            ::reco::TrackHitSoAView trackHits,
-                           ::reco::TrackingRecHitConstView hits,
+                           caStructures::CAHitsView hits,
                            ::reco::CALayersSoAConstView caLayers,
                            ::reco_extender::ExtenderLayersConstView extLayers,
                            const ::reco::CAModulesConstView modules,
@@ -523,8 +524,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     const ExtPhiBinner* phiBinner,
                     ::reco::TrackSoAConstView tracks,
                     ::reco::TrackHitSoAConstView trackHits,
-                    ::reco::TrackingRecHitConstView hits,
-                    ::reco::HitModuleSoAConstView hitModules,
+                    caStructures::CAHitsView hits,
                     ::reco::TrackingRecHitsMaskingConstView hitMask,
                     ::reco_extender::ExtenderLayersConstView extLayers,
                     ::reco::CAModulesConstView caModules,
@@ -557,8 +557,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                           const float* bMap,  // normalised (Bz,Br) r-z lattice, read per road segment
                           ::reco::TrackSoAView tracks,
                           ::reco::TrackHitSoAView trackHits,
-                          ::reco::TrackingRecHitConstView hits,
-                          ::reco::HitModuleSoAConstView hitModules,
+                          caStructures::CAHitsView hits,
                           ::reco::TrackingRecHitsMaskingConstView hitMask,
                           ::reco::CALayersSoAConstView caLayers,
                           ::reco::CAModulesConstView modules,

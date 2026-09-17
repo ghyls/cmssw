@@ -23,6 +23,7 @@
 #include "DataFormats/TrackSoA/interface/TracksSoA.h"
 #include "DataFormats/TrackSoA/interface/alpaka/TrackUtilities.h"
 #include "DataFormats/TrackingRecHitSoA/interface/StubsSoA.h"
+#include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsMaskSoA.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/AtomicPairCounter.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/config.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/workdivision.h"
@@ -2465,7 +2466,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
                                   const float dropAbsEtaMax,  // = the walk's own |eta| reach
                                   const int fbEtaReach,
                                   const int fbPhiReach,
-                                  const ::reco::TrackingRecHitConstView hh,     // for ::reco::isStub
+                                  const caStructures::CAHitsView hh,            // for caStructures::isStub
                                   const ::reco::StubsConstView sv,              // stub -> its two OT rows
                                   const ::reco::OTRecHitsConstView ov) const {  // sensor kind and position
       const int32_t nT = tracks_view.nTracks();
@@ -2531,7 +2532,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
         // a sensor hit, are different ids and the same published rechit, which is what the validation
         // sees. k = 0, 1 selects the key; false means this hit has no k-th one. Without the stub view
         // (the CA's own call) a stub keys on its id alone.
-        const uint32_t nPix = uint32_t(hh.metadata().size() > 0 ? hh.offsetStubs() : 0u);
+        const uint32_t nPix = uint32_t(hh.size() > 0 ? hh.offsetStubs() : 0u);
         const bool haveStubs = sv.metadata().size() > 0;
         auto pubKey = [&](uint32_t id, int k, uint32_t &key) -> bool {
           if (caExtension::isOTId(id))
@@ -2893,9 +2894,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
       // loop would read the container beyond its filled region.
       const uint32_t nHitsInTracks = std::min<uint32_t>(foundNtuplets->size(), track_hits_view.metadata().size());
       for (auto idx : cms::alpakatools::uniform_elements(acc, nHitsInTracks)) {
-        // On content-buffer overflow the content is unwritten (garbage), so the
-        // hit index can be out of range.  Skip such entries: the hit was already
-        // dropped (lossy truncation), so writing a garbage detId would corrupt.
+        // On content-buffer overflow the content is unwritten, so the hit index can be out of range; the
+        // hit was already dropped and writing a garbage detId would corrupt.
         if (foundNtuplets->content[idx] >= (uint32_t)hh.size())
           continue;
         track_hits_view[idx].id() = foundNtuplets->content[idx];
@@ -5787,8 +5787,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     const float fbDropBound = (confirm != nullptr) ? confirm->dropAbsEtaMax : kDedupFbDropAbsEtaMax;
     // Hit and stub views for the length and shared counts: the confirm struct's (empty when absent,
     // which makes a stub count as one published rechit keyed on its own id).
-    const ::reco::TrackingRecHitConstView dedupHitView =
-        (confirm != nullptr) ? confirm->hv : ::reco::TrackingRecHitConstView{};
+    const caStructures::CAHitsView dedupHitView = (confirm != nullptr) ? confirm->hv : caStructures::CAHitsView{};
     const ::reco::StubsConstView dedupStubView = (confirm != nullptr) ? confirm->sv : ::reco::StubsConstView{};
     // The raw outer-tracker rechits, for the sensor kind and the position of a shared published rechit.
     const ::reco::OTRecHitsConstView dedupOTView = (confirm != nullptr) ? confirm->ov : ::reco::OTRecHitsConstView{};

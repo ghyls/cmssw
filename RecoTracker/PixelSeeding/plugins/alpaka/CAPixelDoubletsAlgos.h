@@ -672,8 +672,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caPixelDoublets {
           }
 
           // Key-range guard: one bin per outer hit. Dropping here instead of writing outside off[]
-          // keeps a sizing mismatch non-corrupting; the drop is counted on the matching fill pass
-          // (FillDoubletsHisto), which skips exactly the same keys.
+          // keeps a sizing mismatch non-corrupting; FillDoubletsHisto skips exactly the same keys.
           if ((oi - hh.view(0).offsetBPIX2()) < outerHitHisto->nOnes())
             outerHitHisto->count(acc, oi - hh.view(0).offsetBPIX2());
           cells[ind].init(hh, pairLayerId, i, oi);

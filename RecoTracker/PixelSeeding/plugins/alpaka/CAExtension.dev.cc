@@ -345,8 +345,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
         const float* __restrict__ extRho3,         // [kExtOTLayers] measured 3-dof stub density [cm^-1 rad^-1]
         const ::reco::TrackSoAConstView tracks,
         const ::reco::TrackHitSoAConstView trackHits,
-        const ::reco::TrackingRecHitConstView hits,
-        const ::reco::HitModuleSoAConstView hitModules,
+        const caStructures::CAHitsView hits,
         const ::reco::TrackingRecHitsMaskingConstView hitMask,
         const ::reco_extender::ExtenderLayersConstView caLayers,
         const ::reco::CAModulesConstView caModules,
@@ -604,7 +603,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
             if (ot)
               ++nPriorExtraClusters;  // an appended extra: one cluster, and not part of the core
             else
-              nCoreClusters += ::reco::isStub(hits, int32_t(hitId)) ? 2 : 1;  // a 2-hit stub = 2 clusters
+              nCoreClusters += isStub(hits, int32_t(hitId)) ? 2 : 1;  // a 2-hit stub = 2 clusters
           }
           shCoveredMask = coveredMask;
           const int nOrigSafe = nOrig < kMaxOrigHits ? nOrig : kMaxOrigHits;
@@ -1521,10 +1520,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     // leak-free formation error; non-stub candidates keep the 2-row statistic.
                     float dBend = 0.f, Rbb = 0.f;
                     bool bendRow = false;
-                    if (shDerBendOn && ::reco::isStub(hits, int32_t(hitId))) {
-                      const float sPrec = hits[hitId].dPhiDrErrorPrec();
+                    if (shDerBendOn && isStub(hits, int32_t(hitId))) {
+                      auto const stub = hits.stub(int32_t(hitId));
+                      const float sPrec = stub.dPhiDrErrorPrec();
                       if (sPrec > 0.f) {
-                        dBend = shDerPredB - hits[hitId].dPhiDr();
+                        dBend = shDerPredB - stub.dPhiDr();
                         Rbb = sPrec * sPrec;
                         bendRow = true;
                       }
@@ -1938,7 +1938,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
               // the layer had no hit, so in round 0 round 1 may still try a one-cluster OT hit.
               int gExtraClusters = 0;
               if (gHit >= 0) {
-                gExtraClusters = isOTId(uint32_t(gHit)) ? 1 : (::reco::isStub(hits, gHit) ? 2 : 1);
+                gExtraClusters = isOTId(uint32_t(gHit)) ? 1 : (isStub(hits, gHit) ? 2 : 1);
                 if (shNExtraClusters + gExtraClusters > shExtraClusterCap) {
                   gHit = -1;
                   if (candDump_)
@@ -2714,8 +2714,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                     const ExtPhiBinner* phiBinner,
                     ::reco::TrackSoAConstView tracks,
                     ::reco::TrackHitSoAConstView trackHits,
-                    ::reco::TrackingRecHitConstView hits,
-                    ::reco::HitModuleSoAConstView hitModules,
+                    caStructures::CAHitsView hits,
                     ::reco::TrackingRecHitsMaskingConstView hitMask,
                     ::reco_extender::ExtenderLayersConstView extLayers,
                     ::reco::CAModulesConstView caModules,
@@ -2818,7 +2817,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
         tracks,
         trackHits,
         hits,
-        hitModules,
         hitMask,
         extLayers,
         caModules,
@@ -3072,7 +3070,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                                   const float bf,
                                   ::reco::TrackSoAConstView tracks,
                                   ::reco::TrackHitSoAConstView trackHits,
-                                  ::reco::TrackingRecHitConstView hits,
+                                  caStructures::CAHitsView hits,
                                   const uint32_t* __restrict__ extTuple,
                                   const uint32_t* __restrict__ extCandSlot,
                                   const uint32_t* __restrict__ nExt,
@@ -3267,7 +3265,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                                   const float* __restrict__ extNewCov,
                                   const float* __restrict__ extNewChi2,
                                   const int32_t* __restrict__ extNewNdof,
-                                  ::reco::TrackingRecHitConstView hits,
+                                  caStructures::CAHitsView hits,
                                   ::reco::CALayersSoAConstView caLayers,
                                   SeqContainer* hitContainer,
                                   SeqContainer const* __restrict__ extContainer,
@@ -3456,7 +3454,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                                    float bf,
                                    ::reco::TrackSoAConstView tracks,
                                    ::reco::TrackHitSoAConstView trackHits,
-                                   ::reco::TrackingRecHitConstView hits,
+                                   caStructures::CAHitsView hits,
                                    uint32_t maxNumberOfTuples,
                                    uint32_t hitCapacity,
                                    AttachBuffers& bufs,
@@ -3561,7 +3559,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                            const AttachParams& params,
                            ::reco::TrackSoAView tracks,
                            ::reco::TrackHitSoAView trackHits,
-                           ::reco::TrackingRecHitConstView hits,
+                           caStructures::CAHitsView hits,
                            ::reco::CALayersSoAConstView caLayers,
                            ::reco_extender::ExtenderLayersConstView extLayers,
                            const ::reco::CAModulesConstView modules,
@@ -3687,11 +3685,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
   // builds -- so a merger-attach candidate's per-layer phi window scan is identical to the CA's.
   struct Kernel_mergerHitSetLayerStart {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
-                                  ::reco::HitModuleSoAConstView mm,
+                                  caStructures::CAHitsView mm,
                                   ::reco::CALayersSoAConstView ll,
                                   uint32_t* __restrict__ hitsLayerStart) const {
       for (auto i : cms::alpakatools::uniform_elements(acc, uint32_t(ll.metadata().size())))
-        hitsLayerStart[i] = mm.moduleStart()[ll.layerStarts()[i]];
+        hitsLayerStart[i] = caStructures::moduleStartOf(mm, int32_t(ll.layerStarts()[i]));
     }
   };
 
@@ -3728,8 +3726,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                           const float* bMap,
                           ::reco::TrackSoAView tracks,
                           ::reco::TrackHitSoAView trackHits,
-                          ::reco::TrackingRecHitConstView hits,
-                          ::reco::HitModuleSoAConstView hitModules,
+                          caStructures::CAHitsView hits,
                           ::reco::TrackingRecHitsMaskingConstView hitMask,
                           ::reco::CALayersSoAConstView caLayers,
                           ::reco::CAModulesConstView modules,
@@ -3756,15 +3753,19 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
       alpaka::exec<Acc1D>(queue,
                           make_workdiv<Acc1D>(divide_up_by(nLayersP1, kThreads), kThreads),
                           Kernel_mergerHitSetLayerStart{},
-                          hitModules,
+                          hits,
                           caLayers,
                           layerStart.data());
     }
     ExtPhiBinner::View phiView{phiHist.data(), nullptr, phiStorage.data(), cms::alpakatools::kDynamicSize, nHits};
+    // Same phi binner the CA's prepareHits() builds, over the same (pixel + stub) global index space:
+    // the view-plus-accessor overload, because the facade has no single contiguous iphi column.
+    auto accessor_iphi = [] ALPAKA_FN_ACC(auto const& v) { return v.iphi(); };
     fillManyFromVector<Acc1D>(phiHist.data(),
                               phiView,
                               ::pixelTopology::Phase2OTStubs::numberOfLayers,
-                              hits.iphi().data(),
+                              hits,
+                              accessor_iphi,
                               layerStart.data(),
                               nHits,
                               (uint32_t)256,
@@ -3802,7 +3803,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caExtension {
                  tracks,
                  trackHits,
                  hits,
-                 hitModules,
                  hitMask,
                  extLayers,
                  modules,

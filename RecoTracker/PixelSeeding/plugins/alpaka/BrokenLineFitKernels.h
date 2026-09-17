@@ -151,9 +151,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   template <int N>
   class Kernel_BLFastFit {
   public:
-    // Out-of-line per-lane body of the fast fit (BL_REFIT_NOINLINE, see above): the per-bin ladder's
-    // operator() and the fused ladder's switch call this one compiled function. No cross-lane or
-    // cross-block state: the lane index only forms addresses.
+    // Out-of-line per-lane body of the fast fit. No cross-lane or cross-block state: the lane index only
+    // forms addresses.
     // Templated on the hit view (HitsMultiView, or the CAHitsView facade of Phase2OTStubs).
     template <typename HitsView>
     ALPAKA_FN_ACC BL_REFIT_NOINLINE static void lane(Acc1D const& acc,
@@ -187,9 +186,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       // Prepare data structure
       auto const* hitId = foundNtuplets->begin(tkid);
 
-      // Number of hits the fit uses: kMode filter + same-layer PIXEL overlap dedup (OT stubs never merged),
-      // by the SAME caFitHitSel::dedupWalk used in count/fillMultiplicity. hasStubs is the compile-time
-      // OT-stubs topology flag; combine it with the runtime stub offset as count/fill do.
+      // Hits the fit uses: kMode filter plus same-layer pixel overlap dedup (OT stubs are never merged),
+      // through the caFitHitSel::dedupWalk that count/fillMultiplicity use.
       const bool hasStubsRt = hasStubs && (static_cast<int32_t>(caStructures::offsetStubsOf(hh)) >= 0);
       uint32_t nSel = caFitHitSel::dedupWalk(foundNtuplets, tkid, hh, hasStubsRt, /*k=*/-1);
       ALPAKA_ASSERT_ACC(nSel >= nHitsL);
@@ -219,16 +217,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         auto hit = hitId[j];
         float ge[6];
 
-        // Unified per-hit global-error propagation. The "picked" sensor per the
-        // one-fit-point-per-stub contract is stored in CAModulesSoA::innerSensorFrame (the pixel-side
-        // sensor for PS stubs, the physically-inner sensor for SS stubs, == detFrame for pixels). For SS
-        // stubs the global error is built here from the local error through that frame (OTRecHitsSoA has no
-        // pre-computed global-error columns).
+        // The fit point of a stub sits on the sensor in CAModulesSoA::innerSensorFrame (pixel-side sensor
+        // for PS stubs, physically inner sensor for SS stubs, == detFrame for pixels); the global error is
+        // built here from the local one through that frame.
         auto frame = cm.innerSensorFrame(hh[hit].detectorIndex());
         float xerrFit = hh[hit].xerrLocal();
-        // Stub transverse-error calibration (fit input only): scale the local-x VARIANCE by the squared
-        // pull width (2S barrel 0.68, PS barrel 0.80, disks 0.92/0.95) so the fit weights match the real
-        // resolution. Fit-input only -- track finding is untouched.
+        // Stub transverse-error calibration, fit input only: scale the local-x variance by the squared
+        // pull width so the fit weights match the measured resolution.
         if (hasStubsRt && isStub(hh, int32_t(hit))) {
           const bool is2S = hh[hit].yerrLocal() > 0.1f;                                // strip vs macro-pixel
           const bool isBarrelHit = alpaka::math::abs(acc, hh[hit].zGlobal()) < 118.f;  // OT barrel vs TEDD
@@ -632,9 +627,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   struct Kernel_BLFastFitFused {
     using HitsMultiView = caStructures::HitsViewT<TrackerTraits>;
 
-    // The switch dispatches bins 0..7 by hand; kMainNBins is traits-derived. A traits set carrying more
-    // bins would pass the idle test, fall to `default:` and lose its tuples silently, so raising
-    // maxHitsOnTrackForFullFit past 10 must be a build error.
+    // The switch dispatches bins 0..7 by hand: a traits set carrying more bins would fall to `default:`
+    // and lose its tuples silently, so it must be a build error.
     static_assert(kMainNBins<TrackerTraits> <= 8u,
                   "the fused main ladder dispatches bins 0..7; add cases when a traits set carries more");
     // The fast fit uses the default-stride maps (riemannFit::stride == maxNumberOfConcurrentFits), the
@@ -1765,7 +1759,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   refitDedupWalk(TupleCont const* __restrict__ hitContainer, uint32_t it, HitsView hh, bool hasStubs, int k) {
     auto const* hitId = hitContainer->begin(it);
     auto const nhits = hitContainer->size(it);
-    auto const nTot = hh.metadata().size();
+    auto const nTot = hh.size();
     uint32_t nkept = 0;
     int lastKeptJ = -1;
     for (uint32_t j = 0; j < uint32_t(nhits); ++j) {
@@ -1774,13 +1768,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       if (!ot && h >= static_cast<uint32_t>(nTot))
         break;  // content-overflow guard (untagged out-of-range id)
       // OT extras count as stubs for the kMode filter; merged ids consult the SoA stub flag.
-      const bool hitIsStub = ot ? true : reco::isStub(hh, int32_t(h));
+      const bool hitIsStub = ot ? true : isStub(hh, int32_t(h));
       if (!caFitHitSel::useHit(hitIsStub, hasStubs))
         continue;
       // Merge only two consecutive kept merged-pixel hits, never an OT extra or a stub.
-      if (hasStubs && lastKeptJ >= 0 && !ot && !reco::isStub(hh, int32_t(h))) {
+      if (hasStubs && lastKeptJ >= 0 && !ot && !isStub(hh, int32_t(h))) {
         auto const hp = hitId[lastKeptJ];
-        if (!caOTHitTag::isOTId(hp) && !reco::isStub(hh, int32_t(hp))) {
+        if (!caOTHitTag::isOTId(hp) && !isStub(hh, int32_t(hp))) {
           float const dx = float(hh[h].xGlobal()) - float(hh[hp].xGlobal());
           float const dy = float(hh[h].yGlobal()) - float(hh[hp].yGlobal());
           if (dx * dx + dy * dy < caFitHitSel::kDedupDsMin2)
@@ -1802,7 +1796,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   public:
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   Tuples const* __restrict__ hitContainer,
-                                  ::reco::TrackingRecHitConstView hh,
+                                  caStructures::CAHitsView hh,
                                   const int32_t* __restrict__ acceptedByTuple,
                                   const uint8_t* __restrict__ pServed,
                                   uint32_t* __restrict__ pCounts,
@@ -1898,7 +1892,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   Tuples const* __restrict__ hitContainer,
-                                  ::reco::TrackingRecHitConstView hh,
+                                  caStructures::CAHitsView hh,
                                   ::reco::CAModulesConstView cm,
                                   const int32_t* __restrict__ acceptedByTuple,
                                   typename caStructures::tindex_type* __restrict__ ptkids,
@@ -1986,9 +1980,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
             sb[1] = -1.f;
             sb[2] = 0.f;
             sb[3] = 0.f;
-            if (!caOTHitTag::isOTId(hid) && hasStubsRt && reco::isStub(hh, int32_t(hid)) &&
-                hh[hid].dPhiDrErrorPrec() > 0.f) {
-              const uint8_t flags = hh[hid].stubFlags();
+            if (!caOTHitTag::isOTId(hid) && hasStubsRt && isStub(hh, int32_t(hid)) && hh.hasBend(int32_t(hid))) {
+              auto const stub = hh.stub(int32_t(hid));
+              const uint8_t flags = stub.flags();
               const float zg = hh[hid].zGlobal();
               const float rg = alpaka::math::sqrt(
                   acc, hh[hid].xGlobal() * hh[hid].xGlobal() + hh[hid].yGlobal() * hh[hid].yGlobal());
@@ -2003,8 +1997,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                   nZ = zg / nrm;
                 }
               }
-              sb[0] = hh[hid].dPhiDr();
-              sb[1] = hh[hid].dPhiDrErrorPrec();
+              sb[0] = stub.dPhiDr();
+              sb[1] = stub.dPhiDrErrorPrec();
               sb[2] = nR;
               sb[3] = nZ;
             }
@@ -2030,9 +2024,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
             pz = otSource_.otHits[o].zGlobal();
           } else {
             // Merged SoA hit: the same load as Kernel_BLFastFit (innerSensorFrame + stub xerr scale).
-            auto frame = cm.innerSensorFrame(hh.detectorIndex(hid));
+            auto frame = cm.innerSensorFrame(hh[hid].detectorIndex());
             float xerrFit = hh[hid].xerrLocal();
-            if (reco::isStub(hh, int32_t(hid))) {
+            if (isStub(hh, int32_t(hid))) {
               const bool is2S = hh[hid].yerrLocal() > 0.1f;
               const bool isBarrelHit = alpaka::math::abs(acc, hh[hid].zGlobal()) < 118.f;
               const float f = is2S ? (isBarrelHit ? 0.4624f : 0.8464f) : (isBarrelHit ? 0.64f : 0.9025f);
@@ -2128,7 +2122,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     Queue& queue;
     Tuples const* hitContainer;
     TupleMultiplicity const* tupleMultiplicity;
-    ::reco::TrackingRecHitConstView hv;
+    caStructures::CAHitsView hv;
     ::reco::CAModulesConstView cm;
     OutputSoAView outputSoa;
     const int32_t* acceptedByTuple;

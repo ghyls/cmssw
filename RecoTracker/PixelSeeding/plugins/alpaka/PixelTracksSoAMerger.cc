@@ -12,6 +12,7 @@
 #include "DataFormats/TrackSoA/interface/alpaka/TracksSoACollection.h"
 #include "DataFormats/TrackSoA/interface/TracksDevice.h"
 #include "DataFormats/TrackingRecHitSoA/interface/alpaka/TrackingRecHitsSoACollection.h"
+#include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsMaskSoA.h"
 #include "FWCore/Framework/interface/ConsumesCollector.h"
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/ParameterSet/interface/ConfigurationDescriptions.h"
@@ -318,12 +319,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
     // Refit / attach inputs (mirroring the displaced CA producer). The CA-ordered module geometry is an
     // EventSetup product.
-    desc.add<edm::InputTag>("pixelRecHitSrc", edm::InputTag("hltPhase2PixelRecHitsStubsMerger"))
-        ->setComment("Shared pixel+stub rechit SoA the merged track hit ids index. twinMergeFullRefit/mergerExtend.");
+    desc.add<edm::InputTag>("pixelRecHitSrc", edm::InputTag("hltPhase2SiPixelRecHitsSoA"))
+        ->setComment(
+            "Pixel rechit SoA. Read side by side with otStubsSrc through the CAHitsView facade, which is "
+            "the global hit index space the track hit ids point into. twinMergeFullRefit/mergerExtend.");
     desc.add<edm::InputTag>("otRecHitsSrc", edm::InputTag("hltPixelSeedingOTRecHitsSoA"))
         ->setComment("Raw OT rechit SoA for the tagged (bit30) OT extras. twinMergeFullRefit/mergerExtend.");
     desc.add<edm::InputTag>("otStubsSrc", edm::InputTag("hltOTStubProducer"))
-        ->setComment("OT stub SoA for the full-hits OT source (stub-membership mask). mergerExtend only.");
+        ->setComment(
+            "OT stub SoA: the stub half of the CAHitsView facade (global ids >= nPixelHits), and the "
+            "full-hits OT source's stub-membership mask.");
 
     descriptions.addWithDefaultLabel(desc);
   }
@@ -538,7 +543,17 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       const float* bMapDevice = es.getData(tokenBLBFieldMap_).data();
 
       auto caLayers = geometry.view().layers();
-      const uint32_t nRecHits = uint32_t(pixelRecHits.view().trackingHits().metadata().size());
+      // The global hit index space the merged track hit ids live in: pixel rechits first, then the
+      // stubs. Built as CAHitNtuplet::makeHitsInput() builds it for the CA, so a hit id resolves to
+      // the same row.
+      const caStructures::CAHitsView hitsView(pixelRecHits.const_view().trackingHits(),
+                                              pixelRecHits.const_view().hitModules(),
+                                              otStubs.const_view().stubs(),
+                                              otStubs.const_view().stubModules(),
+                                              pixelRecHits.nHits(),
+                                              otStubs.nStubs(),
+                                              pixelRecHits.nModules());
+      const uint32_t nRecHits = uint32_t(hitsView.size());
       // The merged track capacity is also the attach's host-known candidate bound, flowing into
       // AttachParams::extRefitMaxCandidates through min(). Candidates are a subset of merged tracks, so a
       // bound equal to the merged track count drops nothing.
@@ -597,7 +612,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         // translation unit would change what the compiler generates for the code already there, since on
         // the serial backend these kernels are ordinary inlined host code.
         caExtension::launchExtPredCoeff(queue,
-                                        pixelRecHits.view().trackingHits(),
+                                        hitsView,
                                         geometry.view().modules(),
                                         mergedTracks.view().tracks(),
                                         mergedTracks.view().trackHits(),
@@ -628,8 +643,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                       bMapDevice,
                                       mergedTracks.view().tracks(),
                                       mergedTracks.view().trackHits(),
-                                      pixelRecHits.view().trackingHits(),
-                                      pixelRecHits.view().hitModules(),
+                                      hitsView,
                                       maskView,
                                       caLayers,
                                       geometry.view().modules(),
@@ -652,15 +666,23 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       auto const& geometry = checkedGeometry(es.getData(tokenCAGeom_));
       auto const& pixelRecHits = iEvent.get(tokenPixelRecHits_);
       auto const& otHits = iEvent.get(tokenOTHits_);
+      auto const& otStubs = iEvent.get(tokenOTStubs_);
       auto const& stackedGeom = es.getData(tokenStackedGeomDev_);
       const float* rhoMapDevice = es.getData(tokenBLMaterialMap_).data();
       const float bfield = float(1. / es.getData(tokenField_).inverseBzAtOriginInGeV());
       // (Bz,Br) field map for the final refit's GBL effective field; this refit sets the published pt.
       const float* bMapDevice = es.getData(tokenBLBFieldMap_).data();
+      const caStructures::CAHitsView hitsView(pixelRecHits.const_view().trackingHits(),
+                                              pixelRecHits.const_view().hitModules(),
+                                              otStubs.const_view().stubs(),
+                                              otStubs.const_view().stubModules(),
+                                              pixelRecHits.nHits(),
+                                              otStubs.nStubs(),
+                                              pixelRecHits.nModules());
       deviceAlgo_.refitUnitedTracks(mergedTracks,
                                     unitedMaskPtr,
                                     geometry,
-                                    pixelRecHits,
+                                    hitsView,
                                     &otHits,
                                     &stackedGeom,
                                     rhoMapDevice,
@@ -688,14 +710,23 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // after the attach and the refit a covariance-scaled co-occurrence match pairs them and drops the worse
     // member. Returns a fresh compacted SoA. Hit-id key space of the co-occurrence histogram: nDedupPixHits
     // (the pixel+stub index space) + nDedupOTHits (bit30-tagged extras compress to nDedupPixHits+otIdx).
-    const uint32_t nDedupPixHits = uint32_t(iEvent.get(tokenPixelRecHits_).view().trackingHits().metadata().size());
+    auto const& dedupPixHits = iEvent.get(tokenPixelRecHits_);
+    auto const& dedupStubs = iEvent.get(tokenOTStubs_);
+    const caStructures::CAHitsView dedupHitsView(dedupPixHits.const_view().trackingHits(),
+                                                 dedupPixHits.const_view().hitModules(),
+                                                 dedupStubs.const_view().stubs(),
+                                                 dedupStubs.const_view().stubModules(),
+                                                 dedupPixHits.nHits(),
+                                                 dedupStubs.nStubs(),
+                                                 dedupPixHits.nModules());
+    const uint32_t nDedupPixHits = uint32_t(dedupHitsView.size());
     const uint32_t nDedupOTHits = iEvent.get(tokenOTHits_).nHits();
     // The duplicate criterion carries no configured number: the shared-cluster fraction is the
     // validation's own matching definition and the compatibility test's threshold is the 5-sigma
     // rejection. What the merger passes is the walk's |eta| reach as the drop authority, so the
     // extension and the duplicate removal cannot disagree about where they operate.
-    MergerDedupConfirmInputs confirm{iEvent.get(tokenPixelRecHits_).view().trackingHits(),
-                                     iEvent.get(tokenOTStubs_).const_view().stubs(),
+    MergerDedupConfirmInputs confirm{dedupHitsView,
+                                     dedupStubs.const_view().stubs(),
                                      iEvent.get(tokenOTHits_).const_view().otRecHits(),
                                      float(extMaxAbsEta_)};
     auto dedupTracks = deviceAlgo_.finalDedupTracks(mergedTracks, nDedupPixHits, nDedupOTHits, queue, &confirm);

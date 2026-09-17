@@ -119,7 +119,6 @@ _HLTPhase2PixelTracksAndVerticesSequenceCAStubsTwoIterations = cms.Sequence(
     +hltSiPixelRecHits                      # legacy pixel rechits for the legacy converter
     +hltPixelSeedingOTRecHitsSoA
     +hltOTStubProducer
-    +hltPhase2PixelRecHitsStubsMerger
     +hltPhase2PixelTracksSoA                     # prompt stub CA via the modifier (label preserved)
     +hltPhase2PixelTrackTorchHighPuritySelector  # prompt forest selector via the modifier (label preserved)
     +hltPhase2PixelTrackHighPtMasking            # masks the hits of the prompt tracks
@@ -148,8 +147,8 @@ from Configuration.ProcessModifiers.pixelTrackMask_cff import pixelTrackMask
 )
 
 # SerialSync arms of the stub chain for the CPU vs. GPU validation, to be kept in sync with the two
-# sequences above. The stub formation and the pixel/stub merger stay accelerated and are shared: the
-# twins read their host copies, as the default arm reads the accelerated rechits.
+# sequences above. The stub formation stays accelerated and is shared: the twins read its host copy,
+# as the default arm reads the accelerated rechits.
 hltPhase2PixelTrackHighPtMaskingSerialSync = makeSerialClone(hltPhase2PixelTrackHighPtMasking,
     tracksSoASrc = "hltPhase2PixelTrackTorchHighPuritySelectorSerialSync",
 )
@@ -180,7 +179,6 @@ _HLTPhase2PixelTracksAndVerticesSequenceCAStubsSerialSync = cms.Sequence(
     +hltSiPixelRecHits
     +hltPixelSeedingOTRecHitsSoA
     +hltOTStubProducer
-    +hltPhase2PixelRecHitsStubsMerger
     +hltPhase2PixelTracksSoASerialSync
     +hltPhase2PixelTrackTorchHighPuritySelectorSerialSync
     +hltPhase2PixelTracksSerialSync
@@ -196,7 +194,6 @@ _HLTPhase2PixelTracksAndVerticesSequenceCAStubsTwoIterationsSerialSync = cms.Seq
     +hltSiPixelRecHits
     +hltPixelSeedingOTRecHitsSoA
     +hltOTStubProducer
-    +hltPhase2PixelRecHitsStubsMerger
     +hltPhase2PixelTracksSoASerialSync
     +hltPhase2PixelTrackTorchHighPuritySelectorSerialSync
     +hltPhase2PixelTrackHighPtMaskingSerialSync

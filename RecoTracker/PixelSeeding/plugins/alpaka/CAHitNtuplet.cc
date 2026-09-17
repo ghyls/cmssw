@@ -13,6 +13,7 @@
 #include "DataFormats/TrackSoA/interface/alpaka/TracksSoACollection.h"
 #include "DataFormats/TrackSoA/interface/TracksDevice.h"
 #include "DataFormats/TrackingRecHitSoA/interface/alpaka/TrackingRecHitsSoACollection.h"
+#include "DataFormats/TrackingRecHitSoA/interface/alpaka/TrackingRecHitsMaskSoACollection.h"
 #include "DataFormats/TrackingRecHitSoA/interface/alpaka/OTRecHitsSoACollection.h"
 #include "DataFormats/TrackingRecHitSoA/interface/alpaka/StubsSoACollection.h"
 #include "FWCore/Framework/interface/ConsumesCollector.h"
@@ -624,8 +625,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     if (hasHitMask_) {
       tokenHitMask_ = device::EDGetToken<MapToHit>(consumes(iConfig.getParameter<edm::InputTag>("hitMask")));
     }
-    iCache->tokenGeometry_ = esConsumes<edm::Transition::BeginRun>();
-    iCache->tokenTopology_ = esConsumes<edm::Transition::BeginRun>();
     if constexpr (caStructures::viewHasStubs<caStructures::HitsViewT<TrackerTraits>>) {
       // The stub CA reads the pixel rechits and the stubs SoA side by side; only a topology whose
       // hit view carries the stubs consumes the stubs product.
@@ -726,10 +725,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       // The doublet kernels index the mask with merged-hit global indices, guarding only on the
       // view being non-empty, so a `hitMask` tag pointing at a mask built for a different hit
       // collection would read out of range on device.
-      if (maskView.metadata().size() != int(hits.nHits()))
+      if (maskView.metadata().size() != int(nHits))
         throw cms::Exception("CAHitMaskMismatch")
             << "CAHitNtupletAlpaka: the configured `hitMask` has " << maskView.metadata().size()
-            << " rows but the hit collection has " << hits.nHits()
+            << " rows but the hit collection has " << nHits
             << ". The mask must be the one built for this hit collection.";
     }
 

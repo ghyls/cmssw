@@ -83,8 +83,8 @@ public:
     desc.add<std::string>("tableName", "TrkDispCA");
     desc.add<edm::InputTag>("trackSrc", edm::InputTag("hltPhase2PixelTracksSoALowPt"));
     desc.add<edm::InputTag>("pixelRecHitSrc", edm::InputTag("hltPhase2SiPixelRecHitsSoA"));
-    // Raw OT-rechit SoA: resolves tagged OT extras attached by the in-CA fit extension so the
-    // deployed 12-feature vector matches the device Kernel_classifyTracks on OT-extended tracks.
+    // Raw OT-rechit SoA: resolves the tagged OT extras, so the feature vector matches the device
+    // kernel on OT-extended tracks.
     desc.add<edm::InputTag>("otRecHitsSoASrc", edm::InputTag("hltPixelSeedingOTRecHitsSoA"));
 
     // In the merged collection, iteration is the only column that still separates the two arms.
@@ -244,14 +244,15 @@ private:
           if (caOTHitTag::isOTId(h))
             continue;  // OT extra: indexes the OT SoA, which holds no cluster information
           if (h >= uint32_t(nHitsTot) || h >= offsetStubsMain)
-            continue;  // stub row, whose charge and sizes the merger zeroes, or a corrupt index
-          const float q = float(hh[h].chargeAndStatus().charge);
+            continue;  // outer-tracker entry, which carries no cluster at all, or a corrupt index
+          auto const pix = hh.pixel(int32_t(h));
+          const float q = float(pix.chargeAndStatus().charge);
           if (!(q > 0.f))
             continue;  // a pixel row with no charge carries no usable cluster
           const bool barrel = uint32_t(hh[h].detectorIndex()) < pixelBarrelModuleEnd_;
           const float qn = q * (barrel ? absSinTheta : absCosTheta);
-          const float sx = float(hh[h].clusterSizeX());
-          const float sy = float(hh[h].clusterSizeY());
+          const float sx = float(pix.clusterSizeX());
+          const float sy = float(pix.clusterSizeY());
           if (nPix == 0) {
             qMin = q;
             qnMin = qn;

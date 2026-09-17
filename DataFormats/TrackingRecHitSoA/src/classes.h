@@ -4,6 +4,7 @@
 #include "DataFormats/Common/interface/Wrapper.h"
 #include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsHost.h"
 #include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsSoA.h"
+#include "DataFormats/TrackingRecHitSoA/interface/TrackingRecHitsMaskSoA.h"
 #include "DataFormats/TrackingRecHitSoA/interface/SiPixelHitStatus.h"
 #include "DataFormats/TrackingRecHitSoA/interface/OTRecHitsHost.h"
 #include "DataFormats/TrackingRecHitSoA/interface/OTRecHitsSoA.h"

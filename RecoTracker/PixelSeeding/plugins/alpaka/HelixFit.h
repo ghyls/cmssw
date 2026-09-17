@@ -76,7 +76,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   // The shared-cluster fraction (the validation's 75 % matching) and the 5-sigma compatibility threshold
   // (ExtDerivedTables.h) are not configurable.
   struct MergerDedupConfirmInputs {
-    ::reco::TrackingRecHitConstView hv;
+    caStructures::CAHitsView hv;
     ::reco::StubsConstView sv;
     ::reco::OTRecHitsConstView ov;
     float dropAbsEtaMax;
@@ -85,11 +85,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   template <typename TrackerTraits>
   class HelixFit {
   public:
-    // Hit view of the CA main fit (see CAStructures.h).
+    // Hit view of the CA main fit: the merged collection's MultiView, or the pixel+stubs facade for
+    // Phase2OTStubs (see CAStructures.h).
     using HitsMultiView = caStructures::HitsViewT<TrackerTraits>;
 
     using HitView = ::reco::TrackingRecHitView;
-    using HitConstView = ::reco::TrackingRecHitConstView;
+    using HitConstView = caStructures::CAHitsView;
     using OutputSoAView = ::reco::TrackSoAView;
     using OutputHitSoAView = ::reco::TrackHitSoAView;
 
@@ -169,8 +170,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                               uint32_t nhits,
                               uint32_t maxNumberOfTuples,
                               Queue &queue);
-    // ONE sweep of the N-binned BLFastFit+BLFit kernels: the factorized fast BrokenLine fit that every
-    // CA iteration and every topology runs on its own tracks.
+    // One sweep of the N-binned BLFastFit+BLFit kernels, the factorized fast BrokenLine fit every CA
+    // iteration runs on its own tracks.
     void launchBrokenLineKernels(const HitsMultiView &hv,
                                  const ::reco::CAModulesConstView &fr,
                                  uint32_t nhits,

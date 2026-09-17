@@ -213,7 +213,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   // frame ceiling, so no launch costs a local-memory reservation. Only compiled/launched for
   // Phase2OTStubs (the sole topology the OT extension runs on); a no-op for every other traits set.
   template <typename TrackerTraits>
-  void HelixFit<TrackerTraits>::refitExtended(const ::reco::TrackingRecHitConstView& hv,
+  void HelixFit<TrackerTraits>::refitExtended(const caStructures::CAHitsView& hv,
                                               const ::reco::CAModulesConstView& cm,
                                               caStructures::SequentialContainer const* hitContainer,
                                               const int32_t* acceptedByTuple,
@@ -469,10 +469,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   uint32_t* __restrict__ content,
                                   ::reco::TrackSoAConstView tracks,
-                                  ::reco::TrackingRecHitConstView hh,
+                                  caStructures::CAHitsView hh,
                                   const int32_t* __restrict__ unitedMask,
                                   uint32_t nTracks) const {
-      const uint32_t nTot = uint32_t(hh.metadata().size());
+      const uint32_t nTot = uint32_t(hh.size());
       constexpr float kFar = 3.40282347e+38f;
       constexpr uint32_t kSentinel = 0x3FFFFFFFu;  // untagged, >= any real nTot -> walk break
       // Position + class of an id. Returns false for unresolvable ids (guards; sorted last).
@@ -493,7 +493,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         x = hh[id].xGlobal();
         y = hh[id].yGlobal();
         z = hh[id].zGlobal();
-        isPixel = !::reco::isStub(hh, int32_t(id));
+        isPixel = !isStub(hh, int32_t(id));
         return true;
       };
       auto keyOf = [&](uint32_t id) -> float {
@@ -730,7 +730,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   };
 
   template <typename TrackerTraits>
-  void HelixFit<TrackerTraits>::refitMergedTwins(const ::reco::TrackingRecHitConstView& hv,
+  void HelixFit<TrackerTraits>::refitMergedTwins(const caStructures::CAHitsView& hv,
                                                  const ::reco::CAModulesConstView& cm,
                                                  OutputSoAView mergedTracks,
                                                  OutputHitSoAView mergedHits,
@@ -919,13 +919,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                   const uint32_t* __restrict__ contestedPairs,
                                   ::reco::TrackSoAConstView tracks,
                                   ::reco::TrackHitSoAConstView trackHits,
-                                  ::reco::TrackingRecHitConstView hh,
+                                  caStructures::CAHitsView hh,
                                   uint32_t nPairsCap,
                                   uint32_t stride,
                                   uint32_t* __restrict__ diag) const {
       constexpr uint32_t kUnfilled = 0xFFFFFFFFu;  // empty pair-list slot tag (matches contestedPairs memset)
       constexpr uint32_t kSentinel = 0x3FFFFFFFu;  // untagged, >= any nTot -> refitDedupWalk break
-      const uint32_t nTot = uint32_t(hh.metadata().size());
+      const uint32_t nTot = uint32_t(hh.size());
       constexpr float kFar = 3.40282347e+38f;
       // Position + class of an id (raw OT rechit vs merged-SoA hit). Mirrors Kernel_sortUnitedRefitHits.
       auto posOf = [&](uint32_t id, float& x, float& y, float& z, bool& isPixel) -> bool {
@@ -944,7 +944,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         x = hh[id].xGlobal();
         y = hh[id].yGlobal();
         z = hh[id].zGlobal();
-        isPixel = !::reco::isStub(hh, int32_t(id));
+        isPixel = !isStub(hh, int32_t(id));
         return true;
       };
       auto keyOf = [&](uint32_t id) -> float {
@@ -1057,7 +1057,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                   const uint32_t* __restrict__ contestedPairs,  // {i, j} per slot
                                   const int32_t* __restrict__ acceptedMask,     // -1 => build over-size/unfilled
                                   caStructures::SequentialContainer const* __restrict__ unionContainer,
-                                  ::reco::TrackingRecHitConstView hh,
+                                  caStructures::CAHitsView hh,
                                   uint8_t* __restrict__ drop,
                                   int delta,
                                   uint32_t nPairsCap,

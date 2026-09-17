@@ -4,6 +4,8 @@
 #include "DataFormats/TrackSoA/interface/alpaka/TracksSoACollection.h"
 #include "DataFormats/TrackSoA/interface/TracksDevice.h"
 #include "DataFormats/TrackingRecHitSoA/interface/alpaka/TrackingRecHitsSoACollection.h"
+#include "DataFormats/TrackingRecHitSoA/interface/alpaka/TrackingRecHitsMaskSoACollection.h"
+#include "DataFormats/TrackingRecHitSoA/interface/alpaka/StubsSoACollection.h"
 #include "FWCore/Framework/interface/ConsumesCollector.h"
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/ParameterSet/interface/ConfigurationDescriptions.h"
@@ -42,7 +44,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // otherwise only the hits the CA itself found are masked.
     bool const maskAttachedHits_;
 
-    const device::EDGetToken<reco::TrackingRecHitsMaskingCollection> inputRecHitsMaskToken_;
+    // Optional starting mask. An empty "recHitsMaskSoASrc" tag means "start all open": the chain's
+    // first masking stage has no earlier mask to inherit, and the mask is then sized from the two hit
+    // collections the global hit index space is made of (pixel rechits + stubs), read for their row
+    // counts only.
+    const bool hasInputMask_;
+    device::EDGetToken<reco::TrackingRecHitsMaskingCollection> inputRecHitsMaskToken_;
+    device::EDGetToken<reco::TrackingRecHitsSoACollection> pixelRecHitToken_;
+    device::EDGetToken<reco::StubsSoACollection> stubsToken_;
     const device::EDGetToken<reco::TracksSoACollection> inputTrackSoAToken_;
 
     const device::EDPutToken<reco::TrackingRecHitsMaskingCollection> outputRecHitsMaskToken_;
@@ -56,9 +65,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         minQuality_(pixelTrack::qualityByName(iConfig.getParameter<std::string>("minQuality"))),
         applyMasking_(iConfig.getParameter<bool>("applyMasking")),
         maskAttachedHits_(iConfig.getParameter<bool>("maskAttachedHits")),
-        inputRecHitsMaskToken_(consumes(iConfig.getParameter<edm::InputTag>("recHitsMaskSoASrc"))),
+        hasInputMask_(not iConfig.getParameter<edm::InputTag>("recHitsMaskSoASrc").label().empty()),
         inputTrackSoAToken_(consumes(iConfig.getParameter<edm::InputTag>("tracksSoASrc"))),
         outputRecHitsMaskToken_(produces()) {
+    if (hasInputMask_) {
+      inputRecHitsMaskToken_ = consumes(iConfig.getParameter<edm::InputTag>("recHitsMaskSoASrc"));
+    } else {
+      pixelRecHitToken_ = consumes(iConfig.getParameter<edm::InputTag>("pixelRecHitSrc"));
+      stubsToken_ = consumes(iConfig.getParameter<edm::InputTag>("stubsSrc"));
+    }
     if (minQuality_ == pixelTrack::Quality::notQuality) {
       throw cms::Exception("PixelTrackConfiguration")
           << iConfig.getParameter<std::string>("minQuality") + " is not a pixelTrack::Quality";
@@ -78,9 +93,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   void PixelTracksMaskingSoA::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {
     edm::ParameterSetDescription desc;
 
-    desc.add<edm::InputTag>(
-        "recHitsMaskSoASrc",
-        edm::InputTag("siPixelRecHitsExtendedPreSplittingAlpaka"));  // has to be changed for each iteration
+    desc.add<edm::InputTag>("recHitsMaskSoASrc", edm::InputTag(""))
+        ->setComment(
+            "Starting mask of this stage. Empty (the default) means the chain starts all open and the "
+            "mask is seeded here, sized from pixelRecHitSrc + stubsSrc; set it to an earlier masking "
+            "stage in a multi-iteration chain.");
+    desc.add<edm::InputTag>("pixelRecHitSrc", edm::InputTag("hltPhase2SiPixelRecHitsSoA"))
+        ->setComment("Pixel rechits, read for their row count only. Used only when recHitsMaskSoASrc is empty.");
+    desc.add<edm::InputTag>("stubsSrc", edm::InputTag("hltOTStubProducer"))
+        ->setComment("Outer-tracker stubs, read for their row count only. Used only when recHitsMaskSoASrc is empty.");
     desc.add<edm::InputTag>("tracksSoASrc",
                             edm::InputTag("pixelTracksHighPtAlpaka"));  // has to be changed for each iteration
     desc.add<std::string>("minQuality", "highPurity");
@@ -102,14 +123,26 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   void PixelTracksMaskingSoA::produce(edm::StreamID streamID,
                                       device::Event& iEvent,
                                       const device::EventSetup& es) const {
-    auto queue = iEvent.queue();
-    const auto& inpMaskColl = iEvent.get(inputRecHitsMaskToken_);
-    const auto& inpTkColl = iEvent.get(inputTrackSoAToken_);
-
-    iEvent.emplace(
-        outputRecHitsMaskToken_,
-        deviceAlgo_.makeMaskingAsync(
-            inpMaskColl, inpTkColl, minQuality_, iterationIndex_, iEvent.queue(), applyMasking_, maskAttachedHits_));
+    if (hasInputMask_) {
+      // Reading the mask layout first puts the module on the queue that produced it, which orders its
+      // reads before the early release of that product. Keep this get() first.
+      const auto& inpMaskColl = iEvent.get(inputRecHitsMaskToken_);
+      const auto& inpTkColl = iEvent.get(inputTrackSoAToken_);
+      iEvent.emplace(
+          outputRecHitsMaskToken_,
+          deviceAlgo_.makeMaskingAsync(
+              inpMaskColl, inpTkColl, minQuality_, iterationIndex_, iEvent.queue(), applyMasking_, maskAttachedHits_));
+    } else {
+      // Seed the chain: all-open over the global hit index space, [0, nPixelHits + nStubs).
+      const auto& pixColl = iEvent.get(pixelRecHitToken_);
+      const auto& stubColl = iEvent.get(stubsToken_);
+      const auto& inpTkColl = iEvent.get(inputTrackSoAToken_);
+      const uint32_t nHits = pixColl.nHits() + stubColl.nStubs();
+      iEvent.emplace(
+          outputRecHitsMaskToken_,
+          deviceAlgo_.makeMaskingAsync(
+              nHits, inpTkColl, minQuality_, iterationIndex_, iEvent.queue(), applyMasking_, maskAttachedHits_));
+    }
   }
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE
 
