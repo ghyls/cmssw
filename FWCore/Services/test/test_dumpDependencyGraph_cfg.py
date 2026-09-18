@@ -71,6 +71,26 @@ process.viaSourceAlias = cms.EDProducer(
     "AddIntsProducer", labels=cms.VInputTag(cms.InputTag("aliasOfSource"))
 )
 
+# An EDAlias can stand for the Source for one data product, and for a module for
+# another one. It will be checked that process.viaMixedAlias, which consumes
+# only the edmtestThings of process.mixedAlias, depends on process.thingMaker
+# alone, and not on process.source.
+process.thingMaker = cms.EDProducer("ThingProducer")
+process.mixedAlias = cms.EDAlias(
+    source=cms.VPSet(cms.PSet(type=cms.string("edmtestIntProduct"))),
+    thingMaker=cms.VPSet(cms.PSet(type=cms.string("edmtestThings"))),
+)
+process.viaMixedAlias = cms.EDProducer(
+    "OtherThingProducer", thingTag=cms.InputTag("mixedAlias")
+)
+
+# The Source produces edmtestIntProduct, but no edmtestThings. It will be
+# checked that process.notFromSource, which asks for an edmtestThings carrying
+# the source's label, is reported with no dependency on the source.
+process.notFromSource = cms.EDProducer(
+    "OtherThingProducer", thingTag=cms.InputTag("source")
+)
+
 # It will be checked that process.runConsumer's dependency on
 # process.runProducer is a non-event one
 process.runProducer = cms.EDProducer("NonEventIntProducer", ivalue=cms.int32(1))
@@ -80,16 +100,16 @@ process.runConsumer = cms.EDProducer(
     consumesBeginRun=cms.InputTag("runProducer", "beginRun"),
 )
 
-# It will be checked that process.unknownLabel's dependency (on a modules that
-# does not exist) is reported as unresolved, not as a normal edge It will be
-# also checked that no other module in this configuration has an unresolved
-# dependency
+# It will be checked that process.unknownLabel's dependency (on a module that
+# does not exist) is reported as unresolved, and not as a normal edge. It will
+# also be checked that no other module in this configuration has an unresolved
+# dependency.
 process.unknownLabel = cms.EDProducer(
     "AddIntsProducer", labels=cms.VInputTag(cms.InputTag("noSuchModule"))
 )
 
-# It will be checked that depencencies on data products from an earlier process
-# ar marked as "unresolved"
+# It will be checked that dependencies on data products from an earlier process
+# are marked as "unresolved"
 process.fromEarlierProcess = cms.EDProducer(
     "AddIntsProducer", labels=cms.VInputTag(cms.InputTag("first", "", "EARLIER"))
 )
@@ -115,7 +135,7 @@ process.watcher = cms.EDAnalyzer(
 
 # It will be checked which Paths and EndPaths exist, and that each of them
 # contains these modules, in this order. The order of the Paths and the EndPaths
-# themselves is unspecified, and DumpDependencyGraph will alphabetically.
+# themselves is unspecified, and DumpDependencyGraph sorts them alphabetically.
 
 process.p = cms.Path(
     process.first
@@ -139,4 +159,5 @@ process.r = cms.Path(
     + process.moduleA
     + process.moduleB
 )
+process.s = cms.Path(process.thingMaker + process.viaMixedAlias + process.notFromSource)
 process.e = cms.EndPath(process.watcher)

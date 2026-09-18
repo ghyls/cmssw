@@ -32,6 +32,7 @@ namespace edm {
                                 const char* consumedModuleLabel,
                                 const char* consumedProductInstance,
                                 std::vector<ModuleDescription const*>& modules,
+                                bool& consumesSourceProduct,
                                 std::set<std::string>& alreadyFound,
                                 std::map<std::string, ModuleDescription const*> const& labelsToDesc,
                                 ProductRegistry const& preg) {
@@ -56,6 +57,7 @@ namespace edm {
             foundInLabelsToDesc = true;
           } else {
             if (label == "source") {
+              consumesSourceProduct = true;
               foundInLabelsToDesc = true;
             }
           }
@@ -64,19 +66,21 @@ namespace edm {
           return;
         }
       }
-      // Ignore the source products, we are only interested in module products.
-      // As far as I know, it should never be anything else so throw if something
-      // unknown gets passed in.
+      // The source products are reported separately, they are not module
+      // products. As far as I know, it should never be anything else so throw
+      // if something unknown gets passed in.
       if (std::string_view(consumedModuleLabel) != "source") {
         throw cms::Exception("EDConsumerBase", "insertFoundModuleLabel")
             << "Couldn't find ModuleDescription for the consumed product type: '" << consumedType.className()
             << "' module label: '" << consumedModuleLabel << "' product instance name: '" << consumedProductInstance
             << "'";
       }
+      consumesSourceProduct = true;
     }
 
     void modulesWhoseProductsAreConsumed(edm::maker::ModuleHolder const* iHolder,
                                          std::array<std::vector<ModuleDescription const*>*, NumBranchTypes>& modulesAll,
+                                         std::array<bool, NumBranchTypes>& consumesSourceProductAll,
                                          ProductRegistry const& preg,
                                          std::map<std::string, ModuleDescription const*> const& labelsToDesc,
                                          std::string const& processName) {
@@ -85,6 +89,7 @@ namespace edm {
       for (ModuleConsumesInfo const& consumesInfo : iHolder->moduleConsumesInfos()) {
         ProductResolverIndexHelper const& helper = *preg.productLookup(consumesInfo.branchType());
         std::vector<ModuleDescription const*>& modules = *modulesAll[consumesInfo.branchType()];
+        bool& consumesSourceProduct = consumesSourceProductAll[consumesInfo.branchType()];
 
         auto consumedModuleLabel = consumesInfo.label();
         auto consumedProductInstance = consumesInfo.instance();
@@ -107,6 +112,7 @@ namespace edm {
                                        consumedModuleLabel.data(),
                                        consumedProductInstance.data(),
                                        modules,
+                                       consumesSourceProduct,
                                        alreadyFound,
                                        labelsToDesc,
                                        preg);
@@ -122,6 +128,7 @@ namespace edm {
                                        consumedModuleLabel.data(),
                                        consumedProductInstance.data(),
                                        modules,
+                                       consumesSourceProduct,
                                        alreadyFound,
                                        labelsToDesc,
                                        preg);
@@ -136,11 +143,13 @@ namespace edm {
                                    std::vector<edm::maker::ModuleHolder const*>& moduleIDToHolder,
                                    std::array<std::vector<std::vector<ModuleDescription const*>>, NumBranchTypes>&
                                        modulesWhoseProductsAreConsumedBy,
+                                   std::array<std::vector<bool>, NumBranchTypes>& consumesSourceProduct,
                                    ProductRegistry const& preg) {
       allModuleDescriptions.clear();
       moduleIDToHolder.clear();
       for (auto iBranchType = 0U; iBranchType < NumBranchTypes; ++iBranchType) {
         modulesWhoseProductsAreConsumedBy[iBranchType].clear();
+        consumesSourceProduct[iBranchType].clear();
       }
 
       //The maxModuleID will be used as an index so we need the +1 to accomodate that
@@ -148,6 +157,7 @@ namespace edm {
       moduleIDToHolder.resize(moduleRegistry.maxModuleID() + 1);
       for (auto iBranchType = 0U; iBranchType < NumBranchTypes; ++iBranchType) {
         modulesWhoseProductsAreConsumedBy[iBranchType].resize(moduleRegistry.maxModuleID() + 1);
+        consumesSourceProduct[iBranchType].resize(moduleRegistry.maxModuleID() + 1, false);
       }
 
       std::map<std::string, ModuleDescription const*> labelToDesc;
@@ -166,13 +176,19 @@ namespace edm {
         for (auto iBranchType = 0U; iBranchType < NumBranchTypes; ++iBranchType) {
           modules[iBranchType] = &modulesWhoseProductsAreConsumedBy[iBranchType].at(iHolder->moduleDescription().id());
         }
+        // std::vector<bool> gives out no reference to its elements, so collect
+        // the flags here and copy them over below
+        std::array<bool, NumBranchTypes> consumesSource = {};
         try {
           modulesWhoseProductsAreConsumed(
-              iHolder, modules, preg, labelToDesc, iHolder->moduleDescription().processName());
+              iHolder, modules, consumesSource, preg, labelToDesc, iHolder->moduleDescription().processName());
         } catch (cms::Exception& ex) {
           ex.addContext("Calling Worker::modulesWhoseProductsAreConsumed() for module " +
                         iHolder->moduleDescription().moduleLabel());
           throw;
+        }
+        for (auto iBranchType = 0U; iBranchType < NumBranchTypes; ++iBranchType) {
+          consumesSourceProduct[iBranchType].at(iHolder->moduleDescription().id()) = consumesSource[iBranchType];
         }
       });
     }
@@ -212,6 +228,7 @@ namespace edm {
                               allModuleDescriptions_,
                               moduleIDToHolder_,
                               modulesWhoseProductsAreConsumedBy_,
+                              consumesSourceProduct_,
                               *preg);
   }
 
@@ -437,6 +454,10 @@ namespace edm {
   std::vector<ModuleDescription const*> const& PathsAndConsumesOfModules::doModulesWhoseProductsAreConsumedBy(
       unsigned int moduleID, BranchType branchType) const {
     return modulesWhoseProductsAreConsumedBy_[branchType].at(moduleIndex(moduleID));
+  }
+
+  bool PathsAndConsumesOfModules::doConsumesSourceProduct(unsigned int moduleID, BranchType branchType) const {
+    return consumesSourceProduct_[branchType].at(moduleIndex(moduleID));
   }
 
   std::vector<eventsetup::ComponentDescription const*> const&

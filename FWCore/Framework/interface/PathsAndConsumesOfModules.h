@@ -71,6 +71,7 @@ namespace edm {
     std::vector<ModuleDescription const*> const& doModulesOnEndPath(unsigned int endPathIndex) const override;
     std::vector<ModuleDescription const*> const& doModulesWhoseProductsAreConsumedBy(
         unsigned int moduleID, BranchType branchType) const override;
+    bool doConsumesSourceProduct(unsigned int moduleID, BranchType branchType) const override;
 
     std::vector<eventsetup::ComponentDescription const*> const& doESModulesWhoseProductsAreConsumedBy(
         unsigned int moduleID, Transition) const override;
@@ -104,6 +105,10 @@ namespace edm {
     std::vector<edm::maker::ModuleHolder const*> moduleIDToHolder_;
 
     std::array<std::vector<std::vector<ModuleDescription const*>>, NumBranchTypes> modulesWhoseProductsAreConsumedBy_;
+
+    // Indexed by module ID: whether the Source produces any of the data
+    // products that module consumes, for each branch type.
+    std::array<std::vector<bool>, NumBranchTypes> consumesSourceProduct_;
 
     std::array<std::vector<std::vector<eventsetup::ComponentDescription const*>>, kNumberOfEventSetupTransitions>
         esModulesWhoseProductsAreConsumedBy_;

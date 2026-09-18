@@ -76,6 +76,7 @@ namespace {
         unsigned int, edm::Transition) const {
       return m_dummy1;
     }
+    bool doConsumesSourceProduct(unsigned int, edm::BranchType) const final { return false; }
     std::vector<edm::ModuleConsumesESInfo> doModuleConsumesESInfos(unsigned int) const final { return {}; }
     std::vector<edm::eventsetup::ComponentDescription const*> const& doAllESModules() const { return m_dummy1; }
     edm::eventsetup::ComponentDescription const* doComponentDescription(unsigned int esModuleID) const final {

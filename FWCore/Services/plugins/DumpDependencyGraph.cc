@@ -2,11 +2,11 @@
  * Service to dump the module dependency graph of a process as a .json
  */
 
-#include <algorithm>
 #include <fstream>
 #include <set>
 #include <string>
-#include <unordered_map>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -41,19 +41,17 @@ namespace {
     return "Unknown";
   }
 
-  // Map each EDAlias label to the labels of the modules it aliases
-  std::unordered_map<std::string, std::vector<std::string>> aliasTargets(edm::ParameterSetID const& processPSetID) {
-    std::unordered_map<std::string, std::vector<std::string>> targets;
+  // The labels of all the EDAliases of a process. An EDAlias is not a module,
+  // so its label has to be known here, to tell it apart from a label that
+  // nothing in this process provides.
+  std::unordered_set<std::string> aliasLabels(edm::ParameterSetID const& processPSetID) {
     auto const* processPSet = edm::pset::Registry::instance()->getMapped(processPSetID);
-
     if (not processPSet or not processPSet->existsAs<std::vector<std::string>>("@all_aliases")) {
       // There are no aliases
-      return targets;
+      return {};
     }
-    for (std::string const& alias : processPSet->getParameter<std::vector<std::string>>("@all_aliases")) {
-      targets[alias] = processPSet->getParameterSet(alias).getParameterNamesForType<edm::VParameterSet>();
-    }
-    return targets;
+    auto const& aliases = processPSet->getParameter<std::vector<std::string>>("@all_aliases");
+    return {aliases.begin(), aliases.end()};
   }
 
   // the labels of a list of modules, in order, as a JSON array
@@ -80,16 +78,18 @@ public:
     edm::ParameterSetDescription desc;
     desc.setComment(
         "Dumps the module dependency graph of a process as JSON."
-        "\nThe document is keyed by module label and has the following fields:"
+        "\nThe document has the following fields:"
         "\n - process: the process name"
         "\n - modules: {label: {class, type, consumes, consumesNonEvent, consumesUnresolved}}"
         "\n - paths / endpaths: {name: [labels in schedule order]}"
         "\nEach module's three 'consume' lists are omitted when empty, and hold:"
-        "\n - consumes: event-level dependencies on modules of this process"
-        "\n - consumesNonEvent: the same, for the non-event transitions (run, "
-        " lumi and process block), excluding modules already listed in 'consumes'."
-        "\n - consumesUnresolved: declared labels, on any transition, whose data product"
-        " cannot come from this process, and thus has to be read from the input");
+        "\n - consumes: event-level dependencies on the Source or on modules of this process"
+        "\n - consumesNonEvent: the same, for the non-event transitions (run,"
+        " lumi and process block), excluding what is already listed in 'consumes'"
+        "\n - consumesUnresolved: declared labels, on any transition, that name no module and"
+        " no EDAlias of this process, or that are explicitly asked from an earlier process;"
+        " those data products have to be read from the input"
+        "\nThe same label can show up in both lists, when a module consumes it on both counts.");
     desc.addUntracked<std::string>("fileName", "dependency_graph.json");
     descriptions.add("DumpDependencyGraph", desc);
   }
@@ -104,53 +104,46 @@ public:
     }
 
     std::string const& processName = context.processName();
-    auto const aliases = aliasTargets(context.parameterSetID());
+    auto const aliases = aliasLabels(context.parameterSetID());
 
     for (edm::ModuleDescription const* consumer : pathsAndConsumes.allModules()) {
       std::set<std::string> consumed;
       std::set<std::string> consumesNonEvent;
       std::set<std::string> unresolved;
 
-      // collect the dependencies already resolved by the framework
+      // the dependencies within this process, as resolved by the framework
       for (edm::ModuleDescription const* produced :
            pathsAndConsumes.modulesWhoseProductsAreConsumedBy(consumer->id(), edm::InEvent)) {
-        // Event depencencies
+        // Event dependencies
         consumed.insert(produced->moduleLabel());
       }
+      if (pathsAndConsumes.consumesSourceProduct(consumer->id(), edm::InEvent)) {
+        consumed.insert(kSourceLabel);
+      }
       for (edm::BranchType branchType : {edm::InLumi, edm::InRun, edm::InProcess}) {
+        // Non event-only dependencies
         for (edm::ModuleDescription const* produced :
              pathsAndConsumes.modulesWhoseProductsAreConsumedBy(consumer->id(), branchType)) {
-          // Non event-only dependencies
           consumesNonEvent.insert(produced->moduleLabel());
+        }
+        if (pathsAndConsumes.consumesSourceProduct(consumer->id(), branchType)) {
+          consumesNonEvent.insert(kSourceLabel);
         }
       }
 
-      // Data products from a prior process or from Source. Look for those in
-      // the declared consumes().
+      // The data products nothing in this process provides are not reported
+      // above: look for those among the declared consumes().
       for (edm::ModuleConsumesInfo const& info : pathsAndConsumes.moduleConsumesInfos(consumer->id())) {
         std::string label{info.label()};
         if (label.empty() or label == kEmptyLabel) {
           continue;
         }
 
-        std::set<std::string>& target = (info.branchType() == edm::InEvent) ? consumed : consumesNonEvent;
-
         if (info.skipCurrentProcess() or (not info.process().empty() and info.process() != processName)) {
-          // If products come from the earleir process
-          // (info.skipCurrentProcess()) or the process name is something
-          // different from this process' name.
-
+          // the data product is explicitly asked from an earlier process
           unresolved.insert(label);
-        } else if (auto alias = aliases.find(label); alias != aliases.end()) {
-          if (std::find(alias->second.begin(), alias->second.end(), kSourceLabel) != alias->second.end()) {
-            // is the Source among the modules this alias stands for?
-            target.insert(kSourceLabel);
-          }
-        } else if (label == kSourceLabel) {
-          // the Source is not reported by modulesWhoseProductsAreConsumedBy()
-          target.insert(kSourceLabel);
-        } else if (not modules_.contains(label)) {
-          // no module of this process makes this data product.
+        } else if (not modules_.contains(label) and not aliases.contains(label)) {
+          // no module and no EDAlias of this process carries this label
           unresolved.insert(label);
         }
       }
@@ -160,7 +153,7 @@ public:
       consumesNonEvent.erase(consumer->moduleLabel());
 
       // Don't repeat in consumesNonEvent a label already reported in consumed
-      // This way consumesNotEvent declares the edges that exist *only* because
+      // This way consumesNonEvent declares the edges that exist *only* because
       // of a non-event transition
       for (std::string const& label : consumed) {
         consumesNonEvent.erase(label);

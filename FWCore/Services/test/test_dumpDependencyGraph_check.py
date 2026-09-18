@@ -38,8 +38,28 @@ check(
 )
 
 # Check that an EDAlias is resolved per data product, and not by label
-check(modules["moduleA"]["consumes"] == ["moduleD"], "moduleA consumes T, from moduleD")
-check(modules["moduleB"]["consumes"] == ["moduleE"], "moduleB consumes U, from moduleE")
+check(
+    modules["moduleA"]["consumes"] == ["moduleD"],
+    "moduleA consumes edmtestThings, which comes from moduleD",
+)
+check(
+    modules["moduleB"]["consumes"] == ["moduleE"],
+    "moduleB consumes edmtestIntProduct, which comes from moduleE",
+)
+
+# Check that the same holds for an EDAlias that stands for the Source for one
+# data product, and for a module for another one
+check(
+    modules["viaMixedAlias"]["consumes"] == ["thingMaker"],
+    "viaMixedAlias consumes edmtestThings, which comes from thingMaker, not from the source",
+)
+
+# Check that asking for a data product the Source does not produce, but with the
+# source's label, is not reported as a dependency on the source
+check(
+    "consumes" not in modules["notFromSource"],
+    "the source produces no edmtestThings, so notFromSource does not depend on it",
+)
 
 # Check that a module with no dependencies reports none
 check("consumes" not in modules["first"], "first should consume nothing")
@@ -116,6 +136,7 @@ check(
             "fromEarlierProcess",
         ],
         "r": ["moduleD", "moduleE", "moduleA", "moduleB"],
+        "s": ["thingMaker", "viaMixedAlias", "notFromSource"],
     },
     "wrong paths: " + str(graph["paths"]),
 )

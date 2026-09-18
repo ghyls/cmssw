@@ -68,6 +68,15 @@ namespace edm {
       return doModulesWhoseProductsAreConsumedBy(moduleID, branchType);
     }
 
+    // Whether the Source of the current process produces at least one of the
+    // data products the ED module identified by the moduleID argument declares
+    // it consumes for the given branchType. This complements
+    // modulesWhoseProductsAreConsumedBy(), which never includes the source.
+    // EDAliases are resolved per data product, as they are there.
+    bool consumesSourceProduct(unsigned int moduleID, BranchType branchType = InEvent) const {
+      return doConsumesSourceProduct(moduleID, branchType);
+    }
+
     // The EventSetup modules in the returned vector are associated with
     // the ED module identified by the moduleID argument. The other
     // argument named transition could for example be beginRun. The
@@ -142,6 +151,7 @@ namespace edm {
     virtual std::vector<ModuleDescription const*> const& doModulesOnEndPath(unsigned int endPathIndex) const = 0;
     virtual std::vector<ModuleDescription const*> const& doModulesWhoseProductsAreConsumedBy(
         unsigned int moduleID, BranchType branchType) const = 0;
+    virtual bool doConsumesSourceProduct(unsigned int moduleID, BranchType branchType) const = 0;
     virtual std::vector<eventsetup::ComponentDescription const*> const& doESModulesWhoseProductsAreConsumedBy(
         unsigned int moduleID, Transition) const = 0;
     virtual std::vector<ModuleConsumesInfo> doModuleConsumesInfos(unsigned int moduleID) const = 0;
