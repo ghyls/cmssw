@@ -55,6 +55,14 @@ namespace ngt {
       object = value_type(cms::alpakatools::host(), prop.nHits, prop.nModules);
     }
 
+    template <typename TQueue>
+      requires(alpaka::isQueue<TQueue>)
+    static void initialize(TQueue& queue, value_type& object, Properties const& prop) {
+      // Replace the default-constructed empty object with one where the buffer
+      // has been allocated in pinned host memory.
+      object = value_type(queue, prop.nHits, prop.nModules);
+    }
+
     static std::vector<std::span<std::byte>> regions(value_type& object) {
       std::byte* address = reinterpret_cast<std::byte*>(object.buffer().data());
       size_t size = alpaka::getExtentProduct(object.buffer());
