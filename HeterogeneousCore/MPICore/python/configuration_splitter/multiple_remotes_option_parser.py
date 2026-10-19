@@ -12,7 +12,7 @@ def build_global_parser():
         type=pathlib.Path,
         help="python configuration file to be split"
     )
-    parser.add_argument("-c", "--reuse-cpp-names", action="store_true")
+    parser.add_argument("-c", "--reuse-dumps", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
         "-l",
@@ -31,6 +31,7 @@ def build_process_parser():
     parser.add_argument("-r", "--output-remote", type=pathlib.Path, default=None)
     parser.add_argument("-d", "--duplicate-modules", nargs="+", default=None)
     parser.add_argument("-n", "--remote-process-name", default="")
+    parser.add_argument("--use-portable-mpi-modules", action="store_true")
 
     return parser
 
@@ -78,10 +79,12 @@ Optional arguments:
         Path to the output configuration for the local process.
         (default: local.py)
    
-    -c, --reuse-cpp-names
-        False by default. If this script was run before, pass this 
-        argument to reuse the generated file with C++ product names
-    
+    -c, --reuse-dumps
+        False by default. If this script was run before on the same,
+        unmodified input config, pass this argument to reuse the product
+        names and dependency graph it dumped then, instead of rerunning
+        cmsRun to regenerate them.
+
     -v, --verbose
         Print debug outputs
 
@@ -93,7 +96,8 @@ PROCESS OPTIONS (can be passed for different remote processes):
         
     -r, --output-remote
         Path to the output configuration for the remote process.
-        (default: remote.py)
+        (default: remote.py for a single remote, remote0.py, remote1.py, ...
+        for several)
 
     -d, --duplicate-modules
         List of module labels that must run on both local and remote
@@ -101,8 +105,15 @@ PROCESS OPTIONS (can be passed for different remote processes):
         between processes.
 
     -n, --remote-process-name
-        Name of the remote process (default: REMOTE)    
-    
+        Name of the remote process (default: REMOTE0, REMOTE1, ... in the
+        order the ':'-separated groups are given)
+
+    --use-portable-mpi-modules
+        Move products with MPISenderPortable/MPIReceiverPortable instead of
+        MPISender/MPIReceiver. Unlike MPISender/MPIReceiver, the portable
+        modules can also move device (e.g. Alpaka SoA) products without a
+        host copy; MPISender/MPIReceiver are not used at all once this is set.
+
 
 SINGLE REMOTE EXAMPLES:
 
@@ -136,13 +147,19 @@ MULTI-REMOTE EXAMPLES:
 
 Notes:
 
-• To split a configuration it must be processed with 0 events.
-    This will cause creating output files and directories (by default in '.cppnamedir' directory).
-• If the splitter was run before, --reuse-cpp-names avoids rerunning cmsRun for products' characteristics.
-    Passing this option will make the script run much faster, given that needed information already exists.
+• To split a configuration it must be processed with 0 events. That single cmsRun job
+    dumps both the C++ product names and the module dependency graph, into the
+    '.edmMpiSplitConfig' directory.
+• --use-portable-mpi-modules additionally runs a short cmsRun job of its own,
+    into the same directory, to learn how each Alpaka backend names the device types
+    it can serialise. This is so that device products can be written into the
+    configurations without naming the backend the splitter happened to run on.
+• If the splitter was run before on the same input config, --reuse-dumps skips that job and
+    reads back what it wrote, which makes the script run faster.
 • For some modules it might be better to run on both processes
     instead of sending their products. Use --duplicate-modules option to specify them.
-• Only dependencies expressed via InputTag are analyzed.
+• Dependencies are the ones the framework itself resolved, so they cover consumes(),
+    mayConsumes(), EDAliases and products made by the Source.
 • Execution order inside dependency groups is preserved.
 """
     )
@@ -156,49 +173,23 @@ def parse_mpi_style_args(argv):
     global_parser = build_global_parser()
     process_parser = build_process_parser()
 
-    # parse global args from full argv
+    # global options are taken from the whole command line, wherever they appear, while
+    # each ":"-separated group is parsed on its own for the options of one remote
     global_args, _ = global_parser.parse_known_args(argv)
-
-    # split independently
     groups = split_groups(argv)
+
     configs = []
+    for i, group in enumerate(groups):
+        proc_args, _ = process_parser.parse_known_args(group)
 
-    # if no ":" - single process
-    if len(groups) == 1:
-        proc_args, _ = process_parser.parse_known_args(argv)
-
-        cfg = argparse.Namespace()
-
-        # merge
-        cfg.config = global_args.config
-        cfg.output_local = global_args.output_local
-        cfg.reuse_cpp_names = global_args.reuse_cpp_names
-        cfg.verbose = global_args.verbose
-
+        cfg = argparse.Namespace(**vars(global_args))
         cfg.remote_modules = proc_args.remote_modules or []
-        cfg.output_remote = proc_args.output_remote
         cfg.duplicate_modules = proc_args.duplicate_modules or []
-        cfg.remote_process_name = proc_args.remote_process_name or ""
-
-        configs.append(cfg)
-        return configs
-
-    # multi-process
-    for i, g in enumerate(groups):
-        proc_args, _ = process_parser.parse_known_args(g)
-        cfg = argparse.Namespace()
-
-        # globals
-        cfg.config = global_args.config
-        cfg.output_local = global_args.output_local
-        cfg.reuse_cpp_names = global_args.reuse_cpp_names
-        cfg.verbose = global_args.verbose
-
-        # per-process overrides
-        cfg.remote_modules = proc_args.remote_modules or []
-        cfg.output_remote = proc_args.output_remote or pathlib.Path(f"remote{i}.py")
-        cfg.duplicate_modules = proc_args.duplicate_modules or []
-        cfg.remote_process_name = proc_args.remote_process_name or ""
+        cfg.remote_process_name = proc_args.remote_process_name or f"REMOTE{i}"
+        cfg.use_portable_mpi_modules = proc_args.use_portable_mpi_modules
+        # a single remote writes the plain default file name; several need one each
+        cfg.output_remote = proc_args.output_remote or pathlib.Path(
+            "remote.py" if len(groups) == 1 else f"remote{i}.py")
 
         configs.append(cfg)
 
